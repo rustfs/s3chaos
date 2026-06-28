@@ -1,0 +1,25 @@
+[package]
+name = "s3chaos"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+aws-config = "1"
+aws-credential-types = "1"
+aws-sdk-s3 = "1"
+futures = "0.3.31"
+hex = "0.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.148"
+serde_yaml_ng = "0.10.0"
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "process", "time", "io-util"] }
+uuid = { version = "1", features = ["v4"] }
+
+k8s-openapi = { version = "0.26.1", features = ["v1_30", "schemars"] }
+kube = { version = "2.0.1", features = ["runtime", "client", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["cookies", "json", "rustls-tls", "stream"] }
+rustls = { version = "0.23", features = ["ring"] }
