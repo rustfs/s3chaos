@@ -329,7 +329,22 @@ execution, matrix expansion, per-scenario cluster/storage credentials,
 Artifacts are written under:
 
 ```text
-${RUSTFS_FAULT_TEST_RUN_ROOT:-target/fault-tests/<timestamp>}/<scenario>/
+${RUSTFS_FAULT_TEST_RUN_ROOT:-target/fault-tests/<timestamp>}/<scenario>/<case-name>/
+```
+
+For example, a single `io-eio` run writes the Rust artifacts under:
+
+```text
+target/fault-tests/<timestamp>/io-eio/fault_io_eio_preserves_committed_objects/
+```
+
+The shell runner also writes runner-level files such as `test.log`,
+`health-watch.log`, `exit-code`, and cluster snapshots in the outer scenario
+directory. Suite runs add the suite and attempt directories before the same
+case-name layer:
+
+```text
+target/fault-tests/<timestamp>/<suite-name>/<suite-run-id>/<attempt>/<case-name>/
 ```
 
 Key files:
@@ -361,8 +376,8 @@ A successful run must show:
 - `run-spec.yaml` and `run-spec.json`: the resolved run contract, including the
   selected scenario, fault list, workload profile, recovery gates, topology
   assumptions, and required artifacts. This is the stable handoff surface for
-  future YAML-driven orchestration and UI rendering. The shell runner validates
-  that the JSON and YAML artifacts decode to the same contract.
+  suite planning, audit, and UI rendering. The shell runner validates that the
+  JSON and YAML artifacts decode to the same contract.
 - `run-events.jsonl`: an ordered lifecycle event stream for visualization. A
   successful run includes `run started`, `checker-final succeeded`, and `run
   succeeded` events.
