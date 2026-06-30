@@ -4,7 +4,7 @@ SCENARIO ?=
 SUITE ?=
 FAULT_SCRIPT := $(CURDIR)/scripts/fault-test.sh
 
-.PHONY: check fmt fmt-check clippy test fault-check fault-list fault-preflight fault-run fault-run-dm fault-suite-template fault-suite-validate fault-suite-run fault-dashboard-install fault-dashboard-port-forward fault-cleanup
+.PHONY: check fmt fmt-check clippy test fault-check fault-list fault-preflight fault-run fault-run-dm fault-suite-template fault-suite-validate fault-suite-plan fault-suite-run fault-dashboard-install fault-dashboard-port-forward fault-cleanup
 
 check: fmt-check clippy test
 
@@ -43,6 +43,10 @@ fault-suite-template:
 fault-suite-validate:
 	@test -n "$(SUITE)" || (echo "SUITE is required, for example: make fault-suite-validate SUITE=suite.yaml" >&2; exit 1)
 	bash $(FAULT_SCRIPT) suite-validate "$(SUITE)"
+
+fault-suite-plan:
+	@test -n "$(SUITE)" || (echo "SUITE is required, for example: make fault-suite-plan SUITE=suite.yaml" >&2; exit 1)
+	bash $(FAULT_SCRIPT) suite-plan "$(SUITE)"
 
 fault-suite-run:
 	@test -n "$(SUITE)" || (echo "SUITE is required, for example: make fault-suite-run SUITE=suite.yaml" >&2; exit 1)

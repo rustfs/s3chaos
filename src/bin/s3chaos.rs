@@ -19,7 +19,7 @@ use s3chaos::fault::{
     scenarios::scenario_catalog_json,
     spec::{FaultRunArtifactSpec, FaultRunSpec},
     suite::{fault_suite_template_yaml, resolve_fault_suite_yaml},
-    suite_runner::run_fault_suite_from_yaml,
+    suite_runner::{plan_fault_suite_from_yaml, run_fault_suite_from_yaml},
 };
 
 #[tokio::main]
@@ -33,6 +33,7 @@ async fn main() -> Result<()> {
         "fault-required-artifacts-json" => print_fault_required_artifacts_json(),
         "fault-run" => run_selected_scenario_from_env().await,
         "fault-suite-json" => print_fault_suite_json(args),
+        "fault-suite-plan" => print_fault_suite_plan(args),
         "fault-suite-run" => run_fault_suite(args).await,
         "fault-suite-template" => print_fault_suite_template(),
         "fault-suite-validate" => validate_fault_suite(args),
@@ -50,6 +51,7 @@ fn print_help() -> Result<()> {
     println!("  fault-required-artifacts-json");
     println!("  fault-run");
     println!("  fault-suite-json <suite.yaml>");
+    println!("  fault-suite-plan <suite.yaml>");
     println!("  fault-suite-run <suite.yaml>");
     println!("  fault-suite-template");
     println!("  fault-suite-validate <suite.yaml>");
@@ -80,6 +82,18 @@ fn print_fault_suite_json(mut args: impl Iterator<Item = String>) -> Result<()> 
         "fault-suite-json accepts exactly one path"
     );
     println!("{}", resolve_fault_suite_yaml(path)?.to_json()?);
+    Ok(())
+}
+
+fn print_fault_suite_plan(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let path = args
+        .next()
+        .context("fault-suite-plan requires suite yaml path")?;
+    ensure!(
+        args.next().is_none(),
+        "fault-suite-plan accepts exactly one path"
+    );
+    println!("{}", plan_fault_suite_from_yaml(path)?.to_json()?);
     Ok(())
 }
 

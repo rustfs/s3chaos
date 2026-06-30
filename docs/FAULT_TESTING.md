@@ -53,6 +53,7 @@ make fault-run SCENARIO=io-eio
 make fault-run-dm
 make fault-suite-template
 make fault-suite-validate SUITE=suite.yaml
+make fault-suite-plan SUITE=suite.yaml
 make fault-suite-run SUITE=suite.yaml
 make fault-dashboard-install
 make fault-dashboard-port-forward
@@ -274,6 +275,7 @@ Generate a starting point:
 make fault-suite-template > suite.yaml
 make fault-suite-validate SUITE=suite.yaml
 cargo run --manifest-path Cargo.toml --bin s3chaos -- fault-suite-json suite.yaml
+make fault-suite-plan SUITE=suite.yaml
 ```
 
 Example:
@@ -303,22 +305,36 @@ scenarios:
     duration: 8m
 ```
 
+Render and review the exact destructive plan before running:
+
+```bash
+make fault-suite-plan SUITE=suite.yaml
+```
+
+The plan expands each attempt with scenario, repetition, resolved duration,
+selected faults, targets, workload profile, expected backend, CRDs/tools,
+artifact paths, and budget impact. Suite runs also write the execution plan to
+`suite-plan.json` under the suite artifact root. Set `RUSTFS_FAULT_TEST_SEED`
+before both planning and running when the preview and execution must use the
+same workload seeds.
+
 Run a suite sequentially:
 
 ```bash
 make fault-suite-run SUITE=suite.yaml
 ```
 
-The shell entrypoint validates the suite, preflights each referenced scenario,
-prebuilds the `s3chaos` binary, captures cluster snapshots, watches baseline
-node/Tenant/Chaos Mesh health while the suite is running, and terminates the
-suite if the guard fails or `maxDuration` is reached. The Rust suite runner
-creates a suite artifact root under `RUSTFS_FAULT_TEST_ARTIFACTS`, runs each
-scenario/repetition in order, validates each successful scenario's artifacts
-with the Rust artifact contract, refuses to start an attempt unless the
-remaining `maxDuration` can cover the scenario duration plus recovery timeout,
-enforces `stopOnFirstFailure` and cumulative `maxClientDisruptions`, and writes
-`suite-summary.json`.
+The shell entrypoint validates the suite, asks Rust to render the suite plan,
+preflights each referenced scenario, prebuilds the `s3chaos` binary, captures
+cluster snapshots, watches baseline node/Tenant/Chaos Mesh health while the
+suite is running, and terminates the suite if the guard fails or `maxDuration`
+is reached. The Rust suite runner creates a suite artifact root under
+`RUSTFS_FAULT_TEST_ARTIFACTS`, runs each planned scenario/repetition in order,
+validates each successful scenario's artifacts with the Rust artifact contract,
+refuses to start impossible plans whose minimum attempt duration plus recovery
+timeout cannot fit within `maxDuration`, keeps enforcing the live remaining
+`maxDuration` before every attempt, enforces `stopOnFirstFailure` and cumulative
+`maxClientDisruptions`, and writes `suite-plan.json` and `suite-summary.json`.
 
 The suite runner is intentionally sequential. It does not yet support parallel
 execution, matrix expansion, per-scenario cluster/storage credentials,
@@ -345,6 +361,13 @@ case-name layer:
 
 ```text
 target/fault-tests/<timestamp>/<suite-name>/<suite-run-id>/<attempt>/<case-name>/
+```
+
+Suite-level artifacts include:
+
+```text
+suite-plan.json
+suite-summary.json
 ```
 
 Key files:

@@ -22,6 +22,7 @@ make fault-preflight SCENARIO=io-eio
 make fault-run SCENARIO=io-eio
 make fault-suite-template
 make fault-suite-validate SUITE=suite.yaml
+make fault-suite-plan SUITE=suite.yaml
 make fault-suite-run SUITE=suite.yaml
 make fault-cleanup
 ```

@@ -8,6 +8,10 @@ the runner has an auditable plan and stronger safety boundaries.
 
 ## 1. Consolidate Bash And Rust Responsibilities
 
+Status: first implementation pass added Rust-owned suite planning through
+`s3chaos fault-suite-plan <suite.yaml>` and made suite runs persist the resolved
+plan as `suite-plan.json`.
+
 - Move more execution contract ownership into Rust: suite planning, artifact
   layout, budget decisions, and runtime validation.
 - Keep `scripts/fault-test.sh` as a thin operational wrapper for shell-specific

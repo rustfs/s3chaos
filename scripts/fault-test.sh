@@ -50,6 +50,7 @@ Commands:
   list                  List catalog scenarios.
   suite-template        Print a YAML FaultSuite template.
   suite-validate <file> Validate a YAML FaultSuite contract.
+  suite-plan <file>     Render the resolved destructive FaultSuite plan.
   suite-run <file>      Run a destructive YAML FaultSuite sequentially.
   dashboard-install     Install/upgrade Chaos Mesh with Dashboard enabled.
   dashboard-port-forward [port]
@@ -701,44 +702,46 @@ run_one() {
 }
 
 preflight_suite() {
-  local suite="$1" scenario
+  local suite="$1" plan_path="$2" scenario
   s3chaos_cli fault-suite-validate "$suite"
+  ensure_inherited_kubeconfig
+  s3chaos_cli fault-suite-plan "$suite" >"$plan_path"
   while IFS= read -r scenario; do
     [[ -n "$scenario" ]] || continue
     preflight "$scenario"
-  done < <(s3chaos_cli fault-suite-json "$suite" | jq -r '.scenarios[].name' | sort -u)
+  done < <(jq -r '.attempts[].scenario' "$plan_path" | sort -u)
 }
 
 suite_requires_chaos() {
-  local suite="$1"
-  s3chaos_cli fault-suite-json "$suite" \
-    | jq -e 'any(.scenarios[]; .requiresChaosMesh == true)' >/dev/null
+  local plan_path="$1"
+  jq -e '.requiresChaosMesh == true' "$plan_path" >/dev/null
 }
 
 suite_max_duration_seconds() {
-  local suite="$1"
-  s3chaos_cli fault-suite-json "$suite" | jq -r '.budgets.maxDurationSeconds // empty'
+  local plan_path="$1"
+  jq -r '.budgets.maxDurationSeconds // empty' "$plan_path"
 }
 
 run_suite() {
-  local suite="$1" run_root rc
+  local suite="$1" run_root rc suite_plan
   local baseline_ready_nodes baseline_tenants current_time health_checks require_chaos
   local started_at now max_duration_seconds elapsed
   [[ -f "$suite" ]] || die "suite yaml file not found: $suite"
   run_root="$(new_run_root)"
   mkdir -p "$run_root"
-  preflight_suite "$suite"
+  suite_plan="$run_root/suite-plan-preview.json"
+  preflight_suite "$suite" "$suite_plan"
   build_fault_binary "$run_root" "fault-suite-run"
-  preflight_suite "$suite"
+  preflight_suite "$suite" "$suite_plan"
   baseline_ready_nodes="$(kubectl_cluster get nodes -o json | jq -r '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length')"
   baseline_tenants="$run_root/baseline-non-fault-tenants.tsv"
   list_non_fault_tenants >"$baseline_tenants"
-  if suite_requires_chaos "$suite"; then
+  if suite_requires_chaos "$suite_plan"; then
     require_chaos=true
   else
     require_chaos=false
   fi
-  max_duration_seconds="$(suite_max_duration_seconds "$suite")"
+  max_duration_seconds="$(suite_max_duration_seconds "$suite_plan")"
   capture_cluster_snapshot "$run_root" before
 
   echo "starting suite=$suite artifacts=$run_root"
@@ -843,6 +846,12 @@ case "${1:-help}" in
     [[ -n "${2:-}" ]] || die "suite yaml path is required"
     [[ -z "${3:-}" ]] || die "suite-validate accepts exactly one suite yaml path"
     s3chaos_cli fault-suite-validate "$2"
+    ;;
+  suite-plan)
+    [[ -n "${2:-}" ]] || die "suite yaml path is required"
+    [[ -z "${3:-}" ]] || die "suite-plan accepts exactly one suite yaml path"
+    ensure_inherited_kubeconfig
+    s3chaos_cli fault-suite-plan "$2"
     ;;
   suite-run)
     [[ -n "${2:-}" ]] || die "suite yaml path is required"
