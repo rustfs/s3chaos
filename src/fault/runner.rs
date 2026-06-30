@@ -16,7 +16,8 @@ use crate::{
     fault::{
         backends::{
             chaos_mesh::{
-                self, ChaosGuard, IoChaosSpec, NetworkChaosSpec, PodChaosSpec, StressChaosSpec,
+                self, ChaosGuard, IoChaosSpec, IoLatencyParameters, NetworkChaosSpec,
+                NetworkDelayParameters, PodChaosSpec, StressChaosSpec,
             },
             host::{self, DmFlakeyGuard, DmFlakeySpec, DmStatusSnapshot},
         },
@@ -33,11 +34,14 @@ use crate::{
         },
         scenarios::{self, FaultBackend, FaultIsolation, FaultScenario, FaultScenarioSpec},
         spec::FaultRunSpec,
-        workload::{ObjectSpec, S3WorkloadClient, WorkloadPlan, sha256_hex, wait_for_s3_endpoint},
+        workload::{
+            ObjectSpec, S3WorkloadClient, WorkloadOperation, WorkloadPlan, sha256_hex,
+            wait_for_s3_endpoint,
+        },
     },
     framework::{
         artifacts::ArtifactCollector,
-        command::CommandSpec,
+        command::{CommandOutput, CommandSpec},
         config::ClusterTestConfig,
         kube_client,
         kubectl::Kubectl,
@@ -942,34 +946,70 @@ async fn run_fault_case(
         "removing applied faults",
         None,
     )?;
+    let fault_delete_started_at = Instant::now();
     if let Err(error) = fault.delete(cluster.timeout) {
-        events
-            .record(
-                "fault-delete",
-                RunEventStatus::Failed,
-                error.to_string(),
-                None,
-            )
-            .ok();
-        collect_fault_artifacts(collector, scenario.case_name, &fault, "delete-failed")?;
-        write_failure_summary(
+        let finalizer_recovery = match try_recover_stuck_iochaos_finalizer(
+            config,
             collector,
             scenario.case_name,
-            FailureSummary::new(
-                &scenario.name,
+            &mut fault,
+            &run_id,
+            &error,
+            fault_delete_started_at,
+        ) {
+            Ok(recovery) => recovery,
+            Err(recovery_error) => {
+                let _ = collector.write_text(
+                    scenario.case_name,
+                    "iochaos-finalizer-recovery-error.txt",
+                    &format!(
+                        "failed to evaluate or apply IOChaos finalizer recovery:\n{recovery_error}"
+                    ),
+                );
+                None
+            }
+        };
+        if let Some(recovery) = finalizer_recovery {
+            events.record(
                 "fault-delete",
-                "environment_or_fault_backend",
-                error.to_string(),
-            ),
+                RunEventStatus::Succeeded,
+                "patched stuck IOChaos finalizer after recovery evidence",
+                Some(serde_json::json!({
+                    "warning_artifact": "iochaos-finalizer-recovery-warning.json",
+                    "iochaos": recovery.iochaos_name,
+                    "target_nodes": recovery.target_nodes,
+                })),
+            )?;
+        } else {
+            events
+                .record(
+                    "fault-delete",
+                    RunEventStatus::Failed,
+                    error.to_string(),
+                    None,
+                )
+                .ok();
+            collect_fault_artifacts(collector, scenario.case_name, &fault, "delete-failed")?;
+            write_failure_summary(
+                collector,
+                scenario.case_name,
+                FailureSummary::new(
+                    &scenario.name,
+                    "fault-delete",
+                    "environment_or_fault_backend",
+                    error.to_string(),
+                ),
+            )?;
+            return Err(error);
+        }
+    } else {
+        events.record(
+            "fault-delete",
+            RunEventStatus::Succeeded,
+            "applied faults were removed",
+            None,
         )?;
-        return Err(error);
     }
-    events.record(
-        "fault-delete",
-        RunEventStatus::Succeeded,
-        "applied faults were removed",
-        None,
-    )?;
 
     events.record(
         "tenant-recovery",
@@ -1339,11 +1379,13 @@ fn initialize_fault_run(
     let spec = scenarios::scenario_spec(&scenario.name)?;
     let run_id = format!("run-{}", Uuid::new_v4());
     let workload_seed = config.workload_seed.unwrap_or_else(generated_seed);
-    let workload_plan = WorkloadPlan::seeded(
+    let workload_plan = WorkloadPlan::seeded_with_mix(
         workload_seed,
         scenario.object_count,
         config.workload.concurrency,
-    );
+        config.workload_operation_mix,
+    )
+    .context("build workload plan")?;
     let bucket = bucket_name(&run_id);
     let events_path = collector
         .case_dir(scenario.case_name)
@@ -1601,6 +1643,15 @@ impl AppliedFaults {
             .filter_map(AppliedFault::chaos_guard)
             .collect()
     }
+
+    fn single_iochaos_guard_mut(&mut self) -> Option<&mut ChaosGuard> {
+        if self.items.len() != 1 {
+            return None;
+        }
+        self.items[0]
+            .chaos_guard_mut()
+            .filter(|guard| guard.is_kind("iochaos"))
+    }
 }
 
 impl AppliedFault {
@@ -1650,13 +1701,18 @@ impl AppliedFault {
                 })
             }
             FaultKind::RustfsVolumeLatency => {
+                let (delay, methods) = injection.parameters().io_latency()?;
                 let chaos = IoChaosSpec::latency_on_rustfs_volume(
                     cluster,
                     &config.chaos_namespace,
                     run_id,
                     &scenario.name,
                     injection.rustfs_volume_path()?,
-                    injection.percent()?,
+                    IoLatencyParameters {
+                        methods,
+                        delay,
+                        percent: injection.percent()?,
+                    },
                     injection.duration(),
                 )?
                 .with_name_suffix(resource_name_suffix);
@@ -1734,36 +1790,59 @@ impl AppliedFault {
             | FaultKind::RustfsServerNetworkCorrupt
             | FaultKind::RustfsServerNetworkDuplicate => {
                 let chaos = match injection.kind() {
-                    FaultKind::RustfsServerNetworkDelay => NetworkChaosSpec::delay_one_rustfs_pod(
-                        cluster,
-                        &config.chaos_namespace,
-                        run_id,
-                        &scenario.name,
-                        injection.duration(),
-                    )?,
-                    FaultKind::RustfsServerNetworkLoss => NetworkChaosSpec::loss_one_rustfs_pod(
-                        cluster,
-                        &config.chaos_namespace,
-                        run_id,
-                        &scenario.name,
-                        injection.duration(),
-                    )?,
+                    FaultKind::RustfsServerNetworkDelay => {
+                        let (latency, jitter, correlation_percent) =
+                            injection.parameters().network_delay()?;
+                        NetworkChaosSpec::delay_one_rustfs_pod(
+                            cluster,
+                            &config.chaos_namespace,
+                            run_id,
+                            &scenario.name,
+                            injection.duration(),
+                            NetworkDelayParameters {
+                                latency,
+                                jitter,
+                                correlation_percent,
+                            },
+                        )?
+                    }
+                    FaultKind::RustfsServerNetworkLoss => {
+                        let (loss_percent, correlation_percent) =
+                            injection.parameters().network_loss()?;
+                        NetworkChaosSpec::loss_one_rustfs_pod(
+                            cluster,
+                            &config.chaos_namespace,
+                            run_id,
+                            &scenario.name,
+                            injection.duration(),
+                            loss_percent,
+                            correlation_percent,
+                        )?
+                    }
                     FaultKind::RustfsServerNetworkCorrupt => {
+                        let (corrupt_percent, correlation_percent) =
+                            injection.parameters().network_corrupt()?;
                         NetworkChaosSpec::corrupt_one_rustfs_pod(
                             cluster,
                             &config.chaos_namespace,
                             run_id,
                             &scenario.name,
                             injection.duration(),
+                            corrupt_percent,
+                            correlation_percent,
                         )?
                     }
                     FaultKind::RustfsServerNetworkDuplicate => {
+                        let (duplicate_percent, correlation_percent) =
+                            injection.parameters().network_duplicate()?;
                         NetworkChaosSpec::duplicate_one_rustfs_pod(
                             cluster,
                             &config.chaos_namespace,
                             run_id,
                             &scenario.name,
                             injection.duration(),
+                            duplicate_percent,
+                            correlation_percent,
                         )?
                     }
                     _ => unreachable!(),
@@ -1777,20 +1856,28 @@ impl AppliedFault {
             }
             FaultKind::RustfsServerCpuStress | FaultKind::RustfsServerMemoryStress => {
                 let chaos = match injection.kind() {
-                    FaultKind::RustfsServerCpuStress => StressChaosSpec::cpu_on_one_rustfs_pod(
-                        cluster,
-                        &config.chaos_namespace,
-                        run_id,
-                        &scenario.name,
-                        injection.duration(),
-                    )?,
+                    FaultKind::RustfsServerCpuStress => {
+                        let (workers, load) = injection.parameters().stress_cpu()?;
+                        StressChaosSpec::cpu_on_one_rustfs_pod(
+                            cluster,
+                            &config.chaos_namespace,
+                            run_id,
+                            &scenario.name,
+                            injection.duration(),
+                            workers,
+                            load,
+                        )?
+                    }
                     FaultKind::RustfsServerMemoryStress => {
+                        let (workers, size) = injection.parameters().stress_memory()?;
                         StressChaosSpec::memory_on_one_rustfs_pod(
                             cluster,
                             &config.chaos_namespace,
                             run_id,
                             &scenario.name,
                             injection.duration(),
+                            workers,
+                            size,
                         )?
                     }
                     _ => unreachable!(),
@@ -1888,6 +1975,13 @@ impl AppliedFault {
         }
     }
 
+    fn chaos_guard_mut(&mut self) -> Option<&mut ChaosGuard> {
+        match self {
+            Self::Chaos { guard, .. } | Self::PodKill { guard, .. } => Some(guard.as_mut()),
+            Self::DmFlakey(_) => None,
+        }
+    }
+
     fn snapshot(&self, stage: &str) -> Result<FaultStatusSnapshot> {
         match self {
             Self::Chaos { guard, .. } | Self::PodKill { guard, .. } => Ok(FaultStatusSnapshot {
@@ -1932,6 +2026,589 @@ fn chaos_resource_name_suffix(total: usize, index: usize) -> String {
     } else {
         format!("-{index:02}")
     }
+}
+
+const IOCHAOS_FINALIZER_RECOVERY_WARNING: &str = "iochaos-finalizer-recovery-warning.json";
+const IOCHAOS_FINALIZER_RECOVERY_DIAGNOSTIC: &str = "iochaos-finalizer-recovery-diagnostic.json";
+const CHAOS_DAEMON_UNMOUNT_MARKER: &str = "unmount successfully";
+const MANAGED_IOCHAOS_FINALIZERS: &[&str] = &[
+    "chaos-mesh/records",
+    "finalizer.chaos-mesh.org",
+    "chaos-mesh.org/finalizer",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct IoChaosFinalizerRecoveryReport {
+    iochaos_namespace: String,
+    iochaos_name: String,
+    source: String,
+    original_error: String,
+    finalizers: Vec<String>,
+    managed_finalizers: Vec<String>,
+    unmanaged_finalizers: Vec<String>,
+    finalizers_after_patch: Vec<String>,
+    deletion_timestamp: Option<String>,
+    run_id_label_matches: bool,
+    managed_label_matches: bool,
+    podiochaos_action_cleared: bool,
+    target_pod_injection_absent: bool,
+    daemon_unmount_observed: bool,
+    daemon_unmount_matches: Vec<DaemonUnmountLogEvidence>,
+    target_pods_ready: bool,
+    namespace_deleting: bool,
+    safe_to_patch: bool,
+    patched: bool,
+    decision: String,
+    target_pods: Vec<TargetPodRecoveryEvidence>,
+    target_nodes: Vec<String>,
+    podiochaos: PodIoChaosRecoveryEvidence,
+    daemon_log_artifacts: Vec<String>,
+    controller_log_artifact: String,
+    daemon_log_since: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DaemonUnmountLogEvidence {
+    node: String,
+    artifact: String,
+    line: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TargetPodRecoveryEvidence {
+    name: String,
+    node: Option<String>,
+    ready: bool,
+    terminating: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct PodIoChaosRecoveryEvidence {
+    query_succeeded: bool,
+    related_count: usize,
+    source_actions_remaining: usize,
+    empty_action_objects: usize,
+}
+
+fn try_recover_stuck_iochaos_finalizer(
+    config: &FaultTestConfig,
+    collector: &ArtifactCollector,
+    case_name: &str,
+    faults: &mut AppliedFaults,
+    run_id: &str,
+    original_error: &anyhow::Error,
+    delete_started_at: Instant,
+) -> Result<Option<IoChaosFinalizerRecoveryReport>> {
+    let Some(guard) = faults.single_iochaos_guard_mut() else {
+        return Ok(None);
+    };
+    let mut report = collect_iochaos_finalizer_recovery_evidence(
+        config,
+        collector,
+        case_name,
+        guard,
+        run_id,
+        original_error,
+        delete_started_at,
+    )?;
+
+    if !report.safe_to_patch {
+        collector.write_text(
+            case_name,
+            IOCHAOS_FINALIZER_RECOVERY_DIAGNOSTIC,
+            &serde_json::to_string_pretty(&report)?,
+        )?;
+        return Ok(None);
+    }
+
+    if let Err(error) = guard
+        .replace_finalizers_and_wait_deleted(&report.finalizers_after_patch, config.cluster.timeout)
+    {
+        report.decision = format!("finalizer patch was allowed but failed: {error}");
+        collector.write_text(
+            case_name,
+            IOCHAOS_FINALIZER_RECOVERY_DIAGNOSTIC,
+            &serde_json::to_string_pretty(&report)?,
+        )?;
+        return Err(error);
+    }
+    report.patched = true;
+    report.decision = "patched managed IOChaos finalizers after recovery evidence".to_string();
+    collector.write_text(
+        case_name,
+        IOCHAOS_FINALIZER_RECOVERY_WARNING,
+        &serde_json::to_string_pretty(&report)?,
+    )?;
+    Ok(Some(report))
+}
+
+fn collect_iochaos_finalizer_recovery_evidence(
+    config: &FaultTestConfig,
+    collector: &ArtifactCollector,
+    case_name: &str,
+    guard: &ChaosGuard,
+    run_id: &str,
+    original_error: &anyhow::Error,
+    delete_started_at: Instant,
+) -> Result<IoChaosFinalizerRecoveryReport> {
+    let source = format!("{}/{}", guard.namespace(), guard.name());
+    let iochaos_json_output = capture_command_artifact(
+        collector,
+        case_name,
+        "iochaos-delete-timeout.json",
+        Kubectl::new(&config.cluster)
+            .namespaced(guard.namespace())
+            .command(["get", guard.kind(), guard.name(), "-o", "json"]),
+    )?;
+    capture_command_artifact(
+        collector,
+        case_name,
+        "iochaos-delete-timeout.yaml",
+        Kubectl::new(&config.cluster)
+            .namespaced(guard.namespace())
+            .command(["get", guard.kind(), guard.name(), "-o", "yaml"]),
+    )?;
+
+    let iochaos = parse_success_json(&iochaos_json_output);
+    let finalizers = iochaos
+        .as_ref()
+        .map(finalizers_from_resource)
+        .unwrap_or_default();
+    let managed_finalizers = finalizers
+        .iter()
+        .filter(|finalizer| is_managed_iochaos_finalizer(finalizer))
+        .cloned()
+        .collect::<Vec<_>>();
+    let unmanaged_finalizers = finalizers
+        .iter()
+        .filter(|finalizer| !is_managed_iochaos_finalizer(finalizer))
+        .cloned()
+        .collect::<Vec<_>>();
+    let finalizers_after_patch = unmanaged_finalizers.clone();
+    let deletion_timestamp = iochaos
+        .as_ref()
+        .and_then(|value| value.pointer("/metadata/deletionTimestamp"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let run_id_label_matches = iochaos
+        .as_ref()
+        .is_some_and(|value| resource_label_matches(value, chaos_mesh::RUN_ID_LABEL, run_id));
+    let managed_label_matches = iochaos.as_ref().is_some_and(|value| {
+        resource_label_matches(
+            value,
+            chaos_mesh::MANAGED_BY_LABEL,
+            chaos_mesh::MANAGED_BY_VALUE,
+        )
+    });
+
+    let target_pods_output = capture_command_artifact(
+        collector,
+        case_name,
+        "target-pods-delete-timeout.json",
+        Kubectl::new(&config.cluster)
+            .namespaced(&config.cluster.test_namespace)
+            .command([
+                "get",
+                "pod",
+                "-l",
+                &format!("rustfs.tenant={}", config.cluster.tenant_name),
+                "-o",
+                "json",
+            ]),
+    )?;
+    let target_pods = parse_success_json(&target_pods_output)
+        .as_ref()
+        .map(target_pods_from_json)
+        .unwrap_or_default();
+    let target_pod_names = target_pods
+        .iter()
+        .map(|pod| pod.name.clone())
+        .collect::<BTreeSet<_>>();
+    let target_nodes = target_pods
+        .iter()
+        .filter_map(|pod| pod.node.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    capture_command_artifact(
+        collector,
+        case_name,
+        "podiochaos-delete-timeout.yaml",
+        Kubectl::new(&config.cluster)
+            .namespaced(&config.cluster.test_namespace)
+            .command(["get", "podiochaos", "-o", "yaml"]),
+    )?;
+    let podiochaos_json_output = capture_command_artifact(
+        collector,
+        case_name,
+        "podiochaos-delete-timeout.json",
+        Kubectl::new(&config.cluster)
+            .namespaced(&config.cluster.test_namespace)
+            .command(["get", "podiochaos", "-o", "json"]),
+    )?;
+    let podiochaos = parse_success_json(&podiochaos_json_output)
+        .as_ref()
+        .map(|value| podiochaos_recovery_evidence(value, &target_pod_names, &source))
+        .unwrap_or(PodIoChaosRecoveryEvidence {
+            query_succeeded: false,
+            related_count: 0,
+            source_actions_remaining: usize::MAX,
+            empty_action_objects: 0,
+        });
+
+    let daemon_pods_output = capture_command_artifact(
+        collector,
+        case_name,
+        "chaos-daemon-pods-delete-timeout.json",
+        Kubectl::new(&config.cluster)
+            .namespaced(&config.chaos_namespace)
+            .command(["get", "pod", "-o", "json"]),
+    )?;
+    let daemon_pods = parse_success_json(&daemon_pods_output)
+        .as_ref()
+        .map(chaos_daemon_pods_from_json)
+        .unwrap_or_default();
+    let mut daemon_log_artifacts = Vec::new();
+    let mut daemon_unmount_matches = Vec::new();
+    let daemon_log_since = format!(
+        "{}s",
+        delete_started_at
+            .elapsed()
+            .as_secs()
+            .saturating_add(30)
+            .max(1)
+    );
+    for node in &target_nodes {
+        let artifact = format!(
+            "chaos-daemon-{}-delete-timeout.log",
+            sanitize_artifact_token(node)
+        );
+        if let Some(daemon_pod) = daemon_pods
+            .iter()
+            .find(|pod| pod.node.as_deref() == Some(node.as_str()))
+        {
+            let output = capture_command_artifact(
+                collector,
+                case_name,
+                &artifact,
+                Kubectl::new(&config.cluster)
+                    .namespaced(&config.chaos_namespace)
+                    .command(vec![
+                        "logs".to_string(),
+                        format!("pod/{}", daemon_pod.name),
+                        "--since".to_string(),
+                        daemon_log_since.clone(),
+                        "--tail=1000".to_string(),
+                    ]),
+            )?;
+            daemon_unmount_matches.extend(
+                unmount_success_log_lines(&output.stdout)
+                    .into_iter()
+                    .map(|line| DaemonUnmountLogEvidence {
+                        node: node.clone(),
+                        artifact: artifact.clone(),
+                        line,
+                    }),
+            );
+            daemon_log_artifacts.push(artifact);
+        } else {
+            collector.write_text(
+                case_name,
+                &artifact,
+                &format!("no chaos-daemon pod was found on target node {node}\n"),
+            )?;
+            daemon_log_artifacts.push(artifact);
+        }
+    }
+
+    let controller_log_artifact = "chaos-controller-manager-delete-timeout.log".to_string();
+    capture_command_artifact(
+        collector,
+        case_name,
+        &controller_log_artifact,
+        Kubectl::new(&config.cluster)
+            .namespaced(&config.chaos_namespace)
+            .command(vec![
+                "logs".to_string(),
+                "deployment/chaos-controller-manager".to_string(),
+                "--since".to_string(),
+                daemon_log_since.clone(),
+                "--tail=1000".to_string(),
+            ]),
+    )?;
+
+    let namespace_json_output = capture_command_artifact(
+        collector,
+        case_name,
+        "target-namespace-delete-timeout.json",
+        Kubectl::new(&config.cluster).command([
+            "get",
+            "namespace",
+            &config.cluster.test_namespace,
+            "-o",
+            "json",
+        ]),
+    )?;
+    let namespace_deleting = parse_success_json(&namespace_json_output)
+        .as_ref()
+        .is_some_and(resource_has_deletion_timestamp);
+
+    let podiochaos_action_cleared = podiochaos.query_succeeded
+        && podiochaos.related_count > 0
+        && podiochaos.empty_action_objects == podiochaos.related_count
+        && podiochaos.source_actions_remaining == 0;
+    let target_pod_injection_absent =
+        podiochaos.query_succeeded && podiochaos.source_actions_remaining == 0;
+    let target_pods_ready =
+        !target_pods.is_empty() && target_pods.iter().all(|pod| pod.ready && !pod.terminating);
+    let mut report = IoChaosFinalizerRecoveryReport {
+        iochaos_namespace: guard.namespace().to_string(),
+        iochaos_name: guard.name().to_string(),
+        source,
+        original_error: original_error.to_string(),
+        finalizers,
+        managed_finalizers,
+        unmanaged_finalizers,
+        finalizers_after_patch,
+        deletion_timestamp,
+        run_id_label_matches,
+        managed_label_matches,
+        podiochaos_action_cleared,
+        target_pod_injection_absent,
+        daemon_unmount_observed: !daemon_unmount_matches.is_empty(),
+        daemon_unmount_matches,
+        target_pods_ready,
+        namespace_deleting,
+        safe_to_patch: false,
+        patched: false,
+        decision: String::new(),
+        target_pods,
+        target_nodes,
+        podiochaos,
+        daemon_log_artifacts,
+        controller_log_artifact,
+        daemon_log_since,
+    };
+    report.safe_to_patch = iochaos_finalizer_patch_allowed(&report);
+    report.decision = if report.safe_to_patch {
+        "recovery evidence satisfied; patching finalizers is allowed".to_string()
+    } else {
+        "recovery evidence incomplete; leaving IOChaos failure classification unchanged".to_string()
+    };
+    Ok(report)
+}
+
+fn iochaos_finalizer_patch_allowed(report: &IoChaosFinalizerRecoveryReport) -> bool {
+    report.run_id_label_matches
+        && report.managed_label_matches
+        && !report.finalizers.is_empty()
+        && !report.managed_finalizers.is_empty()
+        && report.unmanaged_finalizers.is_empty()
+        && report.deletion_timestamp.is_some()
+        && (report.podiochaos_action_cleared || report.target_pod_injection_absent)
+        && report.daemon_unmount_observed
+        && (report.target_pods_ready || report.namespace_deleting)
+}
+
+fn is_managed_iochaos_finalizer(finalizer: &str) -> bool {
+    MANAGED_IOCHAOS_FINALIZERS.contains(&finalizer)
+}
+
+fn capture_command_artifact(
+    collector: &ArtifactCollector,
+    case_name: &str,
+    file_name: &str,
+    command: CommandSpec,
+) -> Result<CommandOutput> {
+    let output = command.run()?;
+    let content = format!(
+        "$ {cmd}\nexit: {code:?}\n\nstdout:\n{stdout}\n\nstderr:\n{stderr}\n",
+        cmd = command.display(),
+        code = output.code,
+        stdout = output.stdout,
+        stderr = output.stderr
+    );
+    collector.write_text(case_name, file_name, &content)?;
+    Ok(output)
+}
+
+fn parse_success_json(output: &CommandOutput) -> Option<serde_json::Value> {
+    if output.code == Some(0) {
+        serde_json::from_str(&output.stdout).ok()
+    } else {
+        None
+    }
+}
+
+fn finalizers_from_resource(value: &serde_json::Value) -> Vec<String> {
+    value
+        .pointer("/metadata/finalizers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn resource_label_matches(value: &serde_json::Value, key: &str, expected: &str) -> bool {
+    value
+        .pointer("/metadata/labels")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|labels| labels.get(key))
+        .and_then(serde_json::Value::as_str)
+        == Some(expected)
+}
+
+fn resource_has_deletion_timestamp(value: &serde_json::Value) -> bool {
+    value
+        .pointer("/metadata/deletionTimestamp")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|timestamp| !timestamp.is_empty())
+}
+
+fn target_pods_from_json(value: &serde_json::Value) -> Vec<TargetPodRecoveryEvidence> {
+    value
+        .pointer("/items")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let name = item
+                .pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str)?
+                .to_string();
+            let node = item
+                .pointer("/spec/nodeName")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let ready = item
+                .pointer("/status/conditions")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|condition| {
+                    condition.get("type").and_then(serde_json::Value::as_str) == Some("Ready")
+                        && condition.get("status").and_then(serde_json::Value::as_str)
+                            == Some("True")
+                });
+            let terminating = resource_has_deletion_timestamp(item);
+            Some(TargetPodRecoveryEvidence {
+                name,
+                node,
+                ready,
+                terminating,
+            })
+        })
+        .collect()
+}
+
+fn podiochaos_recovery_evidence(
+    value: &serde_json::Value,
+    target_pod_names: &BTreeSet<String>,
+    source: &str,
+) -> PodIoChaosRecoveryEvidence {
+    let related = value
+        .pointer("/items")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            item.pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| target_pod_names.contains(name))
+        })
+        .collect::<Vec<_>>();
+    let mut source_actions_remaining = 0usize;
+    let mut empty_action_objects = 0usize;
+    for item in &related {
+        let actions = item
+            .pointer("/spec/actions")
+            .and_then(serde_json::Value::as_array);
+        match actions {
+            Some(actions) if actions.is_empty() => empty_action_objects += 1,
+            Some(actions) => {
+                source_actions_remaining += actions
+                    .iter()
+                    .filter(|action| {
+                        action.get("source").and_then(serde_json::Value::as_str) == Some(source)
+                    })
+                    .count();
+            }
+            None => empty_action_objects += 1,
+        }
+    }
+
+    PodIoChaosRecoveryEvidence {
+        query_succeeded: true,
+        related_count: related.len(),
+        source_actions_remaining,
+        empty_action_objects,
+    }
+}
+
+fn chaos_daemon_pods_from_json(value: &serde_json::Value) -> Vec<TargetPodRecoveryEvidence> {
+    value
+        .pointer("/items")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            let name_matches = item
+                .pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| name.contains("chaos-daemon"));
+            let label_matches = item
+                .pointer("/metadata/labels")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|labels| {
+                    labels
+                        .get("app.kubernetes.io/component")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("chaos-daemon")
+                });
+            name_matches || label_matches
+        })
+        .filter_map(|item| {
+            Some(TargetPodRecoveryEvidence {
+                name: item
+                    .pointer("/metadata/name")
+                    .and_then(serde_json::Value::as_str)?
+                    .to_string(),
+                node: item
+                    .pointer("/spec/nodeName")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                ready: true,
+                terminating: resource_has_deletion_timestamp(item),
+            })
+        })
+        .collect()
+}
+
+fn unmount_success_log_lines(log: &str) -> Vec<String> {
+    log.lines()
+        .filter(|line| {
+            line.to_ascii_lowercase()
+                .contains(CHAOS_DAEMON_UNMOUNT_MARKER)
+        })
+        .take(8)
+        .map(str::to_string)
+        .collect()
+}
+
+fn sanitize_artifact_token(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn collect_fault_artifacts(
@@ -2441,8 +3118,8 @@ async fn run_mixed_workload(
         let existing = prefilled[offset % prefilled.len()].clone();
         async move {
             let mut result = MixedTaskResult::new(index);
-            match offset % 6 {
-                0 => {
+            match plan.operation_mix.operation_at(offset) {
+                WorkloadOperation::Put => {
                     let object = ObjectSpec::prepare_seeded(&run_id, index, size_bytes, seed);
                     let spec = object.spec.clone();
                     let verified = s3.put_and_verify_object(&object, &history).await?;
@@ -2454,7 +3131,7 @@ async fn run_mixed_workload(
                         result.unconfirmed_puts.push(spec);
                     }
                 }
-                1 => {
+                WorkloadOperation::Overwrite => {
                     let object = existing.prepare_overwrite(index as u64 + 1);
                     let spec = object.spec.clone();
                     let verified = s3.put_and_verify_object(&object, &history).await?;
@@ -2466,12 +3143,12 @@ async fn run_mixed_workload(
                         result.unconfirmed_puts.push(spec);
                     }
                 }
-                2 => {
+                WorkloadOperation::Get => {
                     result
                         .gets
                         .push(s3.get_object_result(&existing.key, &history).await?.outcome);
                 }
-                3 => {
+                WorkloadOperation::List => {
                     let prefix = ObjectSpec::key_prefix(&run_id);
                     let outcome = if s3.list_prefix(&prefix, &history).await?.is_some() {
                         OperationOutcome::Ok
@@ -2480,7 +3157,7 @@ async fn run_mixed_workload(
                     };
                     result.lists.push(outcome);
                 }
-                4 => {
+                WorkloadOperation::Delete => {
                     let (delete_outcome, verify_get) =
                         s3.delete_and_verify_absent(&existing.key, &history).await?;
                     result.deletes.push(delete_outcome);
@@ -2488,7 +3165,7 @@ async fn run_mixed_workload(
                         result.gets.push(get_outcome);
                     }
                 }
-                _ => {
+                WorkloadOperation::Multipart => {
                     let object = ObjectSpec::prepare_seeded(&run_id, index, size_bytes, seed);
                     let spec = object.spec.clone();
                     let complete_outcome = s3.complete_multipart_object(&object, &history).await?;
@@ -2908,9 +3585,13 @@ fn warp_bucket_name(run_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        OutcomeCounts, PodIdentity, PodRuntimeState, RecommitAttempt, RecommitReport,
-        WorkloadSummary, bucket_name, chaos_manifest_artifact_name, chaos_resource_name_suffix,
-        pod_deletion_observed, pod_replacement_observed, stable_pod_fingerprint, warp_bucket_name,
+        DaemonUnmountLogEvidence, IoChaosFinalizerRecoveryReport, OutcomeCounts, PodIdentity,
+        PodIoChaosRecoveryEvidence, PodRuntimeState, RecommitAttempt, RecommitReport,
+        TargetPodRecoveryEvidence, WorkloadSummary, bucket_name, chaos_daemon_pods_from_json,
+        chaos_manifest_artifact_name, chaos_resource_name_suffix, finalizers_from_resource,
+        iochaos_finalizer_patch_allowed, pod_deletion_observed, pod_replacement_observed,
+        podiochaos_recovery_evidence, resource_has_deletion_timestamp, resource_label_matches,
+        stable_pod_fingerprint, target_pods_from_json, unmount_success_log_lines, warp_bucket_name,
     };
     use crate::fault::history::OperationOutcome;
     use crate::fault::plan::{
@@ -2918,6 +3599,8 @@ mod tests {
     };
     use crate::fault::scenarios::FaultBackend;
     use crate::fault::workload::WorkloadPlan;
+    use serde_json::json;
+    use std::collections::BTreeSet;
 
     #[test]
     fn fault_bucket_name_is_s3_compatible_and_run_scoped() {
@@ -2954,6 +3637,181 @@ mod tests {
             "chaos-manifest-01-rustfs_volume_io_error.yaml"
         );
         assert_eq!(chaos_resource_name_suffix(2, 1), "-01");
+    }
+
+    #[test]
+    fn iochaos_finalizer_scope_requires_run_and_managed_labels() {
+        let iochaos = json!({
+            "metadata": {
+                "labels": {
+                    "rustfs-fault-test/run-id": "run-123",
+                    "app.kubernetes.io/managed-by": "s3chaos"
+                },
+                "finalizers": ["chaos-mesh/records"],
+                "deletionTimestamp": "2026-06-30T01:02:03Z"
+            }
+        });
+
+        assert!(resource_label_matches(
+            &iochaos,
+            "rustfs-fault-test/run-id",
+            "run-123"
+        ));
+        assert!(resource_label_matches(
+            &iochaos,
+            "app.kubernetes.io/managed-by",
+            "s3chaos"
+        ));
+        assert_eq!(
+            finalizers_from_resource(&iochaos),
+            vec!["chaos-mesh/records"]
+        );
+        assert!(resource_has_deletion_timestamp(&iochaos));
+    }
+
+    #[test]
+    fn podiochaos_evidence_tracks_current_source_actions() {
+        let mut target_pods = BTreeSet::new();
+        target_pods.insert("rustfs-0".to_string());
+        let podiochaos = json!({
+            "items": [
+                {
+                    "metadata": {"name": "rustfs-0"},
+                    "spec": {
+                        "actions": [
+                            {"source": "chaos-mesh/rustfs-fault-io-eio"}
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let evidence = podiochaos_recovery_evidence(
+            &podiochaos,
+            &target_pods,
+            "chaos-mesh/rustfs-fault-io-eio",
+        );
+
+        assert_eq!(evidence.related_count, 1);
+        assert_eq!(evidence.source_actions_remaining, 1);
+        assert_eq!(evidence.empty_action_objects, 0);
+
+        let cleared = json!({
+            "items": [
+                {
+                    "metadata": {"name": "rustfs-0"},
+                    "spec": {"actions": []}
+                }
+            ]
+        });
+        let evidence =
+            podiochaos_recovery_evidence(&cleared, &target_pods, "chaos-mesh/rustfs-fault-io-eio");
+
+        assert_eq!(evidence.related_count, 1);
+        assert_eq!(evidence.source_actions_remaining, 0);
+        assert_eq!(evidence.empty_action_objects, 1);
+    }
+
+    #[test]
+    fn finalizer_patch_requires_complete_recovery_evidence() {
+        let mut report = IoChaosFinalizerRecoveryReport {
+            iochaos_namespace: "chaos-mesh".to_string(),
+            iochaos_name: "rustfs-fault-io-eio-run-123".to_string(),
+            source: "chaos-mesh/rustfs-fault-io-eio-run-123".to_string(),
+            original_error: "timeout".to_string(),
+            finalizers: vec!["chaos-mesh/records".to_string()],
+            managed_finalizers: vec!["chaos-mesh/records".to_string()],
+            unmanaged_finalizers: Vec::new(),
+            finalizers_after_patch: Vec::new(),
+            deletion_timestamp: Some("2026-06-30T01:02:03Z".to_string()),
+            run_id_label_matches: true,
+            managed_label_matches: true,
+            podiochaos_action_cleared: true,
+            target_pod_injection_absent: true,
+            daemon_unmount_observed: true,
+            daemon_unmount_matches: vec![DaemonUnmountLogEvidence {
+                node: "node-a".to_string(),
+                artifact: "chaos-daemon-node-a-delete-timeout.log".to_string(),
+                line: "iochaos unmount successfully".to_string(),
+            }],
+            target_pods_ready: true,
+            namespace_deleting: false,
+            safe_to_patch: false,
+            patched: false,
+            decision: String::new(),
+            target_pods: vec![TargetPodRecoveryEvidence {
+                name: "rustfs-0".to_string(),
+                node: Some("node-a".to_string()),
+                ready: true,
+                terminating: false,
+            }],
+            target_nodes: vec!["node-a".to_string()],
+            podiochaos: PodIoChaosRecoveryEvidence {
+                query_succeeded: true,
+                related_count: 1,
+                source_actions_remaining: 0,
+                empty_action_objects: 1,
+            },
+            daemon_log_artifacts: vec!["chaos-daemon-node-a-delete-timeout.log".to_string()],
+            controller_log_artifact: "chaos-controller-manager-delete-timeout.log".to_string(),
+            daemon_log_since: "90s".to_string(),
+        };
+
+        assert!(iochaos_finalizer_patch_allowed(&report));
+
+        report.daemon_unmount_observed = false;
+        assert!(!iochaos_finalizer_patch_allowed(&report));
+
+        report.daemon_unmount_observed = true;
+        report.finalizers.push("example.com/cleanup".to_string());
+        report
+            .unmanaged_finalizers
+            .push("example.com/cleanup".to_string());
+        report
+            .finalizers_after_patch
+            .push("example.com/cleanup".to_string());
+        assert!(!iochaos_finalizer_patch_allowed(&report));
+    }
+
+    #[test]
+    fn finalizer_recovery_parses_target_pods_and_daemon_logs() {
+        let pods = json!({
+            "items": [
+                {
+                    "metadata": {"name": "rustfs-0"},
+                    "spec": {"nodeName": "node-a"},
+                    "status": {
+                        "conditions": [
+                            {"type": "Ready", "status": "True"}
+                        ]
+                    }
+                }
+            ]
+        });
+        let daemon_pods = json!({
+            "items": [
+                {
+                    "metadata": {
+                        "name": "chaos-daemon-abc",
+                        "labels": {"app.kubernetes.io/component": "chaos-daemon"}
+                    },
+                    "spec": {"nodeName": "node-a"}
+                }
+            ]
+        });
+
+        let target_pods = target_pods_from_json(&pods);
+        assert_eq!(target_pods[0].name, "rustfs-0");
+        assert_eq!(target_pods[0].node.as_deref(), Some("node-a"));
+        assert!(target_pods[0].ready);
+
+        let daemon_pods = chaos_daemon_pods_from_json(&daemon_pods);
+        assert_eq!(daemon_pods[0].name, "chaos-daemon-abc");
+        assert!(!unmount_success_log_lines("iochaos unmount successfully").is_empty());
+        assert_eq!(
+            unmount_success_log_lines("old line\niochaos unmount successfully\nother"),
+            vec!["iochaos unmount successfully"]
+        );
     }
 
     #[test]

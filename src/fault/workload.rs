@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{
@@ -50,12 +50,34 @@ pub struct WorkloadSizeClass {
     pub object_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkloadOperationMix {
+    pub put: u32,
+    pub overwrite: u32,
+    pub get: u32,
+    pub list: u32,
+    pub delete: u32,
+    pub multipart: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkloadOperation {
+    Put,
+    Overwrite,
+    Get,
+    List,
+    Delete,
+    Multipart,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkloadPlan {
     pub seed: u64,
     pub generator: String,
     pub object_count: usize,
     pub concurrency: usize,
+    pub operation_mix: WorkloadOperationMix,
     pub total_payload_bytes: u64,
     pub size_distribution: Vec<WorkloadSizeClass>,
     sizes: Vec<usize>,
@@ -67,6 +89,8 @@ struct SerializedWorkloadPlan {
     generator: String,
     object_count: usize,
     concurrency: usize,
+    #[serde(default)]
+    operation_mix: WorkloadOperationMix,
     total_payload_bytes: u64,
     size_distribution: Vec<WorkloadSizeClass>,
 }
@@ -154,6 +178,35 @@ impl WorkloadPlan {
     const GENERATOR: &'static str = "splitmix64-v1";
 
     pub fn seeded(seed: u64, object_count: usize, concurrency: usize) -> Self {
+        Self::seeded_unchecked(
+            seed,
+            object_count,
+            concurrency,
+            WorkloadOperationMix::default(),
+        )
+    }
+
+    pub fn seeded_with_mix(
+        seed: u64,
+        object_count: usize,
+        concurrency: usize,
+        operation_mix: WorkloadOperationMix,
+    ) -> Result<Self> {
+        operation_mix.validate()?;
+        Ok(Self::seeded_unchecked(
+            seed,
+            object_count,
+            concurrency,
+            operation_mix,
+        ))
+    }
+
+    fn seeded_unchecked(
+        seed: u64,
+        object_count: usize,
+        concurrency: usize,
+        operation_mix: WorkloadOperationMix,
+    ) -> Self {
         const SIZE_CLASSES: &[(usize, usize)] = &[
             (4 * 1024, 85),
             (16 * 1024, 10),
@@ -185,6 +238,7 @@ impl WorkloadPlan {
             generator: Self::GENERATOR.to_string(),
             object_count,
             concurrency,
+            operation_mix,
             total_payload_bytes,
             size_distribution,
             sizes,
@@ -205,6 +259,9 @@ impl WorkloadPlan {
                 raw.concurrency, raw.object_count
             ));
         }
+        raw.operation_mix
+            .validate()
+            .map_err(|error| error.to_string())?;
 
         let distributed_objects =
             raw.size_distribution
@@ -253,10 +310,80 @@ impl WorkloadPlan {
             generator: raw.generator,
             object_count: raw.object_count,
             concurrency: raw.concurrency,
+            operation_mix: raw.operation_mix,
             total_payload_bytes: raw.total_payload_bytes,
             size_distribution: raw.size_distribution,
             sizes,
         })
+    }
+}
+
+impl WorkloadOperationMix {
+    const MAX_WEIGHT: u32 = 100;
+
+    pub fn validate(self) -> Result<()> {
+        for (name, value) in [
+            ("put", self.put),
+            ("overwrite", self.overwrite),
+            ("get", self.get),
+            ("list", self.list),
+            ("delete", self.delete),
+            ("multipart", self.multipart),
+        ] {
+            ensure!(
+                (1..=Self::MAX_WEIGHT).contains(&value),
+                "workload.operationWeights.{name} must be between 1 and {}",
+                Self::MAX_WEIGHT
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn operation_at(self, offset: usize) -> WorkloadOperation {
+        let slot = offset as u64 % self.total_weight();
+        let mut cursor = u64::from(self.put);
+        if slot < cursor {
+            return WorkloadOperation::Put;
+        }
+        cursor += u64::from(self.overwrite);
+        if slot < cursor {
+            return WorkloadOperation::Overwrite;
+        }
+        cursor += u64::from(self.get);
+        if slot < cursor {
+            return WorkloadOperation::Get;
+        }
+        cursor += u64::from(self.list);
+        if slot < cursor {
+            return WorkloadOperation::List;
+        }
+        cursor += u64::from(self.delete);
+        if slot < cursor {
+            return WorkloadOperation::Delete;
+        }
+        WorkloadOperation::Multipart
+    }
+
+    pub fn total_weight(self) -> u64 {
+        u64::from(self.put)
+            + u64::from(self.overwrite)
+            + u64::from(self.get)
+            + u64::from(self.list)
+            + u64::from(self.delete)
+            + u64::from(self.multipart)
+    }
+}
+
+impl Default for WorkloadOperationMix {
+    fn default() -> Self {
+        Self {
+            put: 1,
+            overwrite: 1,
+            get: 1,
+            list: 1,
+            delete: 1,
+            multipart: 1,
+        }
     }
 }
 
@@ -1057,7 +1184,7 @@ fn sdk_error_status<E>(error: &SdkError<E>) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjectSpec, WorkloadPlan, sha256_hex};
+    use super::{ObjectSpec, WorkloadOperation, WorkloadOperationMix, WorkloadPlan, sha256_hex};
 
     #[test]
     fn seeded_objects_have_stable_keys_sizes_and_hashes() {
@@ -1103,6 +1230,80 @@ mod tests {
         );
         assert_eq!(plan.total_payload_bytes, 20_337_459_200);
         assert_eq!(plan.concurrency, 80);
+        assert_eq!(plan.operation_mix, WorkloadOperationMix::default());
+        assert_eq!(
+            (0..6)
+                .map(|offset| plan.operation_mix.operation_at(offset))
+                .collect::<Vec<_>>(),
+            vec![
+                WorkloadOperation::Put,
+                WorkloadOperation::Overwrite,
+                WorkloadOperation::Get,
+                WorkloadOperation::List,
+                WorkloadOperation::Delete,
+                WorkloadOperation::Multipart,
+            ]
+        );
+    }
+
+    #[test]
+    fn workload_operation_mix_is_weighted_and_validated() {
+        let mix = WorkloadOperationMix {
+            put: 2,
+            overwrite: 1,
+            get: 1,
+            list: 1,
+            delete: 1,
+            multipart: 1,
+        };
+
+        assert_eq!(
+            (0..7)
+                .map(|offset| mix.operation_at(offset))
+                .collect::<Vec<_>>(),
+            vec![
+                WorkloadOperation::Put,
+                WorkloadOperation::Put,
+                WorkloadOperation::Overwrite,
+                WorkloadOperation::Get,
+                WorkloadOperation::List,
+                WorkloadOperation::Delete,
+                WorkloadOperation::Multipart,
+            ]
+        );
+
+        assert!(
+            WorkloadOperationMix {
+                put: 0,
+                ..WorkloadOperationMix::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert_eq!(
+            WorkloadOperationMix {
+                put: u32::MAX,
+                overwrite: u32::MAX,
+                get: u32::MAX,
+                list: u32::MAX,
+                delete: u32::MAX,
+                multipart: u32::MAX,
+            }
+            .total_weight(),
+            u64::from(u32::MAX) * 6
+        );
+        assert!(
+            WorkloadPlan::seeded_with_mix(
+                42,
+                128,
+                8,
+                WorkloadOperationMix {
+                    put: 0,
+                    ..WorkloadOperationMix::default()
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]

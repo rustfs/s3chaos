@@ -17,6 +17,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::fault::{plan::FaultInjectionParameters, workload::WorkloadOperationMix};
 use crate::framework::{command::CommandSpec, config::ClusterTestConfig, kubectl::Kubectl};
 
 pub const DEFAULT_FAULT_NAMESPACE: &str = "rustfs-fault-test";
@@ -72,10 +73,12 @@ pub struct FaultTestConfig {
     pub expected_context: Option<String>,
     pub destructive_enabled: bool,
     pub scenario: String,
+    pub scenario_parameters: FaultInjectionParameters,
     pub duration: Duration,
     pub percent: u8,
     pub percent_overridden: bool,
     pub workload: FaultWorkloadProfile,
+    pub workload_operation_mix: WorkloadOperationMix,
     pub prefill_concurrency: usize,
     pub workload_seed: Option<u64>,
     pub request_timeout: Duration,
@@ -206,6 +209,7 @@ impl FaultTestConfig {
             expected_context,
             destructive_enabled: env_bool(&get_env, "RUSTFS_FAULT_TEST_DESTRUCTIVE")?,
             scenario,
+            scenario_parameters: FaultInjectionParameters::Default,
             duration: Duration::from_secs(env_u64(
                 &get_env,
                 "RUSTFS_FAULT_TEST_DURATION_SECONDS",
@@ -214,6 +218,7 @@ impl FaultTestConfig {
             percent: env_u8(&get_env, "RUSTFS_FAULT_TEST_PERCENT", default_percent)?,
             percent_overridden: env_optional(&get_env, "RUSTFS_FAULT_TEST_PERCENT").is_some(),
             workload,
+            workload_operation_mix: WorkloadOperationMix::default(),
             prefill_concurrency,
             workload_seed: env_optional_u64(&get_env, "RUSTFS_FAULT_TEST_SEED")?,
             request_timeout: Duration::from_secs(env_u64(

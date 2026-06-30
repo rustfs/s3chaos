@@ -17,7 +17,11 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-use crate::fault::scenarios::{FaultScenarioStatus, scenario_spec};
+use crate::fault::{
+    plan::FaultInjectionParameters,
+    scenarios::{FaultScenarioStatus, scenario_spec},
+    workload::WorkloadOperationMix,
+};
 
 pub const FAULT_SUITE_API_VERSION: &str = "rustfs.com/s3chaos/v1alpha1";
 pub const FAULT_SUITE_KIND: &str = "FaultSuite";
@@ -62,6 +66,8 @@ pub struct FaultSuiteBudgets {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FaultSuiteScenario {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<FaultInjectionParameters>,
     #[serde(default = "default_repetitions")]
     pub repetitions: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -79,6 +85,8 @@ pub struct FaultSuiteWorkloadOverride {
     pub objects: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_weights: Option<WorkloadOperationMix>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +146,7 @@ pub struct ResolvedFaultSuiteBudgets {
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedFaultSuiteScenario {
     pub name: String,
+    pub params: FaultInjectionParameters,
     pub repetitions: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_seconds: Option<u64>,
@@ -271,6 +280,8 @@ impl ResolvedFaultSuiteScenario {
         if let Some(workload) = &scenario.workload {
             validate_workload_override(&scenario.name, workload)?;
         }
+        let params = scenario.params.clone().unwrap_or_default();
+        params.validate_for_scenario(&scenario.name)?;
         let duration_seconds = scenario
             .duration
             .as_deref()
@@ -279,6 +290,7 @@ impl ResolvedFaultSuiteScenario {
 
         Ok(Self {
             name: scenario.name.clone(),
+            params,
             repetitions: scenario.repetitions,
             duration_seconds,
             percent: scenario.percent,
@@ -324,31 +336,61 @@ scenarios:
     workload:
       objects: 40000
       concurrency: 80
+      operationWeights:
+        put: 1
+        overwrite: 1
+        get: 1
+        list: 1
+        delete: 1
+        multipart: 1
   - name: network-delay
     duration: 8m
+    params:
+      kind: networkDelay
+      latency: 200ms
+      jitter: 50ms
+      correlationPercent: 25
 "#
     .to_string()
 }
 
 fn validate_workload_override(name: &str, workload: &FaultSuiteWorkloadOverride) -> Result<()> {
-    let objects = workload.objects.with_context(|| {
-        format!("scenario {name} workload override must set both objects and concurrency")
-    })?;
-    let concurrency = workload.concurrency.with_context(|| {
-        format!("scenario {name} workload override must set both objects and concurrency")
-    })?;
     ensure!(
-        objects >= 12,
-        "scenario {name} workload.objects must be at least 12"
+        workload.objects.is_some()
+            || workload.concurrency.is_some()
+            || workload.operation_weights.is_some(),
+        "scenario {name} workload override must set objects/concurrency or operationWeights"
     );
-    ensure!(
-        concurrency > 0,
-        "scenario {name} workload.concurrency must be greater than zero"
-    );
-    ensure!(
-        concurrency <= objects,
-        "scenario {name} workload.concurrency must be <= workload.objects"
-    );
+    if let Some(operation_weights) = workload.operation_weights {
+        operation_weights.validate()?;
+    }
+    match (workload.objects, workload.concurrency) {
+        (Some(objects), Some(concurrency)) => {
+            ensure!(
+                objects >= 12,
+                "scenario {name} workload.objects must be at least 12"
+            );
+            ensure!(
+                concurrency > 0,
+                "scenario {name} workload.concurrency must be greater than zero"
+            );
+            ensure!(
+                concurrency <= objects,
+                "scenario {name} workload.concurrency must be <= workload.objects"
+            );
+            if let Some(operation_weights) = workload.operation_weights {
+                let mixed_count = objects - objects / 2;
+                let total_weight = operation_weights.total_weight();
+                ensure!(
+                    mixed_count as u64 >= total_weight,
+                    "scenario {name} workload.operationWeights total {} requires at least that many mixed-workload objects, got {mixed_count}",
+                    total_weight
+                );
+            }
+        }
+        (None, None) => {}
+        _ => bail!("scenario {name} workload override must set both objects and concurrency"),
+    }
     Ok(())
 }
 
@@ -410,6 +452,7 @@ impl Default for FaultSuiteBudgets {
 #[cfg(test)]
 mod tests {
     use super::{FaultSuite, parse_duration_seconds};
+    use crate::fault::plan::FaultInjectionParameters;
 
     #[test]
     fn resolves_valid_fault_suite() {
@@ -437,6 +480,11 @@ scenarios:
       concurrency: 8
   - name: network-delay
     repetitions: 2
+    params:
+      kind: networkDelay
+      latency: 350ms
+      jitter: 25ms
+      correlationPercent: 10
 "#,
         )
         .expect("suite yaml");
@@ -448,7 +496,46 @@ scenarios:
         assert_eq!(resolved.scenarios[0].duration_seconds, Some(600));
         assert_eq!(resolved.scenarios[0].priority, "p0");
         assert_eq!(resolved.scenarios[1].repetitions, 2);
+        assert_eq!(
+            resolved.scenarios[1].params,
+            FaultInjectionParameters::NetworkDelay {
+                latency: "350ms".to_string(),
+                jitter: "25ms".to_string(),
+                correlation_percent: 10,
+            }
+        );
         assert!(resolved.scenarios[0].requires_chaos_mesh);
+    }
+
+    #[test]
+    fn accepts_operation_weights_without_object_override() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: io-eio
+    workload:
+      operationWeights:
+        put: 2
+        overwrite: 1
+        get: 3
+        list: 1
+        delete: 1
+        multipart: 1
+"#,
+        )
+        .expect("suite yaml");
+
+        let resolved = suite.resolve().expect("resolved suite");
+
+        let workload = resolved.scenarios[0].workload.as_ref().expect("workload");
+        assert_eq!(
+            workload.operation_weights.expect("operation weights").get,
+            3
+        );
     }
 
     #[test]
@@ -498,6 +585,109 @@ scenarios:
                 .to_string()
                 .contains("must set both objects and concurrency")
         );
+    }
+
+    #[test]
+    fn rejects_unsupported_scenario_params() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: io-eio
+    params:
+      kind: networkDelay
+      latency: 200ms
+      jitter: 50ms
+      correlationPercent: 25
+"#,
+        )
+        .expect("suite yaml");
+
+        let error = suite.resolve().expect_err("unsupported params");
+
+        assert!(error.to_string().contains("does not support typed params"));
+    }
+
+    #[test]
+    fn rejects_unsafe_scenario_params() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: network-loss
+    params:
+      kind: networkLoss
+      lossPercent: 0
+      correlationPercent: 25
+"#,
+        )
+        .expect("suite yaml");
+
+        let error = suite.resolve().expect_err("unsafe params");
+
+        assert!(error.to_string().contains("lossPercent"));
+    }
+
+    #[test]
+    fn rejects_unsafe_operation_weights() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: io-eio
+    workload:
+      operationWeights:
+        put: 0
+        overwrite: 1
+        get: 1
+        list: 1
+        delete: 1
+        multipart: 1
+"#,
+        )
+        .expect("suite yaml");
+
+        let error = suite.resolve().expect_err("unsafe operation weights");
+
+        assert!(error.to_string().contains("operationWeights.put"));
+    }
+
+    #[test]
+    fn rejects_extreme_operation_weights_before_total_check() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: io-eio
+    workload:
+      objects: 64
+      concurrency: 8
+      operationWeights:
+        put: 4294967295
+        overwrite: 4294967295
+        get: 4294967295
+        list: 4294967295
+        delete: 4294967295
+        multipart: 4294967295
+"#,
+        )
+        .expect("suite yaml");
+
+        let error = suite.resolve().expect_err("extreme operation weights");
+
+        assert!(error.to_string().contains("operationWeights.put"));
     }
 
     #[test]

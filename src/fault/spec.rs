@@ -17,7 +17,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::fault::{
     config::FaultTestConfig,
-    plan::{FaultInjection, FaultPlan, FaultSelection, FaultTarget, FaultWorkloadMode},
+    plan::{
+        FaultInjection, FaultInjectionParameters, FaultPlan, FaultSelection, FaultTarget,
+        FaultWorkloadMode,
+    },
     scenarios::{FaultScenario, FaultScenarioSpec},
     workload::WorkloadPlan,
 };
@@ -73,6 +76,8 @@ pub struct FaultRunWorkloadSpec {
     pub mode: String,
     pub object_count: usize,
     pub concurrency: usize,
+    #[serde(default)]
+    pub operation_mix: crate::fault::workload::WorkloadOperationMix,
     pub prefill_concurrency: usize,
     pub request_timeout_seconds: u64,
     pub seed: u64,
@@ -92,6 +97,8 @@ pub struct FaultRunFaultSpec {
     pub name: String,
     pub kind: String,
     pub backend: String,
+    #[serde(default)]
+    pub parameters: FaultInjectionParameters,
     pub target: FaultRunTargetSpec,
     pub selection: FaultRunSelectionSpec,
     pub duration_seconds: u64,
@@ -158,6 +165,7 @@ impl FaultRunSpec {
                 mode: workload_mode_name(plan.workload_mode).to_string(),
                 object_count: workload_plan.object_count,
                 concurrency: workload_plan.concurrency,
+                operation_mix: workload_plan.operation_mix,
                 prefill_concurrency: config.prefill_concurrency,
                 request_timeout_seconds: config.request_timeout.as_secs(),
                 seed: workload_plan.seed,
@@ -222,6 +230,7 @@ impl FaultRunFaultSpec {
             name: format!("{}-{:02}-{}", scenario.name, index, fault.kind().as_str()),
             kind: fault.kind().as_str().to_string(),
             backend: fault.backend().as_str().to_string(),
+            parameters: fault.parameters().clone(),
             target: FaultRunTargetSpec::from_target(fault.target()),
             selection: FaultRunSelectionSpec::from_selection(fault.selection()),
             duration_seconds: fault.duration().as_secs(),

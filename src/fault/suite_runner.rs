@@ -109,6 +109,7 @@ pub struct FaultSuitePlanWorkload {
     pub mode: String,
     pub objects: usize,
     pub concurrency: usize,
+    pub operation_mix: crate::fault::workload::WorkloadOperationMix,
     pub prefill_concurrency: usize,
     pub request_timeout_seconds: u64,
     pub seed: u64,
@@ -120,6 +121,7 @@ pub struct FaultSuitePlanFault {
     pub name: String,
     pub kind: String,
     pub backend: String,
+    pub parameters: crate::fault::plan::FaultInjectionParameters,
     pub target: FaultSuitePlanTarget,
     pub selection: FaultSuitePlanSelection,
     pub duration_seconds: u64,
@@ -559,6 +561,7 @@ impl FaultSuitePlanAttempt {
                 mode: workload_mode_name(input.fault_plan.workload_mode).to_string(),
                 objects: input.config.workload.object_count,
                 concurrency: input.config.workload.concurrency,
+                operation_mix: input.config.workload_operation_mix,
                 prefill_concurrency: input.config.prefill_concurrency,
                 request_timeout_seconds: input.config.request_timeout.as_secs(),
                 seed,
@@ -600,6 +603,7 @@ impl FaultSuitePlanFault {
             name: format!("{}-{:02}-{}", scenario.name, index, fault.kind().as_str()),
             kind: fault.kind().as_str().to_string(),
             backend: fault.backend().as_str().to_string(),
+            parameters: fault.parameters().clone(),
             target: FaultSuitePlanTarget::from_target(fault.target()),
             selection: FaultSuitePlanSelection::from_selection(fault.selection()),
             duration_seconds: fault.duration().as_secs(),
@@ -668,6 +672,7 @@ fn scenario_config(
 ) -> Result<FaultTestConfig> {
     let mut config = base.clone();
     config.scenario = scenario.name.clone();
+    config.scenario_parameters = scenario.params.clone();
     if let Some(duration_seconds) = scenario.duration_seconds {
         config.duration = Duration::from_secs(duration_seconds);
     }
@@ -682,6 +687,9 @@ fn scenario_config(
         let object_count = workload.objects.unwrap_or(config.workload.object_count);
         let concurrency = workload.concurrency.unwrap_or(config.workload.concurrency);
         config.workload = FaultWorkloadProfile::new(object_count, concurrency)?;
+        config.workload_operation_mix = workload
+            .operation_weights
+            .unwrap_or(config.workload_operation_mix);
         config.prefill_concurrency = config
             .prefill_concurrency
             .min(config.workload.concurrency)
@@ -900,7 +908,10 @@ mod tests {
         attempt_seed, build_fault_suite_execution_plan, scenario_config,
         suite_duration_budget_failure, validate_suite_runtime_contract,
     };
-    use crate::fault::{config::FaultTestConfig, suite::FaultSuite};
+    use crate::fault::{
+        config::FaultTestConfig, plan::FaultInjectionParameters, suite::FaultSuite,
+        workload::WorkloadOperationMix,
+    };
     use std::{path::PathBuf, time::Duration};
 
     #[test]
@@ -955,6 +966,7 @@ scenarios:
         assert_eq!(first.duration_seconds, 600);
         assert_eq!(first.workload.objects, 64);
         assert_eq!(first.workload.concurrency, 8);
+        assert_eq!(first.workload.operation_mix.put, 1);
         assert_eq!(first.workload.seed, attempt_seed(Some(100), 1, 1).unwrap());
         assert!(first.artifacts.attempt_dir.ends_with("001-io-eio-r1"));
         assert!(
@@ -976,6 +988,7 @@ scenarios:
         let fault = &first.faults[0];
         assert_eq!(fault.kind, "rustfs_volume_io_error");
         assert_eq!(fault.backend, "chaos-mesh-io-chaos");
+        assert_eq!(fault.parameters, FaultInjectionParameters::Default);
         assert_eq!(fault.target.kind, "rustfs-volume");
         assert_eq!(fault.target.path.as_deref(), Some("/data/rustfs0"));
         assert_eq!(fault.selection.kind, "percent");
@@ -984,6 +997,101 @@ scenarios:
             execution.attempts[0].config.cluster.artifacts_dir,
             PathBuf::from("target/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1")
         );
+    }
+
+    #[test]
+    fn suite_plan_carries_typed_params_and_operation_weights() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: network-delay
+    duration: 8m
+    params:
+      kind: networkDelay
+      latency: 350ms
+      jitter: 75ms
+      correlationPercent: 15
+    workload:
+      objects: 72
+      concurrency: 9
+      operationWeights:
+        put: 2
+        overwrite: 1
+        get: 3
+        list: 1
+        delete: 1
+        multipart: 1
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite");
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.workload_seed = Some(100);
+
+        let execution = build_fault_suite_execution_plan(suite, base, "suite-fixed".to_string())
+            .expect("suite execution plan");
+
+        let attempt = &execution.plan.attempts[0];
+        assert_eq!(attempt.workload.objects, 72);
+        assert_eq!(attempt.workload.concurrency, 9);
+        assert_eq!(attempt.workload.operation_mix.put, 2);
+        assert_eq!(attempt.workload.operation_mix.get, 3);
+        assert_eq!(
+            attempt.faults[0].parameters,
+            FaultInjectionParameters::NetworkDelay {
+                latency: "350ms".to_string(),
+                jitter: "75ms".to_string(),
+                correlation_percent: 15,
+            }
+        );
+        assert_eq!(
+            execution.attempts[0].config.scenario_parameters,
+            attempt.faults[0].parameters
+        );
+        assert_eq!(execution.attempts[0].config.workload_operation_mix.get, 3);
+    }
+
+    #[test]
+    fn workload_override_inherits_base_operation_mix_when_weights_are_omitted() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: io-eio
+    workload:
+      objects: 72
+      concurrency: 9
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite");
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.workload_operation_mix = WorkloadOperationMix {
+            put: 2,
+            overwrite: 1,
+            get: 3,
+            list: 1,
+            delete: 1,
+            multipart: 1,
+        };
+        let attempt_dir =
+            PathBuf::from("target/fault-tests/artifacts/rustfs-smoke/suite-fixed/001-io-eio-r1");
+
+        let config = scenario_config(&base, &suite, &suite.scenarios[0], 1, 1, &attempt_dir)
+            .expect("scenario config");
+
+        assert_eq!(config.workload.object_count, 72);
+        assert_eq!(config.workload.concurrency, 9);
+        assert_eq!(config.workload_operation_mix, base.workload_operation_mix);
     }
 
     #[test]

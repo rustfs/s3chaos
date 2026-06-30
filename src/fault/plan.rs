@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use anyhow::{Result, bail, ensure};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use crate::fault::{
@@ -119,6 +121,352 @@ impl FaultSelection {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub enum IoMethod {
+    Read,
+    Write,
+}
+
+impl IoMethod {
+    pub fn as_chaos_mesh_method(self) -> &'static str {
+        match self {
+            Self::Read => "READ",
+            Self::Write => "WRITE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind", deny_unknown_fields)]
+pub enum FaultInjectionParameters {
+    #[default]
+    Default,
+    IoLatency {
+        delay: String,
+        methods: Vec<IoMethod>,
+    },
+    NetworkDelay {
+        latency: String,
+        jitter: String,
+        #[serde(rename = "correlationPercent")]
+        correlation_percent: u8,
+    },
+    NetworkLoss {
+        #[serde(rename = "lossPercent")]
+        loss_percent: u8,
+        #[serde(rename = "correlationPercent")]
+        correlation_percent: u8,
+    },
+    NetworkCorrupt {
+        #[serde(rename = "corruptPercent")]
+        corrupt_percent: u8,
+        #[serde(rename = "correlationPercent")]
+        correlation_percent: u8,
+    },
+    NetworkDuplicate {
+        #[serde(rename = "duplicatePercent")]
+        duplicate_percent: u8,
+        #[serde(rename = "correlationPercent")]
+        correlation_percent: u8,
+    },
+    StressCpu {
+        workers: u32,
+        load: u8,
+    },
+    StressMemory {
+        workers: u32,
+        size: String,
+    },
+}
+
+impl FaultInjectionParameters {
+    pub fn resolve_for_kind(&self, kind: FaultKind) -> Result<Self> {
+        let resolved = if matches!(self, Self::Default) {
+            Self::default_for_kind(kind)
+        } else {
+            self.clone()
+        };
+        resolved.validate_for_kind(kind)?;
+        Ok(resolved)
+    }
+
+    pub fn validate_for_scenario(&self, scenario: &str) -> Result<()> {
+        if matches!(self, Self::Default) {
+            return Ok(());
+        }
+        let kind = match scenario {
+            IO_LATENCY_SCENARIO => FaultKind::RustfsVolumeLatency,
+            NETWORK_DELAY_SCENARIO => FaultKind::RustfsServerNetworkDelay,
+            NETWORK_LOSS_SCENARIO => FaultKind::RustfsServerNetworkLoss,
+            NETWORK_CORRUPT_SCENARIO => FaultKind::RustfsServerNetworkCorrupt,
+            NETWORK_DUPLICATE_SCENARIO => FaultKind::RustfsServerNetworkDuplicate,
+            STRESS_CPU_SCENARIO => FaultKind::RustfsServerCpuStress,
+            STRESS_MEMORY_SCENARIO => FaultKind::RustfsServerMemoryStress,
+            _ => bail!("scenario {scenario:?} does not support typed params yet"),
+        };
+        self.validate_for_kind(kind)
+    }
+
+    pub fn io_latency(&self) -> Result<(String, Vec<String>)> {
+        match self {
+            Self::IoLatency { delay, methods } => Ok((
+                delay.clone(),
+                methods
+                    .iter()
+                    .map(|method| method.as_chaos_mesh_method().to_string())
+                    .collect(),
+            )),
+            other => bail!("expected ioLatency parameters, got {:?}", other),
+        }
+    }
+
+    pub fn network_delay(&self) -> Result<(String, String, u8)> {
+        match self {
+            Self::NetworkDelay {
+                latency,
+                jitter,
+                correlation_percent,
+            } => Ok((latency.clone(), jitter.clone(), *correlation_percent)),
+            other => bail!("expected networkDelay parameters, got {:?}", other),
+        }
+    }
+
+    pub fn network_loss(&self) -> Result<(u8, u8)> {
+        match self {
+            Self::NetworkLoss {
+                loss_percent,
+                correlation_percent,
+            } => Ok((*loss_percent, *correlation_percent)),
+            other => bail!("expected networkLoss parameters, got {:?}", other),
+        }
+    }
+
+    pub fn network_corrupt(&self) -> Result<(u8, u8)> {
+        match self {
+            Self::NetworkCorrupt {
+                corrupt_percent,
+                correlation_percent,
+            } => Ok((*corrupt_percent, *correlation_percent)),
+            other => bail!("expected networkCorrupt parameters, got {:?}", other),
+        }
+    }
+
+    pub fn network_duplicate(&self) -> Result<(u8, u8)> {
+        match self {
+            Self::NetworkDuplicate {
+                duplicate_percent,
+                correlation_percent,
+            } => Ok((*duplicate_percent, *correlation_percent)),
+            other => bail!("expected networkDuplicate parameters, got {:?}", other),
+        }
+    }
+
+    pub fn stress_cpu(&self) -> Result<(u32, u8)> {
+        match self {
+            Self::StressCpu { workers, load } => Ok((*workers, *load)),
+            other => bail!("expected stressCpu parameters, got {:?}", other),
+        }
+    }
+
+    pub fn stress_memory(&self) -> Result<(u32, String)> {
+        match self {
+            Self::StressMemory { workers, size } => Ok((*workers, size.clone())),
+            other => bail!("expected stressMemory parameters, got {:?}", other),
+        }
+    }
+
+    fn default_for_kind(kind: FaultKind) -> Self {
+        match kind {
+            FaultKind::RustfsVolumeLatency => Self::IoLatency {
+                delay: "250ms".to_string(),
+                methods: vec![IoMethod::Read, IoMethod::Write],
+            },
+            FaultKind::RustfsServerNetworkDelay => Self::NetworkDelay {
+                latency: "200ms".to_string(),
+                jitter: "50ms".to_string(),
+                correlation_percent: 25,
+            },
+            FaultKind::RustfsServerNetworkLoss => Self::NetworkLoss {
+                loss_percent: 25,
+                correlation_percent: 25,
+            },
+            FaultKind::RustfsServerNetworkCorrupt => Self::NetworkCorrupt {
+                corrupt_percent: 5,
+                correlation_percent: 25,
+            },
+            FaultKind::RustfsServerNetworkDuplicate => Self::NetworkDuplicate {
+                duplicate_percent: 10,
+                correlation_percent: 25,
+            },
+            FaultKind::RustfsServerCpuStress => Self::StressCpu {
+                workers: 1,
+                load: 80,
+            },
+            FaultKind::RustfsServerMemoryStress => Self::StressMemory {
+                workers: 1,
+                size: "512MiB".to_string(),
+            },
+            _ => Self::Default,
+        }
+    }
+
+    fn validate_for_kind(&self, kind: FaultKind) -> Result<()> {
+        match (kind, self) {
+            (_, Self::Default) => Ok(()),
+            (FaultKind::RustfsVolumeLatency, Self::IoLatency { delay, methods }) => {
+                validate_duration_token("params.delay", delay, false, 60_000)?;
+                validate_io_methods(methods)?;
+                Ok(())
+            }
+            (
+                FaultKind::RustfsServerNetworkDelay,
+                Self::NetworkDelay {
+                    latency,
+                    jitter,
+                    correlation_percent,
+                },
+            ) => {
+                validate_duration_token("params.latency", latency, false, 60_000)?;
+                validate_duration_token("params.jitter", jitter, true, 60_000)?;
+                validate_correlation(*correlation_percent)?;
+                Ok(())
+            }
+            (
+                FaultKind::RustfsServerNetworkLoss,
+                Self::NetworkLoss {
+                    loss_percent,
+                    correlation_percent,
+                },
+            ) => {
+                validate_percent("params.lossPercent", *loss_percent)?;
+                validate_correlation(*correlation_percent)?;
+                Ok(())
+            }
+            (
+                FaultKind::RustfsServerNetworkCorrupt,
+                Self::NetworkCorrupt {
+                    corrupt_percent,
+                    correlation_percent,
+                },
+            ) => {
+                validate_percent("params.corruptPercent", *corrupt_percent)?;
+                validate_correlation(*correlation_percent)?;
+                Ok(())
+            }
+            (
+                FaultKind::RustfsServerNetworkDuplicate,
+                Self::NetworkDuplicate {
+                    duplicate_percent,
+                    correlation_percent,
+                },
+            ) => {
+                validate_percent("params.duplicatePercent", *duplicate_percent)?;
+                validate_correlation(*correlation_percent)?;
+                Ok(())
+            }
+            (FaultKind::RustfsServerCpuStress, Self::StressCpu { workers, load }) => {
+                validate_workers(*workers)?;
+                ensure!(
+                    (1..=100).contains(load),
+                    "params.load must be between 1 and 100"
+                );
+                Ok(())
+            }
+            (FaultKind::RustfsServerMemoryStress, Self::StressMemory { workers, size }) => {
+                validate_workers(*workers)?;
+                validate_memory_size(size)?;
+                Ok(())
+            }
+            _ => bail!(
+                "parameters kind {:?} is not supported by fault kind {}",
+                self,
+                kind.as_str()
+            ),
+        }
+    }
+}
+
+fn validate_io_methods(methods: &[IoMethod]) -> Result<()> {
+    ensure!(!methods.is_empty(), "params.methods must not be empty");
+    let unique = methods.iter().copied().collect::<BTreeSet<_>>();
+    ensure!(
+        unique.len() == methods.len(),
+        "params.methods must not contain duplicates"
+    );
+    Ok(())
+}
+
+fn validate_duration_token(field: &str, value: &str, allow_zero: bool, max_ms: u64) -> Result<u64> {
+    let value = value.trim();
+    ensure!(!value.is_empty(), "{field} must not be empty");
+    let (digits, multiplier) = if let Some(digits) = value.strip_suffix("ms") {
+        (digits, 1)
+    } else if let Some(digits) = value.strip_suffix('s') {
+        (digits, 1_000)
+    } else {
+        bail!("{field} must use ms or s units, got {value:?}");
+    };
+    let amount = digits
+        .parse::<u64>()
+        .map_err(|error| anyhow::anyhow!("parse {field} {value:?}: {error}"))?;
+    ensure!(
+        allow_zero || amount > 0,
+        "{field} must be greater than zero"
+    );
+    let millis = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow::anyhow!("{field} overflowed"))?;
+    ensure!(millis <= max_ms, "{field} must be <= {max_ms}ms");
+    Ok(millis)
+}
+
+fn validate_percent(field: &str, value: u8) -> Result<()> {
+    ensure!(
+        (1..=100).contains(&value),
+        "{field} must be between 1 and 100"
+    );
+    Ok(())
+}
+
+fn validate_correlation(value: u8) -> Result<()> {
+    ensure!(
+        value <= 100,
+        "params.correlationPercent must be between 0 and 100"
+    );
+    Ok(())
+}
+
+fn validate_workers(value: u32) -> Result<()> {
+    ensure!(
+        (1..=16).contains(&value),
+        "params.workers must be between 1 and 16"
+    );
+    Ok(())
+}
+
+fn validate_memory_size(value: &str) -> Result<()> {
+    let value = value.trim();
+    let mib = if let Some(amount) = value.strip_suffix("MiB") {
+        amount
+            .parse::<u64>()
+            .map_err(|error| anyhow::anyhow!("parse params.size {value:?}: {error}"))?
+    } else if let Some(amount) = value.strip_suffix("GiB") {
+        amount
+            .parse::<u64>()
+            .map_err(|error| anyhow::anyhow!("parse params.size {value:?}: {error}"))?
+            .checked_mul(1024)
+            .ok_or_else(|| anyhow::anyhow!("params.size overflowed"))?
+    } else {
+        bail!("params.size must use MiB or GiB units, got {value:?}");
+    };
+    ensure!(
+        (64..=8192).contains(&mib),
+        "params.size must be between 64MiB and 8192MiB"
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FaultInjection {
     kind: FaultKind,
@@ -126,6 +474,7 @@ pub struct FaultInjection {
     target: FaultTarget,
     selection: FaultSelection,
     duration: Duration,
+    parameters: FaultInjectionParameters,
 }
 
 impl FaultInjection {
@@ -135,6 +484,24 @@ impl FaultInjection {
         target: FaultTarget,
         selection: FaultSelection,
         duration: Duration,
+    ) -> Result<Self> {
+        Self::new_with_parameters(
+            kind,
+            backend,
+            target,
+            selection,
+            duration,
+            FaultInjectionParameters::Default,
+        )
+    }
+
+    pub fn new_with_parameters(
+        kind: FaultKind,
+        backend: FaultBackend,
+        target: FaultTarget,
+        selection: FaultSelection,
+        duration: Duration,
+        parameters: FaultInjectionParameters,
     ) -> Result<Self> {
         ensure!(
             fault_kind_accepts_backend(kind, backend),
@@ -158,6 +525,7 @@ impl FaultInjection {
             validate_rustfs_volume_path(path)?;
         }
         ensure!(duration > Duration::ZERO, "fault duration must be positive");
+        let parameters = parameters.resolve_for_kind(kind)?;
 
         Ok(Self {
             kind,
@@ -165,6 +533,7 @@ impl FaultInjection {
             target,
             selection,
             duration,
+            parameters,
         })
     }
 
@@ -197,6 +566,10 @@ impl FaultInjection {
 
     pub fn duration(&self) -> Duration {
         self.duration
+    }
+
+    pub fn parameters(&self) -> &FaultInjectionParameters {
+        &self.parameters
     }
 
     pub fn rustfs_volume_path(&self) -> Result<&str> {
@@ -301,12 +674,14 @@ pub struct FaultPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FaultPlanOptions {
     pub rustfs_volume_path: String,
+    pub scenario_parameters: FaultInjectionParameters,
 }
 
 impl FaultPlanOptions {
     pub fn from_config(config: &FaultTestConfig) -> Self {
         Self {
             rustfs_volume_path: config.rustfs_volume_path.clone(),
+            scenario_parameters: config.scenario_parameters.clone(),
         }
     }
 }
@@ -315,6 +690,7 @@ impl Default for FaultPlanOptions {
     fn default() -> Self {
         Self {
             rustfs_volume_path: DEFAULT_RUSTFS_DATA_VOLUME.to_string(),
+            scenario_parameters: FaultInjectionParameters::Default,
         }
     }
 }
@@ -370,6 +746,7 @@ impl FaultPlan {
                 spec,
                 scenario,
                 &options.rustfs_volume_path,
+                &options.scenario_parameters,
             )?,
             POD_KILL_ONE_SCENARIO => FaultInjection::new(
                 FaultKind::RustfsServerPodKill,
@@ -392,42 +769,63 @@ impl FaultPlan {
                 FaultSelection::FixedTargets(1),
                 scenario.duration,
             )?,
-            NETWORK_DELAY_SCENARIO => {
-                network_fault(FaultKind::RustfsServerNetworkDelay, spec, scenario)?
-            }
-            NETWORK_LOSS_SCENARIO => {
-                network_fault(FaultKind::RustfsServerNetworkLoss, spec, scenario)?
-            }
-            NETWORK_CORRUPT_SCENARIO => {
-                network_fault(FaultKind::RustfsServerNetworkCorrupt, spec, scenario)?
-            }
-            NETWORK_DUPLICATE_SCENARIO => {
-                network_fault(FaultKind::RustfsServerNetworkDuplicate, spec, scenario)?
-            }
+            NETWORK_DELAY_SCENARIO => network_fault(
+                FaultKind::RustfsServerNetworkDelay,
+                spec,
+                scenario,
+                &options.scenario_parameters,
+            )?,
+            NETWORK_LOSS_SCENARIO => network_fault(
+                FaultKind::RustfsServerNetworkLoss,
+                spec,
+                scenario,
+                &options.scenario_parameters,
+            )?,
+            NETWORK_CORRUPT_SCENARIO => network_fault(
+                FaultKind::RustfsServerNetworkCorrupt,
+                spec,
+                scenario,
+                &options.scenario_parameters,
+            )?,
+            NETWORK_DUPLICATE_SCENARIO => network_fault(
+                FaultKind::RustfsServerNetworkDuplicate,
+                spec,
+                scenario,
+                &options.scenario_parameters,
+            )?,
             IO_READ_MISTAKE_SCENARIO => volume_fault(
                 FaultKind::RustfsVolumeReadMistake,
                 spec,
                 scenario,
                 &options.rustfs_volume_path,
+                &options.scenario_parameters,
             )?,
             IO_LATENCY_SCENARIO => volume_fault(
                 FaultKind::RustfsVolumeLatency,
                 spec,
                 scenario,
                 &options.rustfs_volume_path,
+                &options.scenario_parameters,
             )?,
             DISK_FULL_SCENARIO => volume_fault(
                 FaultKind::RustfsVolumeEnospc,
                 spec,
                 scenario,
                 &options.rustfs_volume_path,
+                &options.scenario_parameters,
             )?,
-            STRESS_CPU_SCENARIO => {
-                resource_fault(FaultKind::RustfsServerCpuStress, spec, scenario)?
-            }
-            STRESS_MEMORY_SCENARIO => {
-                resource_fault(FaultKind::RustfsServerMemoryStress, spec, scenario)?
-            }
+            STRESS_CPU_SCENARIO => resource_fault(
+                FaultKind::RustfsServerCpuStress,
+                spec,
+                scenario,
+                &options.scenario_parameters,
+            )?,
+            STRESS_MEMORY_SCENARIO => resource_fault(
+                FaultKind::RustfsServerMemoryStress,
+                spec,
+                scenario,
+                &options.scenario_parameters,
+            )?,
             DM_FLAKEY_SCENARIO => FaultInjection::new(
                 FaultKind::RustfsBlockDeviceFlakey,
                 spec.backend,
@@ -440,6 +838,7 @@ impl FaultPlan {
                 spec,
                 scenario,
                 &options.rustfs_volume_path,
+                &options.scenario_parameters,
             )?,
             other => bail!("scenario {other:?} has no fault plan mapping"),
         };
@@ -501,8 +900,9 @@ fn volume_fault(
     spec: &FaultScenarioSpec,
     scenario: &FaultScenario,
     volume_path: &str,
+    parameters: &FaultInjectionParameters,
 ) -> Result<FaultInjection> {
-    FaultInjection::new(
+    FaultInjection::new_with_parameters(
         kind,
         spec.backend,
         FaultTarget::RustfsVolume {
@@ -510,6 +910,7 @@ fn volume_fault(
         },
         FaultSelection::Percent(scenario.percent),
         scenario.duration,
+        parameters.resolve_for_kind(kind)?,
     )
 }
 
@@ -517,13 +918,15 @@ fn network_fault(
     kind: FaultKind,
     spec: &FaultScenarioSpec,
     scenario: &FaultScenario,
+    parameters: &FaultInjectionParameters,
 ) -> Result<FaultInjection> {
-    FaultInjection::new(
+    FaultInjection::new_with_parameters(
         kind,
         spec.backend,
         FaultTarget::RustfsServerPeerNetwork,
         FaultSelection::FixedTargets(1),
         scenario.duration,
+        parameters.resolve_for_kind(kind)?,
     )
 }
 
@@ -531,21 +934,23 @@ fn resource_fault(
     kind: FaultKind,
     spec: &FaultScenarioSpec,
     scenario: &FaultScenario,
+    parameters: &FaultInjectionParameters,
 ) -> Result<FaultInjection> {
-    FaultInjection::new(
+    FaultInjection::new_with_parameters(
         kind,
         spec.backend,
         FaultTarget::RustfsServerResource,
         FaultSelection::FixedTargets(1),
         scenario.duration,
+        parameters.resolve_for_kind(kind)?,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_RUSTFS_DATA_VOLUME, FaultInjection, FaultKind, FaultPlan, FaultSelection,
-        FaultTarget, FaultWorkloadMode,
+        DEFAULT_RUSTFS_DATA_VOLUME, FaultInjection, FaultInjectionParameters, FaultKind, FaultPlan,
+        FaultSelection, FaultTarget, FaultWorkloadMode,
     };
     use crate::fault::{
         config::FaultTestConfig,
@@ -657,6 +1062,27 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn fault_injection_new_resolves_default_parameters_for_parameterized_kind() {
+        let injection = FaultInjection::new(
+            FaultKind::RustfsServerNetworkDelay,
+            FaultBackend::ChaosMeshNetworkChaos,
+            FaultTarget::RustfsServerPeerNetwork,
+            FaultSelection::FixedTargets(1),
+            Duration::from_secs(60),
+        )
+        .expect("network delay fault");
+
+        assert_eq!(
+            injection.parameters(),
+            &FaultInjectionParameters::NetworkDelay {
+                latency: "200ms".to_string(),
+                jitter: "50ms".to_string(),
+                correlation_percent: 25,
+            }
+        );
     }
 
     #[test]

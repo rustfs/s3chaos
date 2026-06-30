@@ -75,8 +75,10 @@ pub(crate) struct RunMetadata {
     duration_seconds: u64,
     percent: Option<u8>,
     fault_selection: Vec<String>,
+    fault_parameters: Vec<crate::fault::plan::FaultInjectionParameters>,
     workload_objects: usize,
     workload_concurrency: usize,
+    workload_operation_mix: crate::fault::workload::WorkloadOperationMix,
     prefill_concurrency: usize,
     request_timeout_seconds: u64,
     use_cluster_ip: bool,
@@ -119,8 +121,14 @@ impl RunMetadata {
                 .iter()
                 .map(|fault| fault.selection().summary())
                 .collect(),
+            fault_parameters: plan
+                .faults()
+                .iter()
+                .map(|fault| fault.parameters().clone())
+                .collect(),
             workload_objects: workload_plan.object_count,
             workload_concurrency: workload_plan.concurrency,
+            workload_operation_mix: workload_plan.operation_mix,
             prefill_concurrency: config.prefill_concurrency,
             request_timeout_seconds: config.request_timeout.as_secs(),
             use_cluster_ip: config.use_cluster_ip,

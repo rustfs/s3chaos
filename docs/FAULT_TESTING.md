@@ -262,12 +262,13 @@ command for the desired scenario. Tool requirements, such as `warp` for
 ## YAML Suite Contracts
 
 Scenario definitions stay in Rust. YAML suites are a declarative composition
-layer for selected scenarios, budgets, observability, and per-scenario
-overrides. They compile against the Rust catalog and fail fast when a scenario
-name, percent override, duration, or workload budget is invalid. If `workload`
-is present for a scenario, set both `objects` and `concurrency`. Unknown YAML
-fields are rejected so typos cannot silently drop suite budgets or workload
-overrides.
+layer for selected scenarios, budgets, observability, typed scenario parameters,
+and per-scenario workload overrides. They compile against the Rust catalog and
+fail fast when a scenario name, percent override, duration, parameter, or
+workload budget is invalid. If `workload` changes `objects` or `concurrency`,
+set both fields together; `operationWeights` may be set by itself. Unknown YAML
+fields are rejected so typos cannot silently drop suite budgets, parameters, or
+workload overrides.
 
 Generate a starting point:
 
@@ -301,9 +302,28 @@ scenarios:
     workload:
       objects: 40000
       concurrency: 80
+      operationWeights:
+        put: 1
+        overwrite: 1
+        get: 1
+        list: 1
+        delete: 1
+        multipart: 1
   - name: network-delay
     duration: 8m
+    params:
+      kind: networkDelay
+      latency: 200ms
+      jitter: 50ms
+      correlationPercent: 25
 ```
+
+Typed `params` are scenario-gated. `network-delay`, `network-loss`,
+`network-corrupt`, `network-duplicate`, `io-latency`, `stress-cpu`, and
+`stress-memory` accept the matching `kind`; other scenarios reject `params`
+until their safe schema is added. The plan expands defaults and explicit values
+into `parameters`, so operators can review the exact latency, loss/corruption
+rate, IO latency methods, or stress intensity before a destructive run.
 
 Render and review the exact destructive plan before running:
 
@@ -312,11 +332,11 @@ make fault-suite-plan SUITE=suite.yaml
 ```
 
 The plan expands each attempt with scenario, repetition, resolved duration,
-selected faults, targets, workload profile, expected backend, CRDs/tools,
-artifact paths, and budget impact. Suite runs also write the execution plan to
-`suite-plan.json` under the suite artifact root. Set `RUSTFS_FAULT_TEST_SEED`
-before both planning and running when the preview and execution must use the
-same workload seeds.
+selected faults, typed fault parameters, targets, workload profile and operation
+mix, expected backend, CRDs/tools, artifact paths, and budget impact. Suite runs
+also write the execution plan to `suite-plan.json` under the suite artifact
+root. Set `RUSTFS_FAULT_TEST_SEED` before both planning and running when the
+preview and execution must use the same workload seeds.
 
 Run a suite sequentially:
 
@@ -414,12 +434,19 @@ A successful run must show:
   retained as sampled workload-time diagnostics.
 - `recommit-report.json`: every previously unconfirmed write was recommitted
   and GET verified after recovery.
-- `workload-plan.json`: object count, concurrency, and payload distribution are
-  internally consistent with the selected environment values.
+- `workload-plan.json`: object count, concurrency, operation mix, and payload
+  distribution are internally consistent with the selected environment values.
 
 If a scenario fails, inspect `failure-summary.json`,
 `runner-failure-summary.json`, `test.log`, `fault-status-*.json`, and the
 RustFS Pod logs first.
+When IOChaos deletion times out, the runner also captures
+`iochaos-finalizer-recovery-*.json`, `iochaos-delete-timeout.*`,
+`podiochaos-delete-timeout.*`, target pod/node evidence, target-node
+`chaos-daemon` logs, and `chaos-controller-manager-delete-timeout.log`. If the
+evidence proves the IO fault was already recovered but the IOChaos finalizer is
+stuck, s3chaos may patch only that run-id-owned managed IOChaos finalizer and
+record the action as a warning artifact.
 
 ## Cleanup
 

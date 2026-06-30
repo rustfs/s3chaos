@@ -26,10 +26,10 @@ pub use runtime::{
     require_iochaos_crd, require_networkchaos_crd, require_podchaos_crd, require_stresschaos_crd,
 };
 
-pub(super) const RUN_ID_LABEL: &str = "rustfs-fault-test/run-id";
+pub(crate) const RUN_ID_LABEL: &str = "rustfs-fault-test/run-id";
 const SCENARIO_LABEL: &str = "rustfs-fault-test/scenario";
-pub(super) const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
-pub(super) const MANAGED_BY_VALUE: &str = "s3chaos";
+pub(crate) const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
+pub(crate) const MANAGED_BY_VALUE: &str = "s3chaos";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IoChaosAction {
@@ -44,6 +44,13 @@ pub enum IoChaosAction {
         max_occurrences: u8,
         max_length: usize,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IoLatencyParameters {
+    pub methods: Vec<String>,
+    pub delay: String,
+    pub percent: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +106,13 @@ pub enum NetworkChaosAction {
         duplicate: String,
         correlation: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkDelayParameters {
+    pub latency: String,
+    pub jitter: String,
+    pub correlation_percent: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,16 +232,21 @@ impl IoChaosSpec {
         run_id: impl Into<String>,
         scenario: impl Into<String>,
         volume_path: impl Into<String>,
-        percent: u8,
+        parameters: IoLatencyParameters,
         duration: Duration,
     ) -> Result<Self> {
         ensure!(
-            (1..=100).contains(&percent),
-            "IOChaos percent must be in 1..=100, got {percent}"
+            (1..=100).contains(&parameters.percent),
+            "IOChaos percent must be in 1..=100, got {}",
+            parameters.percent
         );
         ensure!(
             duration > Duration::ZERO,
             "IOChaos duration must be positive"
+        );
+        ensure!(
+            !parameters.methods.is_empty(),
+            "IOChaos methods must not be empty"
         );
 
         let run_id = run_id.into();
@@ -243,11 +262,11 @@ impl IoChaosSpec {
             tenant_name: config.tenant_name.clone(),
             container_name: "rustfs".to_string(),
             volume_path: volume_path.into(),
-            methods: vec!["READ".to_string(), "WRITE".to_string()],
+            methods: parameters.methods,
             action: IoChaosAction::Latency {
-                delay: "250ms".to_string(),
+                delay: parameters.delay,
             },
-            percent,
+            percent: parameters.percent,
             duration,
         })
     }
@@ -496,6 +515,7 @@ impl NetworkChaosSpec {
         run_id: impl Into<String>,
         scenario: impl Into<String>,
         duration: Duration,
+        parameters: NetworkDelayParameters,
     ) -> Result<Self> {
         Self::one_rustfs_pod(
             config,
@@ -505,9 +525,9 @@ impl NetworkChaosSpec {
             duration,
             "net-delay",
             NetworkChaosAction::Delay {
-                latency: "200ms".to_string(),
-                jitter: "50ms".to_string(),
-                correlation: "25".to_string(),
+                latency: parameters.latency,
+                jitter: parameters.jitter,
+                correlation: parameters.correlation_percent.to_string(),
             },
         )
     }
@@ -518,6 +538,8 @@ impl NetworkChaosSpec {
         run_id: impl Into<String>,
         scenario: impl Into<String>,
         duration: Duration,
+        loss_percent: u8,
+        correlation_percent: u8,
     ) -> Result<Self> {
         Self::one_rustfs_pod(
             config,
@@ -527,8 +549,8 @@ impl NetworkChaosSpec {
             duration,
             "net-loss",
             NetworkChaosAction::Loss {
-                loss: "25".to_string(),
-                correlation: "25".to_string(),
+                loss: loss_percent.to_string(),
+                correlation: correlation_percent.to_string(),
             },
         )
     }
@@ -539,6 +561,8 @@ impl NetworkChaosSpec {
         run_id: impl Into<String>,
         scenario: impl Into<String>,
         duration: Duration,
+        corrupt_percent: u8,
+        correlation_percent: u8,
     ) -> Result<Self> {
         Self::one_rustfs_pod(
             config,
@@ -548,8 +572,8 @@ impl NetworkChaosSpec {
             duration,
             "net-corrupt",
             NetworkChaosAction::Corrupt {
-                corrupt: "5".to_string(),
-                correlation: "25".to_string(),
+                corrupt: corrupt_percent.to_string(),
+                correlation: correlation_percent.to_string(),
             },
         )
     }
@@ -560,6 +584,8 @@ impl NetworkChaosSpec {
         run_id: impl Into<String>,
         scenario: impl Into<String>,
         duration: Duration,
+        duplicate_percent: u8,
+        correlation_percent: u8,
     ) -> Result<Self> {
         Self::one_rustfs_pod(
             config,
@@ -569,8 +595,8 @@ impl NetworkChaosSpec {
             duration,
             "net-duplicate",
             NetworkChaosAction::Duplicate {
-                duplicate: "10".to_string(),
-                correlation: "25".to_string(),
+                duplicate: duplicate_percent.to_string(),
+                correlation: correlation_percent.to_string(),
             },
         )
     }
@@ -702,6 +728,8 @@ impl StressChaosSpec {
         run_id: impl Into<String>,
         scenario: impl Into<String>,
         duration: Duration,
+        workers: u32,
+        load: u8,
     ) -> Result<Self> {
         Self::one_rustfs_pod(
             config,
@@ -711,8 +739,8 @@ impl StressChaosSpec {
             duration,
             "stress-cpu",
             StressChaosAction::Cpu {
-                workers: 1,
-                load: 80,
+                workers,
+                load: load.into(),
             },
         )
     }
@@ -723,6 +751,8 @@ impl StressChaosSpec {
         run_id: impl Into<String>,
         scenario: impl Into<String>,
         duration: Duration,
+        workers: u32,
+        size: impl Into<String>,
     ) -> Result<Self> {
         Self::one_rustfs_pod(
             config,
@@ -732,8 +762,8 @@ impl StressChaosSpec {
             duration,
             "stress-memory",
             StressChaosAction::Memory {
-                workers: 1,
-                size: "512MiB".to_string(),
+                workers,
+                size: size.into(),
             },
         )
     }
@@ -828,8 +858,8 @@ spec:
 #[cfg(test)]
 mod tests {
     use super::{
-        IoChaosSpec, NetworkChaosSpec, PodChaosSpec, StressChaosSpec,
-        runtime::chaos_experiment_is_active,
+        IoChaosSpec, IoLatencyParameters, NetworkChaosSpec, NetworkDelayParameters, PodChaosSpec,
+        StressChaosSpec, runtime::chaos_experiment_is_active,
     };
     use crate::fault::config::FaultTestConfig;
     use std::time::Duration;
@@ -890,15 +920,20 @@ mod tests {
             "run-1234567890",
             "io-latency",
             "/data/rustfs0",
-            20,
+            IoLatencyParameters {
+                methods: vec!["READ".to_string()],
+                delay: "400ms".to_string(),
+                percent: 20,
+            },
             Duration::from_secs(60),
         )
         .expect("valid latency chaos");
         let manifest = spec.manifest();
 
         assert!(manifest.contains("action: latency"));
-        assert!(manifest.contains("delay: 250ms"));
-        assert!(manifest.contains("methods:\n    - READ\n    - WRITE"));
+        assert!(manifest.contains("delay: 400ms"));
+        assert!(manifest.contains("methods:\n    - READ"));
+        assert!(!manifest.contains("    - WRITE"));
     }
 
     #[test]
@@ -929,6 +964,11 @@ mod tests {
             "run-1234567890",
             "network-delay",
             Duration::from_secs(60),
+            NetworkDelayParameters {
+                latency: "350ms".to_string(),
+                jitter: "75ms".to_string(),
+                correlation_percent: 15,
+            },
         )
         .expect("valid network delay")
         .manifest();
@@ -938,14 +978,19 @@ mod tests {
             "run-1234567890",
             "network-loss",
             Duration::from_secs(60),
+            40,
+            10,
         )
         .expect("valid network loss")
         .manifest();
 
         assert!(delay.contains("action: delay"));
-        assert!(delay.contains("latency: \"200ms\""));
+        assert!(delay.contains("latency: \"350ms\""));
+        assert!(delay.contains("jitter: \"75ms\""));
+        assert!(delay.contains("correlation: \"15\""));
         assert!(loss.contains("action: loss"));
-        assert!(loss.contains("loss: \"25\""));
+        assert!(loss.contains("loss: \"40\""));
+        assert!(loss.contains("correlation: \"10\""));
     }
 
     #[test]
@@ -957,6 +1002,8 @@ mod tests {
             "run-1234567890",
             "stress-cpu",
             Duration::from_secs(60),
+            2,
+            65,
         )
         .expect("valid cpu stress")
         .manifest();
@@ -966,15 +1013,19 @@ mod tests {
             "run-1234567890",
             "stress-memory",
             Duration::from_secs(60),
+            3,
+            "768MiB",
         )
         .expect("valid memory stress")
         .manifest();
 
         assert!(cpu.contains("kind: StressChaos"));
         assert!(cpu.contains("cpu:"));
-        assert!(cpu.contains("load: 80"));
+        assert!(cpu.contains("workers: 2"));
+        assert!(cpu.contains("load: 65"));
         assert!(memory.contains("memory:"));
-        assert!(memory.contains("size: \"512MiB\""));
+        assert!(memory.contains("workers: 3"));
+        assert!(memory.contains("size: \"768MiB\""));
         assert!(memory.contains("rustfs.tenant: fault-test-tenant"));
     }
 

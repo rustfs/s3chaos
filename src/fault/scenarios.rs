@@ -481,6 +481,15 @@ impl FaultScenario {
             "RUSTFS_FAULT_TEST_DURATION_SECONDS must be greater than zero"
         );
         config.workload.validate()?;
+        config.workload_operation_mix.validate()?;
+        let mixed_count = config.workload.object_count - config.workload.object_count / 2;
+        let total_weight = config.workload_operation_mix.total_weight();
+        ensure!(
+            mixed_count as u64 >= total_weight,
+            "workload operationWeights total {} requires at least that many mixed-workload objects, got {}",
+            total_weight,
+            mixed_count
+        );
         ensure!(
             !config.percent_overridden || spec.percent_supported,
             "RUSTFS_FAULT_TEST_PERCENT only applies to percent-based IOChaos scenarios; scenario {:?} targets {:?} with a fixed target count",

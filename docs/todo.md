@@ -26,6 +26,11 @@ plan as `suite-plan.json`.
 
 ## 2. Extend The Suite YAML Contract
 
+Status: first implementation pass added catalog-gated `params.kind` support for
+network delay/loss/corrupt/duplicate, IO latency, CPU stress, and memory stress,
+plus `workload.operationWeights`. Plans and run specs now carry the resolved
+parameters and operation mix used by execution.
+
 - Add typed scenario parameters instead of exposing raw backend manifests.
 - Let supported scenarios declare safe parameter schemas, such as network delay,
   packet loss, IO fault mode, target selection policy, or stress intensity.

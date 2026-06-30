@@ -195,6 +195,14 @@ impl ChaosGuard {
         &self.name
     }
 
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn is_kind(&self, kind: &str) -> bool {
+        self.kind == kind
+    }
+
     pub fn wait_active(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
 
@@ -259,6 +267,26 @@ impl ChaosGuard {
 
     pub fn delete(&mut self, timeout: Duration) -> Result<()> {
         self.delete_inner()?;
+        self.wait_deleted(timeout)?;
+        self.deleted = true;
+        Ok(())
+    }
+
+    pub fn replace_finalizers_and_wait_deleted(
+        &mut self,
+        finalizers: &[String],
+        timeout: Duration,
+    ) -> Result<()> {
+        let patch = serde_json::json!({
+            "metadata": {
+                "finalizers": finalizers,
+            },
+        })
+        .to_string();
+        Kubectl::new(&self.config)
+            .namespaced(&self.namespace)
+            .command(["patch", self.kind, &self.name, "--type=merge", "-p", &patch])
+            .run_checked()?;
         self.wait_deleted(timeout)?;
         self.deleted = true;
         Ok(())
