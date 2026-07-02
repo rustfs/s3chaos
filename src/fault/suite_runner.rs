@@ -78,6 +78,7 @@ pub struct FaultSuitePlanBudgets {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_stable_window_seconds: Option<u64>,
     pub cluster_timeout_seconds: u64,
+    pub recovery_stability_reread_seconds: u64,
     pub minimum_required_seconds: u64,
 }
 
@@ -171,6 +172,7 @@ pub struct FaultSuitePlanArtifacts {
 pub struct FaultSuitePlanBudgetImpact {
     pub duration_seconds: u64,
     pub recovery_timeout_seconds: u64,
+    pub recovery_stability_reread_seconds: u64,
     pub minimum_required_seconds: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remaining_before_seconds: Option<u64>,
@@ -468,6 +470,7 @@ fn build_fault_suite_execution_plan(
             let budget = FaultSuitePlanBudgetImpact {
                 duration_seconds: config.duration.as_secs(),
                 recovery_timeout_seconds: config.cluster.timeout.as_secs(),
+                recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
                 minimum_required_seconds: required,
                 remaining_before_seconds: remaining_before,
                 remaining_after_minimum_seconds: remaining_after,
@@ -504,6 +507,7 @@ fn build_fault_suite_execution_plan(
             max_client_disruptions: suite.budgets.max_client_disruptions,
             recovery_stable_window_seconds: suite.budgets.recovery_stable_window_seconds,
             cluster_timeout_seconds: base_config.cluster.timeout.as_secs(),
+            recovery_stability_reread_seconds: base_config.recovery_stability_reread.as_secs(),
             minimum_required_seconds,
         },
         requires_chaos_mesh,
@@ -781,28 +785,30 @@ fn suite_duration_budget_failure(
             ));
         }
     };
-    let required = config
-        .duration
-        .checked_add(config.cluster.timeout)
-        .unwrap_or(Duration::MAX);
+    let required = attempt_minimum_required_duration(config).unwrap_or(Duration::MAX);
     if remaining < required {
         return Some(format!(
-            "suite maxDuration budget {max_duration_seconds}s leaves {}s, but scenario {scenario} repetition {repetition} needs at least {}s (duration {}s + recovery timeout {}s)",
+            "suite maxDuration budget {max_duration_seconds}s leaves {}s, but scenario {scenario} repetition {repetition} needs at least {}s (duration {}s + recovery timeout {}s + recovery stability reread {}s)",
             remaining.as_secs(),
             required.as_secs(),
             config.duration.as_secs(),
-            config.cluster.timeout.as_secs()
+            config.cluster.timeout.as_secs(),
+            config.recovery_stability_reread.as_secs()
         ));
     }
     None
 }
 
 fn attempt_minimum_required_seconds(config: &FaultTestConfig) -> Result<u64> {
+    attempt_minimum_required_duration(config).map(|required| required.as_secs())
+}
+
+fn attempt_minimum_required_duration(config: &FaultTestConfig) -> Result<Duration> {
     config
         .duration
         .checked_add(config.cluster.timeout)
-        .context("suite attempt duration plus recovery timeout overflowed")
-        .map(|required| required.as_secs())
+        .and_then(|duration| duration.checked_add(config.recovery_stability_reread))
+        .context("suite attempt duration plus recovery timeout plus recovery stability reread overflowed")
 }
 
 fn attempt_seed(base_seed: Option<u64>, attempt_index: usize, repetition: usize) -> Option<u64> {
@@ -819,6 +825,7 @@ fn validate_attempt_artifacts(
         expected_workload_concurrency: config.workload.concurrency,
         expected_rustfs_pod_count: config.expected_rustfs_pod_count,
         expected_stable_window_seconds: config.rustfs_pod_stable_window.as_secs(),
+        expected_recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
         expected_rustfs_volume_path: config.rustfs_volume_path.clone(),
     };
     validate_fault_artifacts(&options)
@@ -966,7 +973,7 @@ kind: FaultSuite
 metadata:
   name: rustfs-smoke
 budgets:
-  maxDuration: 30m
+  maxDuration: 32m
   maxClientDisruptions: 10
   recoveryStableWindowSeconds: 30
 scenarios:
@@ -993,8 +1000,8 @@ scenarios:
         assert_eq!(execution.plan.suite, "rustfs-smoke");
         assert_eq!(execution.plan.run_id, "suite-fixed");
         assert_eq!(execution.plan.suite_seed, 100);
-        assert_eq!(execution.plan.budgets.max_duration_seconds, Some(1800));
-        assert_eq!(execution.plan.budgets.minimum_required_seconds, 1800);
+        assert_eq!(execution.plan.budgets.max_duration_seconds, Some(1920));
+        assert_eq!(execution.plan.budgets.minimum_required_seconds, 1920);
         assert!(execution.plan.requires_chaos_mesh);
         assert_eq!(
             execution.plan.required_crds,
@@ -1024,9 +1031,10 @@ scenarios:
                 .required
                 .contains(&"run-spec.json".to_string())
         );
-        assert_eq!(first.budget.minimum_required_seconds, 900);
-        assert_eq!(first.budget.remaining_before_seconds, Some(1800));
-        assert_eq!(first.budget.remaining_after_minimum_seconds, Some(900));
+        assert_eq!(first.budget.recovery_stability_reread_seconds, 60);
+        assert_eq!(first.budget.minimum_required_seconds, 960);
+        assert_eq!(first.budget.remaining_before_seconds, Some(1920));
+        assert_eq!(first.budget.remaining_after_minimum_seconds, Some(960));
 
         let fault = &first.faults[0];
         assert_eq!(fault.kind, "rustfs_volume_io_error");
@@ -1276,7 +1284,7 @@ scenarios:
 
         assert!(
             suite_duration_budget_failure(
-                Duration::from_secs(300),
+                Duration::from_secs(240),
                 Some(1_200),
                 &config,
                 "io-eio",
@@ -1286,14 +1294,14 @@ scenarios:
         );
 
         let error = suite_duration_budget_failure(
-            Duration::from_secs(301),
+            Duration::from_secs(241),
             Some(1_200),
             &config,
             "io-eio",
             1,
         )
         .expect("budget should fail");
-        assert!(error.contains("needs at least 900s"));
+        assert!(error.contains("needs at least 960s"));
 
         assert!(
             suite_duration_budget_failure(Duration::from_secs(10_000), None, &config, "io-eio", 1)

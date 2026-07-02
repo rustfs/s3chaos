@@ -12,14 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use serde_json::Value;
 use std::time::Duration;
 
-use crate::framework::{
-    artifacts::ArtifactCollector, command::CommandOutput, command::CommandSpec,
-    config::ClusterTestConfig, kubectl::Kubectl,
+use crate::{
+    fault::{
+        config::FaultTestConfig,
+        plan::{FaultInjection, FaultKind},
+        scenarios::FaultScenario,
+    },
+    framework::{
+        artifacts::ArtifactCollector, command::CommandOutput, command::CommandSpec,
+        config::ClusterTestConfig, kubectl::Kubectl,
+    },
 };
 
 const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
@@ -64,6 +71,60 @@ pub struct DmFlakeySpec<'a> {
     pub fault_table: &'a str,
     pub recovery_table: Option<&'a str>,
     pub run_id: &'a str,
+}
+
+pub(crate) struct FaultApplyRequest<'a> {
+    pub config: &'a FaultTestConfig,
+    pub collector: &'a ArtifactCollector,
+    pub scenario: &'a FaultScenario,
+    pub injection: &'a FaultInjection,
+    pub run_id: &'a str,
+}
+
+pub(crate) fn apply_fault(request: &FaultApplyRequest<'_>) -> Result<DmFlakeyGuard> {
+    match request.injection.kind() {
+        FaultKind::RustfsBlockDeviceFlakey => {
+            let spec = dm_flakey_spec(request.config, request.run_id)?;
+            apply_dm_flakey(
+                &request.config.cluster,
+                &spec,
+                request.collector,
+                request.scenario.case_name,
+            )
+        }
+        other => bail!(
+            "fault kind {} must be applied by a Chaos Mesh backend",
+            other.as_str()
+        ),
+    }
+}
+
+fn dm_flakey_spec<'a>(config: &'a FaultTestConfig, run_id: &'a str) -> Result<DmFlakeySpec<'a>> {
+    let name = config
+        .dm_name
+        .as_deref()
+        .context("RUSTFS_FAULT_TEST_DM_NAME is required for dm-flakey")?;
+    let fault_table = config
+        .dm_fault_table
+        .as_deref()
+        .context("RUSTFS_FAULT_TEST_DM_FAULT_TABLE is required for dm-flakey")?;
+    let node = config
+        .dm_node
+        .as_deref()
+        .context("RUSTFS_FAULT_TEST_DM_NODE is required for dm-flakey")?;
+    let mount_path = config
+        .dm_mount_path
+        .as_deref()
+        .context("RUSTFS_FAULT_TEST_DM_MOUNT_PATH is required for dm-flakey")?;
+    Ok(DmFlakeySpec {
+        node,
+        mount_path,
+        helper_image: &config.dm_helper_image,
+        name,
+        fault_table,
+        recovery_table: config.dm_recovery_table.as_deref(),
+        run_id,
+    })
 }
 
 pub fn apply_dm_flakey(
@@ -517,8 +578,8 @@ fn normalize_dm_table(table: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DmFlakeySpec, dm_helper_manifest, dm_resume_args, dm_suspend_args, helper_pod_name,
-        normalize_dm_table, pv_targets_node, validate_dm_spec,
+        DmFlakeySpec, dm_flakey_spec, dm_helper_manifest, dm_resume_args, dm_suspend_args,
+        helper_pod_name, normalize_dm_table, pv_targets_node, validate_dm_spec,
     };
     use crate::fault::config::FaultTestConfig;
 
@@ -589,6 +650,39 @@ mod tests {
             ..valid
         };
         assert!(validate_dm_spec(&root).is_err());
+    }
+
+    #[test]
+    fn dm_flakey_spec_maps_explicit_config_fields() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.dm_name = Some("rustfs-fault-dm".to_string());
+        config.dm_node = Some("worker-a".to_string());
+        config.dm_mount_path = Some("/data/rustfs-fault/dm-volume".to_string());
+        config.dm_fault_table = Some("0 1024 flakey /dev/loop0 0 1 15".to_string());
+        config.dm_recovery_table = Some("0 1024 linear /dev/loop0 0".to_string());
+
+        let spec = dm_flakey_spec(&config, "run-123").expect("dm spec");
+
+        assert_eq!(spec.name, "rustfs-fault-dm");
+        assert_eq!(spec.node, "worker-a");
+        assert_eq!(spec.mount_path, "/data/rustfs-fault/dm-volume");
+        assert_eq!(spec.helper_image, config.dm_helper_image);
+        assert_eq!(spec.fault_table, "0 1024 flakey /dev/loop0 0 1 15");
+        assert_eq!(spec.recovery_table, Some("0 1024 linear /dev/loop0 0"));
+        assert_eq!(spec.run_id, "run-123");
+    }
+
+    #[test]
+    fn dm_flakey_spec_requires_explicit_target_config() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+
+        let error = dm_flakey_spec(&config, "run-123").expect_err("missing dm config");
+
+        assert!(
+            error
+                .to_string()
+                .contains("RUSTFS_FAULT_TEST_DM_NAME is required")
+        );
     }
 
     #[test]

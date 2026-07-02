@@ -47,12 +47,15 @@ operation mix, payload distribution, and hotspot behavior used by execution.
 
 ## 3. Abstract Fault Backend Ports
 
-Status: second implementation pass made the applied-fault lifecycle an explicit
-`FaultBackendHandle` port for wait-active, ensure-active, snapshot, delete,
-failure artifacts, and backend-specific recovery. Apply is now routed through
-backend-family factories, and generic runner flow no longer reaches through the
-port to concrete Chaos Mesh guards. Fine-grained extraction of per-kind spec
-construction into backend modules remains a follow-up cleanup.
+Status: third implementation pass keeps the applied-fault lifecycle behind the
+`FaultBackendHandle` port and moved backend-specific apply/spec construction into
+the Chaos Mesh and host adapters. The runner now selects the backend family and
+wraps adapter results in lifecycle handles; backend modules own manifests,
+command-specific specs, and pre-apply pod identity capture. Backend intent
+mapping is now split into pure spec builders with focused tests before any
+Kubernetes side effects run. Remaining cleanup is optional: move the
+runner-local handle wrappers out if more backends make that stateful lifecycle
+logic grow.
 
 - Introduce a backend port owned by the fault domain for apply, wait-active,
   snapshot, ensure-active, delete, and cleanup operations.

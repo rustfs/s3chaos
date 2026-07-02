@@ -12,10 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use std::time::Duration;
 
-use crate::framework::config::ClusterTestConfig;
+use crate::{
+    fault::{
+        config::FaultTestConfig,
+        plan::{FaultInjection, FaultKind},
+        pods::rustfs_pod_identities,
+        reporting::PodIdentity,
+        scenarios::FaultScenario,
+    },
+    framework::{artifacts::ArtifactCollector, config::ClusterTestConfig},
+};
 
 mod runtime;
 
@@ -30,6 +39,290 @@ pub(crate) const RUN_ID_LABEL: &str = "rustfs-fault-test/run-id";
 const SCENARIO_LABEL: &str = "rustfs-fault-test/scenario";
 pub(crate) const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
 pub(crate) const MANAGED_BY_VALUE: &str = "s3chaos";
+
+pub(crate) struct FaultApplyRequest<'a> {
+    pub config: &'a FaultTestConfig,
+    pub collector: &'a ArtifactCollector,
+    pub scenario: &'a FaultScenario,
+    pub injection: &'a FaultInjection,
+    pub run_id: &'a str,
+    pub manifest_name: &'a str,
+    pub resource_name_suffix: &'a str,
+}
+
+pub(crate) enum AppliedFault {
+    Experiment {
+        guard: ChaosGuard,
+        active_required: bool,
+    },
+    PodKill {
+        guard: ChaosGuard,
+        before_pods: Vec<PodIdentity>,
+    },
+}
+
+enum FaultSpec {
+    Io(IoChaosSpec),
+    Pod(PodChaosSpec),
+    PodKill(PodChaosSpec),
+    Network(NetworkChaosSpec),
+    Stress(StressChaosSpec),
+}
+
+impl FaultSpec {
+    fn manifest(&self) -> String {
+        match self {
+            Self::Io(chaos) => chaos.manifest(),
+            Self::Pod(chaos) | Self::PodKill(chaos) => chaos.manifest(),
+            Self::Network(chaos) => chaos.manifest(),
+            Self::Stress(chaos) => chaos.manifest(),
+        }
+    }
+}
+
+pub(crate) fn apply_fault(request: &FaultApplyRequest<'_>) -> Result<AppliedFault> {
+    let config = request.config;
+    let cluster = &config.cluster;
+    let scenario = request.scenario;
+    let spec = build_fault_spec(
+        config,
+        scenario,
+        request.injection,
+        request.run_id,
+        request.resource_name_suffix,
+    )?;
+    let before_pods = if matches!(spec, FaultSpec::PodKill(_)) {
+        Some(rustfs_pod_identities(cluster)?)
+    } else {
+        None
+    };
+    request
+        .collector
+        .write_text(scenario.case_name, request.manifest_name, &spec.manifest())?;
+
+    match spec {
+        FaultSpec::Io(chaos) => Ok(AppliedFault::Experiment {
+            guard: apply_iochaos(cluster, &chaos)?,
+            active_required: true,
+        }),
+        FaultSpec::Pod(chaos) => Ok(AppliedFault::Experiment {
+            guard: apply_podchaos(cluster, &chaos)?,
+            active_required: true,
+        }),
+        FaultSpec::PodKill(chaos) => {
+            let Some(before_pods) = before_pods else {
+                unreachable!("PodKill captures pod identities before apply");
+            };
+            Ok(AppliedFault::PodKill {
+                guard: apply_podchaos(cluster, &chaos)?,
+                before_pods,
+            })
+        }
+        FaultSpec::Network(chaos) => Ok(AppliedFault::Experiment {
+            guard: apply_networkchaos(cluster, &chaos)?,
+            active_required: true,
+        }),
+        FaultSpec::Stress(chaos) => Ok(AppliedFault::Experiment {
+            guard: apply_stresschaos(cluster, &chaos)?,
+            active_required: true,
+        }),
+    }
+}
+
+fn build_fault_spec(
+    config: &FaultTestConfig,
+    scenario: &FaultScenario,
+    injection: &FaultInjection,
+    run_id: &str,
+    resource_name_suffix: &str,
+) -> Result<FaultSpec> {
+    let cluster = &config.cluster;
+    match injection.kind() {
+        FaultKind::RustfsVolumeEnospc => Ok(FaultSpec::Io(
+            IoChaosSpec::enospc_on_rustfs_volume(
+                cluster,
+                &config.chaos_namespace,
+                run_id,
+                &scenario.name,
+                injection.rustfs_volume_path()?,
+                injection.percent()?,
+                injection.duration(),
+            )?
+            .with_name_suffix(resource_name_suffix),
+        )),
+        FaultKind::RustfsVolumeReadMistake => Ok(FaultSpec::Io(
+            IoChaosSpec::read_mistake_on_rustfs_volume(
+                cluster,
+                &config.chaos_namespace,
+                run_id,
+                &scenario.name,
+                injection.rustfs_volume_path()?,
+                injection.percent()?,
+                injection.duration(),
+            )?
+            .with_name_suffix(resource_name_suffix),
+        )),
+        FaultKind::RustfsVolumeLatency => {
+            let (delay, methods) = injection.parameters().io_latency()?;
+            Ok(FaultSpec::Io(
+                IoChaosSpec::latency_on_rustfs_volume(
+                    cluster,
+                    &config.chaos_namespace,
+                    run_id,
+                    &scenario.name,
+                    injection.rustfs_volume_path()?,
+                    IoLatencyParameters {
+                        methods,
+                        delay,
+                        percent: injection.percent()?,
+                    },
+                    injection.duration(),
+                )?
+                .with_name_suffix(resource_name_suffix),
+            ))
+        }
+        FaultKind::RustfsVolumeIoError => Ok(FaultSpec::Io(
+            IoChaosSpec::eio_on_rustfs_volume(
+                cluster,
+                &config.chaos_namespace,
+                run_id,
+                &scenario.name,
+                injection.rustfs_volume_path()?,
+                injection.percent()?,
+                injection.duration(),
+            )?
+            .with_name_suffix(resource_name_suffix),
+        )),
+        FaultKind::RustfsServerPodKill => Ok(FaultSpec::PodKill(
+            PodChaosSpec::kill_one_rustfs_pod(
+                cluster,
+                &config.chaos_namespace,
+                run_id,
+                &scenario.name,
+            )
+            .with_name_suffix(resource_name_suffix),
+        )),
+        FaultKind::RustfsServerPodFailure => Ok(FaultSpec::Pod(
+            PodChaosSpec::fail_one_rustfs_pod(
+                cluster,
+                &config.chaos_namespace,
+                run_id,
+                &scenario.name,
+                injection.duration(),
+            )?
+            .with_name_suffix(resource_name_suffix),
+        )),
+        FaultKind::RustfsServerNetworkPartition => Ok(FaultSpec::Network(
+            NetworkChaosSpec::partition_one_rustfs_pod(
+                cluster,
+                &config.chaos_namespace,
+                run_id,
+                &scenario.name,
+                injection.duration(),
+            )?
+            .with_name_suffix(resource_name_suffix),
+        )),
+        FaultKind::RustfsServerNetworkDelay
+        | FaultKind::RustfsServerNetworkLoss
+        | FaultKind::RustfsServerNetworkCorrupt
+        | FaultKind::RustfsServerNetworkDuplicate => {
+            let chaos = match injection.kind() {
+                FaultKind::RustfsServerNetworkDelay => {
+                    let (latency, jitter, correlation_percent) =
+                        injection.parameters().network_delay()?;
+                    NetworkChaosSpec::delay_one_rustfs_pod(
+                        cluster,
+                        &config.chaos_namespace,
+                        run_id,
+                        &scenario.name,
+                        injection.duration(),
+                        NetworkDelayParameters {
+                            latency,
+                            jitter,
+                            correlation_percent,
+                        },
+                    )?
+                }
+                FaultKind::RustfsServerNetworkLoss => {
+                    let (loss_percent, correlation_percent) =
+                        injection.parameters().network_loss()?;
+                    NetworkChaosSpec::loss_one_rustfs_pod(
+                        cluster,
+                        &config.chaos_namespace,
+                        run_id,
+                        &scenario.name,
+                        injection.duration(),
+                        loss_percent,
+                        correlation_percent,
+                    )?
+                }
+                FaultKind::RustfsServerNetworkCorrupt => {
+                    let (corrupt_percent, correlation_percent) =
+                        injection.parameters().network_corrupt()?;
+                    NetworkChaosSpec::corrupt_one_rustfs_pod(
+                        cluster,
+                        &config.chaos_namespace,
+                        run_id,
+                        &scenario.name,
+                        injection.duration(),
+                        corrupt_percent,
+                        correlation_percent,
+                    )?
+                }
+                FaultKind::RustfsServerNetworkDuplicate => {
+                    let (duplicate_percent, correlation_percent) =
+                        injection.parameters().network_duplicate()?;
+                    NetworkChaosSpec::duplicate_one_rustfs_pod(
+                        cluster,
+                        &config.chaos_namespace,
+                        run_id,
+                        &scenario.name,
+                        injection.duration(),
+                        duplicate_percent,
+                        correlation_percent,
+                    )?
+                }
+                _ => unreachable!(),
+            }
+            .with_name_suffix(resource_name_suffix);
+            Ok(FaultSpec::Network(chaos))
+        }
+        FaultKind::RustfsServerCpuStress | FaultKind::RustfsServerMemoryStress => {
+            let chaos = match injection.kind() {
+                FaultKind::RustfsServerCpuStress => {
+                    let (workers, load) = injection.parameters().stress_cpu()?;
+                    StressChaosSpec::cpu_on_one_rustfs_pod(
+                        cluster,
+                        &config.chaos_namespace,
+                        run_id,
+                        &scenario.name,
+                        injection.duration(),
+                        workers,
+                        load,
+                    )?
+                }
+                FaultKind::RustfsServerMemoryStress => {
+                    let (workers, size) = injection.parameters().stress_memory()?;
+                    StressChaosSpec::memory_on_one_rustfs_pod(
+                        cluster,
+                        &config.chaos_namespace,
+                        run_id,
+                        &scenario.name,
+                        injection.duration(),
+                        workers,
+                        size,
+                    )?
+                }
+                _ => unreachable!(),
+            }
+            .with_name_suffix(resource_name_suffix);
+            Ok(FaultSpec::Stress(chaos))
+        }
+        FaultKind::RustfsBlockDeviceFlakey => {
+            bail!("fault kind rustfs_block_device_flakey must be applied by the host backend")
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IoChaosAction {
@@ -858,11 +1151,26 @@ spec:
 #[cfg(test)]
 mod tests {
     use super::{
-        IoChaosSpec, IoLatencyParameters, NetworkChaosSpec, NetworkDelayParameters, PodChaosSpec,
-        StressChaosSpec, runtime::chaos_experiment_is_active,
+        FaultSpec, IoChaosAction, IoChaosSpec, IoLatencyParameters, NetworkChaosAction,
+        NetworkChaosSpec, NetworkDelayParameters, PodChaosAction, PodChaosSpec, StressChaosAction,
+        StressChaosSpec, build_fault_spec, runtime::chaos_experiment_is_active,
     };
     use crate::fault::config::FaultTestConfig;
+    use crate::fault::plan::{
+        FaultInjection, FaultInjectionParameters, FaultKind, FaultSelection, FaultTarget, IoMethod,
+    };
+    use crate::fault::scenarios::{FaultBackend, FaultScenario};
     use std::time::Duration;
+
+    fn test_scenario(name: &str) -> FaultScenario {
+        FaultScenario {
+            name: name.to_string(),
+            case_name: "fault_case",
+            duration: Duration::from_secs(60),
+            percent: 20,
+            object_count: 12,
+        }
+    }
 
     #[test]
     fn iochaos_manifest_targets_rustfs_workload_only() {
@@ -1027,6 +1335,144 @@ mod tests {
         assert!(memory.contains("workers: 3"));
         assert!(memory.contains("size: \"768MiB\""));
         assert!(memory.contains("rustfs.tenant: fault-test-tenant"));
+    }
+
+    #[test]
+    fn backend_spec_builder_maps_io_latency_params() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let scenario = test_scenario("io-latency");
+        let injection = FaultInjection::new_with_parameters(
+            FaultKind::RustfsVolumeLatency,
+            FaultBackend::ChaosMeshIoChaos,
+            FaultTarget::RustfsVolume {
+                path: "/data/rustfs0".to_string(),
+            },
+            FaultSelection::Percent(35),
+            Duration::from_secs(90),
+            FaultInjectionParameters::IoLatency {
+                delay: "250ms".to_string(),
+                methods: vec![IoMethod::Read],
+            },
+        )
+        .expect("valid injection");
+
+        let spec = build_fault_spec(&config, &scenario, &injection, "run-1234567890", "-01")
+            .expect("fault spec");
+
+        match spec {
+            FaultSpec::Io(spec) => {
+                assert_eq!(spec.name, "rustfs-fault-io-latency-run-12345678-01");
+                assert_eq!(
+                    spec.action,
+                    IoChaosAction::Latency {
+                        delay: "250ms".to_string()
+                    }
+                );
+                assert_eq!(spec.methods, ["READ"]);
+                assert_eq!(spec.percent, 35);
+                assert_eq!(spec.duration, Duration::from_secs(90));
+            }
+            _ => panic!("expected IOChaos spec"),
+        }
+    }
+
+    #[test]
+    fn backend_spec_builder_maps_network_delay_params() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let scenario = test_scenario("network-delay");
+        let injection = FaultInjection::new_with_parameters(
+            FaultKind::RustfsServerNetworkDelay,
+            FaultBackend::ChaosMeshNetworkChaos,
+            FaultTarget::RustfsServerPeerNetwork,
+            FaultSelection::FixedTargets(1),
+            Duration::from_secs(75),
+            FaultInjectionParameters::NetworkDelay {
+                latency: "350ms".to_string(),
+                jitter: "75ms".to_string(),
+                correlation_percent: 15,
+            },
+        )
+        .expect("valid injection");
+
+        let spec = build_fault_spec(&config, &scenario, &injection, "run-1234567890", "-02")
+            .expect("fault spec");
+
+        match spec {
+            FaultSpec::Network(spec) => {
+                assert_eq!(spec.name, "rustfs-fault-net-delay-run-12345678-02");
+                assert_eq!(
+                    spec.action,
+                    NetworkChaosAction::Delay {
+                        latency: "350ms".to_string(),
+                        jitter: "75ms".to_string(),
+                        correlation: "15".to_string(),
+                    }
+                );
+                assert_eq!(spec.duration, Duration::from_secs(75));
+            }
+            _ => panic!("expected NetworkChaos spec"),
+        }
+    }
+
+    #[test]
+    fn backend_spec_builder_preserves_special_pod_kill_variant() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let scenario = test_scenario("pod-kill-one");
+        let injection = FaultInjection::new(
+            FaultKind::RustfsServerPodKill,
+            FaultBackend::ChaosMeshPodChaos,
+            FaultTarget::RustfsServerPod,
+            FaultSelection::FixedTargets(1),
+            Duration::from_secs(60),
+        )
+        .expect("valid injection");
+
+        let spec = build_fault_spec(&config, &scenario, &injection, "run-1234567890", "-03")
+            .expect("fault spec");
+
+        match spec {
+            FaultSpec::PodKill(spec) => {
+                assert_eq!(spec.name, "rustfs-fault-pod-kill-run-12345678-03");
+                assert_eq!(spec.action, PodChaosAction::PodKill);
+            }
+            _ => panic!("expected PodKill spec"),
+        }
+    }
+
+    #[test]
+    fn backend_spec_builder_maps_memory_stress_params() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let scenario = test_scenario("stress-memory");
+        let injection = FaultInjection::new_with_parameters(
+            FaultKind::RustfsServerMemoryStress,
+            FaultBackend::ChaosMeshStressChaos,
+            FaultTarget::RustfsServerResource,
+            FaultSelection::FixedTargets(1),
+            Duration::from_secs(120),
+            FaultInjectionParameters::StressMemory {
+                workers: 2,
+                size: "768MiB".to_string(),
+            },
+        )
+        .expect("valid injection");
+
+        let spec = build_fault_spec(&config, &scenario, &injection, "run-1234567890", "-04")
+            .expect("fault spec");
+
+        match spec {
+            FaultSpec::Stress(spec) => {
+                assert_eq!(spec.name, "rustfs-fault-stress-memory-run-12345678-04");
+                match spec.action {
+                    StressChaosAction::Memory { workers, size } => {
+                        assert_eq!(workers, 2);
+                        assert_eq!(size, "768MiB");
+                    }
+                    _ => panic!("expected memory stress"),
+                }
+                assert_eq!(spec.duration, Duration::from_secs(120));
+            }
+            _ => panic!("expected StressChaos spec"),
+        }
     }
 
     #[test]
