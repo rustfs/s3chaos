@@ -27,8 +27,14 @@ use crate::fault::{
     runner::run_scenario_with_config,
     scenarios::{FaultScenario, FaultScenarioSpec, scenario_spec},
     spec::FaultRunArtifactSpec,
-    suite::{ResolvedFaultSuite, ResolvedFaultSuiteScenario, resolve_fault_suite_yaml},
-    workload::{WorkloadHotspot, WorkloadPlan, WorkloadSizeClass},
+    suite::{
+        ResolvedFaultSuite, ResolvedFaultSuiteScenario, ResolvedFaultSuiteWorkloadDurationProfile,
+        ResolvedFaultSuiteWorkloadOverride, resolve_fault_suite_yaml,
+    },
+    workload::{
+        WorkloadHotspot, WorkloadOperationMix, WorkloadPayloadDistribution, WorkloadPlan,
+        WorkloadSizeClass,
+    },
 };
 
 pub const FAULT_SUITE_PLAN_API_VERSION: &str = "rustfs.com/s3chaos/v1alpha1";
@@ -111,6 +117,8 @@ pub struct FaultSuitePlanWorkload {
     pub mode: String,
     pub objects: usize,
     pub concurrency: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_profile_min_seconds: Option<u64>,
     pub operation_mix: crate::fault::workload::WorkloadOperationMix,
     pub payload_distribution: Vec<FaultSuitePlanPayloadClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -576,6 +584,11 @@ impl FaultSuitePlanAttempt {
             .map(FaultSuitePlanPayloadClass::from)
             .collect();
         let hotspot = workload_plan.hotspot;
+        let duration_profile_min_seconds = input.scenario.workload.as_ref().and_then(|workload| {
+            workload
+                .duration_profile_for(input.config.duration.as_secs())
+                .map(|profile| profile.min_duration_seconds)
+        });
 
         Ok(Self {
             index: input.index,
@@ -592,6 +605,7 @@ impl FaultSuitePlanAttempt {
                 mode: workload_mode_name(input.fault_plan.workload_mode).to_string(),
                 objects: input.config.workload.object_count,
                 concurrency: input.config.workload.concurrency,
+                duration_profile_min_seconds,
                 operation_mix: input.config.workload_operation_mix,
                 payload_distribution,
                 hotspot,
@@ -726,17 +740,10 @@ fn scenario_config(
         config.percent_overridden = false;
     }
     if let Some(workload) = &scenario.workload {
-        let object_count = workload.objects.unwrap_or(config.workload.object_count);
-        let concurrency = workload.concurrency.unwrap_or(config.workload.concurrency);
-        config.workload = FaultWorkloadProfile::new(object_count, concurrency)?;
-        config.workload_operation_mix = workload
-            .operation_weights
-            .unwrap_or(config.workload_operation_mix);
-        config.workload_payload_distribution = workload
-            .payload_distribution
-            .clone()
-            .or(config.workload_payload_distribution.clone());
-        config.workload_hotspot = workload.hotspot.or(config.workload_hotspot);
+        apply_workload_override(&mut config, workload)?;
+        if let Some(profile) = workload.duration_profile_for(config.duration.as_secs()) {
+            apply_workload_duration_profile(&mut config, profile)?;
+        }
         config.prefill_concurrency = config
             .prefill_concurrency
             .min(config.workload.concurrency)
@@ -753,6 +760,59 @@ fn scenario_config(
     config.workload_seed = attempt_seed(base.workload_seed, attempt_index, repetition);
     config.cluster.artifacts_dir = attempt_dir.to_path_buf();
     Ok(config)
+}
+
+fn apply_workload_override(
+    config: &mut FaultTestConfig,
+    workload: &ResolvedFaultSuiteWorkloadOverride,
+) -> Result<()> {
+    apply_workload_fields(
+        config,
+        workload.objects,
+        workload.concurrency,
+        workload.operation_weights,
+        workload.payload_distribution.as_ref(),
+        workload.hotspot,
+    )
+}
+
+fn apply_workload_duration_profile(
+    config: &mut FaultTestConfig,
+    profile: &ResolvedFaultSuiteWorkloadDurationProfile,
+) -> Result<()> {
+    apply_workload_fields(
+        config,
+        profile.objects,
+        profile.concurrency,
+        profile.operation_weights,
+        profile.payload_distribution.as_ref(),
+        profile.hotspot,
+    )
+}
+
+fn apply_workload_fields(
+    config: &mut FaultTestConfig,
+    objects: Option<usize>,
+    concurrency: Option<usize>,
+    operation_weights: Option<WorkloadOperationMix>,
+    payload_distribution: Option<&WorkloadPayloadDistribution>,
+    hotspot: Option<WorkloadHotspot>,
+) -> Result<()> {
+    if objects.is_some() || concurrency.is_some() {
+        let object_count = objects.unwrap_or(config.workload.object_count);
+        let concurrency = concurrency.unwrap_or(config.workload.concurrency);
+        config.workload = FaultWorkloadProfile::new(object_count, concurrency)?;
+    }
+    if let Some(operation_weights) = operation_weights {
+        config.workload_operation_mix = operation_weights;
+    }
+    if let Some(payload_distribution) = payload_distribution {
+        config.workload_payload_distribution = Some(payload_distribution.clone());
+    }
+    if let Some(hotspot) = hotspot {
+        config.workload_hotspot = Some(hotspot);
+    }
+    Ok(())
 }
 
 fn validate_suite_runtime_contract(
@@ -1133,6 +1193,72 @@ scenarios:
                 .object_percent,
             10
         );
+    }
+
+    #[test]
+    fn suite_plan_applies_duration_based_workload_profile() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-smoke
+scenarios:
+  - name: io-eio
+    duration: 20m
+    workload:
+      objects: 64
+      concurrency: 8
+      durationProfiles:
+        - minDuration: 5m
+          objects: 72
+          concurrency: 9
+        - minDuration: 15m
+          objects: 96
+          concurrency: 12
+          operationWeights:
+            put: 2
+            overwrite: 1
+            get: 4
+            list: 1
+            delete: 1
+            multipart: 1
+          payloadDistribution:
+            - sizeBytes: 1024
+              weight: 1
+            - sizeBytes: 4096
+              weight: 1
+          hotspot:
+            objectPercent: 20
+            operationPercent: 80
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite");
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.workload_seed = Some(100);
+
+        let execution = build_fault_suite_execution_plan(suite, base, "suite-fixed".to_string())
+            .expect("suite execution plan");
+
+        let attempt = &execution.plan.attempts[0];
+        assert_eq!(attempt.workload.objects, 96);
+        assert_eq!(attempt.workload.concurrency, 12);
+        assert_eq!(attempt.workload.duration_profile_min_seconds, Some(900));
+        assert_eq!(attempt.workload.operation_mix.get, 4);
+        assert_eq!(attempt.workload.payload_distribution[0].object_count, 48);
+        assert_eq!(attempt.workload.payload_distribution[1].object_count, 48);
+        assert_eq!(
+            attempt.workload.hotspot.expect("hotspot").operation_percent,
+            80
+        );
+
+        let config = &execution.attempts[0].config;
+        assert_eq!(config.workload.object_count, 96);
+        assert_eq!(config.workload.concurrency, 12);
+        assert_eq!(config.workload_operation_mix.get, 4);
+        assert_eq!(config.workload_hotspot.expect("hotspot").object_percent, 20);
     }
 
     #[test]

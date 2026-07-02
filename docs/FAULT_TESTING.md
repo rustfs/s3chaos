@@ -265,10 +265,11 @@ Scenario definitions stay in Rust. YAML suites are a declarative composition
 layer for selected scenarios, budgets, observability, typed scenario parameters,
 and per-scenario workload overrides. They compile against the Rust catalog and
 fail fast when a scenario name, percent override, duration, parameter, or
-workload budget is invalid. If `workload` changes `objects` or `concurrency`,
-set both fields together; `operationWeights`, `payloadDistribution`, and
-`hotspot` may be set by themselves. Unknown YAML fields are rejected so typos
-cannot silently drop suite budgets, parameters, or workload overrides.
+workload budget is invalid. If `workload` or a duration profile changes
+`objects` or `concurrency`, set both fields together; `operationWeights`,
+`payloadDistribution`, `hotspot`, and `durationProfiles` may be set by
+themselves. Unknown YAML fields are rejected so typos cannot silently drop suite
+budgets, parameters, or workload overrides.
 
 Generate a starting point:
 
@@ -321,6 +322,10 @@ scenarios:
       hotspot:
         objectPercent: 10
         operationPercent: 70
+      durationProfiles:
+        - minDuration: 10m
+          objects: 80000
+          concurrency: 120
   - name: network-delay
     duration: 8m
     params:
@@ -344,8 +349,12 @@ DELETE, and multipart work. `payloadDistribution` controls generated object
 sizes by weighted `sizeBytes` classes. `hotspot` routes the configured
 percentage of operations to the configured percentage of the prefilled object
 set, which lets operators model repeated access to a smaller key range without
-exposing raw object selectors. Duration-based workload profiles are not
-implemented yet; scenario `duration` still controls the fault window.
+exposing raw object selectors. `durationProfiles` selects the profile with the
+highest `minDuration` that is less than or equal to the resolved scenario
+`duration`; profile fields override the static workload fields before planning
+and execution. If a scenario sets an explicit `duration`, at least one duration
+profile threshold must be reachable by that duration. Scenario `duration` still
+controls the fault window.
 
 Render and review the exact destructive plan before running:
 
