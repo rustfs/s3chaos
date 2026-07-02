@@ -35,6 +35,8 @@ pub const DEFAULT_RUSTFS_VOLUME_PATH: &str = "/data/rustfs0";
 pub const DEFAULT_RUSTFS_POD_STABLE_WINDOW_SECONDS: u64 = 60;
 pub const DEFAULT_FAULT_DURATION_SECONDS: u64 = 7_200;
 pub const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
+pub const DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS: u64 = 60;
+pub const MAX_RECOVERY_STABILITY_REREAD_SECONDS: u64 = 120;
 pub const DEFAULT_CLUSTER_TIMEOUT_SECONDS: u64 = 300;
 pub const DEFAULT_WARP_DURATION_SECONDS: u64 = 60;
 pub const DEFAULT_DM_HELPER_IMAGE: &str = "rancher/mirrored-library-busybox:1.37.0";
@@ -87,6 +89,7 @@ pub struct FaultTestConfig {
     pub prefill_concurrency: usize,
     pub workload_seed: Option<u64>,
     pub request_timeout: Duration,
+    pub recovery_stability_reread: Duration,
     pub expected_rustfs_pod_count: usize,
     pub rustfs_volume_path: String,
     pub rustfs_pod_stable_window: Duration,
@@ -175,6 +178,16 @@ impl FaultTestConfig {
             "RUSTFS_FAULT_TEST_TIMEOUT_SECONDS",
             DEFAULT_CLUSTER_TIMEOUT_SECONDS,
         )?;
+        let recovery_stability_reread_seconds = env_u64(
+            &get_env,
+            "RUSTFS_FAULT_TEST_RECOVERY_STABILITY_REREAD_SECONDS",
+            DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS,
+        )?;
+        ensure!(
+            (1..=MAX_RECOVERY_STABILITY_REREAD_SECONDS)
+                .contains(&recovery_stability_reread_seconds),
+            "RUSTFS_FAULT_TEST_RECOVERY_STABILITY_REREAD_SECONDS must be between 1 and {MAX_RECOVERY_STABILITY_REREAD_SECONDS}"
+        );
         let rustfs_pod_stable_window_seconds = env_u64(
             &get_env,
             "RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS",
@@ -233,6 +246,7 @@ impl FaultTestConfig {
                 "RUSTFS_FAULT_TEST_REQUEST_TIMEOUT_SECONDS",
                 DEFAULT_REQUEST_TIMEOUT_SECONDS,
             )?),
+            recovery_stability_reread: Duration::from_secs(recovery_stability_reread_seconds),
             expected_rustfs_pod_count,
             rustfs_volume_path,
             rustfs_pod_stable_window: Duration::from_secs(rustfs_pod_stable_window_seconds),
@@ -485,6 +499,10 @@ mod tests {
         assert_eq!(config.prefill_concurrency, 16);
         assert_eq!(config.workload_seed, None);
         assert_eq!(config.request_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(
+            config.recovery_stability_reread,
+            std::time::Duration::from_secs(60)
+        );
         assert_eq!(config.expected_rustfs_pod_count, 4);
         assert_eq!(config.rustfs_volume_path, "/data/rustfs0");
         assert_eq!(
@@ -521,6 +539,7 @@ mod tests {
                 "RUSTFS_FAULT_TEST_PREFILL_CONCURRENCY" => Some("4".to_string()),
                 "RUSTFS_FAULT_TEST_SEED" => Some("4242".to_string()),
                 "RUSTFS_FAULT_TEST_REQUEST_TIMEOUT_SECONDS" => Some("7".to_string()),
+                "RUSTFS_FAULT_TEST_RECOVERY_STABILITY_REREAD_SECONDS" => Some("90".to_string()),
                 "RUSTFS_FAULT_TEST_RUSTFS_POD_COUNT" => Some("6".to_string()),
                 "RUSTFS_FAULT_TEST_RUSTFS_VOLUME_PATH" => Some("/data/rustfs1".to_string()),
                 "RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS" => Some("15".to_string()),
@@ -556,6 +575,10 @@ mod tests {
         assert_eq!(config.prefill_concurrency, 4);
         assert_eq!(config.workload_seed, Some(4242));
         assert_eq!(config.request_timeout, std::time::Duration::from_secs(7));
+        assert_eq!(
+            config.recovery_stability_reread,
+            std::time::Duration::from_secs(90)
+        );
         assert_eq!(config.expected_rustfs_pod_count, 6);
         assert_eq!(config.rustfs_volume_path, "/data/rustfs1");
         assert_eq!(
@@ -606,6 +629,21 @@ mod tests {
                 "RUSTFS_FAULT_TEST_STORAGE_CLASS" => Some("fast-csi".to_string()),
                 "RUSTFS_FAULT_TEST_SERVER_IMAGE" => Some("rustfs/rustfs:test".to_string()),
                 "RUSTFS_FAULT_TEST_SEED" => Some("not-a-number".to_string()),
+                _ => None,
+            },
+            "production-test-cluster".to_string(),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn recovery_stability_reread_window_is_bounded() {
+        let result = FaultTestConfig::from_env_with(
+            |name| match name {
+                "RUSTFS_FAULT_TEST_STORAGE_CLASS" => Some("fast-csi".to_string()),
+                "RUSTFS_FAULT_TEST_SERVER_IMAGE" => Some("rustfs/rustfs:test".to_string()),
+                "RUSTFS_FAULT_TEST_RECOVERY_STABILITY_REREAD_SECONDS" => Some("121".to_string()),
                 _ => None,
             },
             "production-test-cluster".to_string(),

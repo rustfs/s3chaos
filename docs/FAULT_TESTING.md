@@ -463,6 +463,13 @@ A successful run must show:
 If a scenario fails, inspect `failure-summary.json`,
 `runner-failure-summary.json`, `test.log`, `fault-status-*.json`, and the
 RustFS Pod logs first.
+When `checker-pre-recommit` fails or errors, the runner writes
+`recovery-stability-report.json` as a failure-only diagnostic artifact. It keeps
+the immediate checker failure intact; for committed-object GETs that returned
+HTTP 200 but timed out or hit a body streaming error, it also runs a bounded
+reread. The artifact classifies the failure as `recovery_tail_read_latency`,
+`committed_object_unavailable`, `data_corruption`, or `harness_error`;
+`failure-summary.json` uses the same classification.
 When IOChaos deletion times out, the runner also captures
 `iochaos-finalizer-recovery-*.json`, `iochaos-delete-timeout.*`,
 `podiochaos-delete-timeout.*`, target pod/node evidence, target-node

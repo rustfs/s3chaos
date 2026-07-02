@@ -16,7 +16,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::fault::{
-    config::FaultTestConfig,
+    config::{DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS, FaultTestConfig},
     plan::{
         FaultInjection, FaultInjectionParameters, FaultPlan, FaultSelection, FaultTarget,
         FaultWorkloadMode,
@@ -89,7 +89,13 @@ pub struct FaultRunRecoverySpec {
     pub timeout_seconds: u64,
     pub expected_rustfs_pod_count: usize,
     pub stable_pod_window_seconds: u64,
+    #[serde(default = "default_recovery_stability_reread_seconds")]
+    pub recovery_stability_reread_seconds: u64,
     pub recommit_unconfirmed_writes: bool,
+}
+
+fn default_recovery_stability_reread_seconds() -> u64 {
+    DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +181,7 @@ impl FaultRunSpec {
                 timeout_seconds: config.cluster.timeout.as_secs(),
                 expected_rustfs_pod_count: config.expected_rustfs_pod_count,
                 stable_pod_window_seconds: config.rustfs_pod_stable_window.as_secs(),
+                recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
                 recommit_unconfirmed_writes: true,
             },
             faults: plan
@@ -339,6 +346,7 @@ mod tests {
         assert_eq!(spec.scenario.isolation, "fresh-tenant");
         assert_eq!(spec.faults[0].backend, "chaos-mesh-io-chaos");
         assert_eq!(spec.recovery.expected_rustfs_pod_count, 4);
+        assert_eq!(spec.recovery.recovery_stability_reread_seconds, 60);
         assert!(
             spec.artifacts
                 .required

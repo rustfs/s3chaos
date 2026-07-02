@@ -16,6 +16,8 @@ use anyhow::{Result, ensure};
 use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
+use tokio::time::{sleep as async_sleep, timeout};
 
 use crate::fault::{
     history::{OperationKind, OperationOutcome, OperationRecord, Recorder},
@@ -45,6 +47,56 @@ pub struct CheckerReport {
     pub final_listed_objects: Option<usize>,
     pub tenant_recovered: bool,
     pub passed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryStabilityClassification {
+    DataCorruption,
+    CommittedObjectUnavailable,
+    RecoveryTailReadLatency,
+    HarnessError,
+}
+
+impl RecoveryStabilityClassification {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::DataCorruption => "data_corruption",
+            Self::CommittedObjectUnavailable => "committed_object_unavailable",
+            Self::RecoveryTailReadLatency => "recovery_tail_read_latency",
+            Self::HarnessError => "harness_error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryStabilityReport {
+    pub immediate_passed: bool,
+    pub reread_attempted_keys: Vec<String>,
+    pub reread_recovered_keys: Vec<String>,
+    pub still_unavailable_keys: Vec<String>,
+    pub hash_mismatches: Vec<String>,
+    #[serde(default)]
+    pub data_corruption_evidence: Vec<String>,
+    pub harness_errors: Vec<String>,
+    pub max_recovery_seconds: u64,
+    pub classification: RecoveryStabilityClassification,
+}
+
+impl RecoveryStabilityReport {
+    pub(crate) fn harness_error(message: impl Into<String>, max_recovery: Duration) -> Self {
+        Self {
+            immediate_passed: false,
+            reread_attempted_keys: Vec::new(),
+            reread_recovered_keys: Vec::new(),
+            still_unavailable_keys: Vec::new(),
+            hash_mismatches: Vec::new(),
+            data_corruption_evidence: Vec::new(),
+            harness_errors: vec![message.into()],
+            max_recovery_seconds: max_recovery.as_secs(),
+            classification: RecoveryStabilityClassification::HarnessError,
+        }
+    }
 }
 
 impl CheckerReport {
@@ -174,6 +226,130 @@ pub async fn check_s3_history(
     Ok(report)
 }
 
+pub async fn recovery_stability_reread(
+    s3: &S3WorkloadClient,
+    recorder: &Recorder,
+    immediate_report: &CheckerReport,
+    immediate_record_start: usize,
+    concurrency: usize,
+    max_recovery: Duration,
+) -> Result<RecoveryStabilityReport> {
+    let records = recorder.records();
+    let model = object_model(&records[..immediate_record_start.min(records.len())]);
+    let immediate_records = records
+        .get(immediate_record_start.min(records.len())..)
+        .unwrap_or_default();
+    let attempted_keys = recovery_tail_candidate_keys(immediate_records, &model);
+    let mut hash_mismatches = immediate_report.hash_mismatches.clone();
+    hash_mismatches.extend(immediate_report.successful_corrupted_reads.iter().cloned());
+    let data_corruption_evidence = immediate_data_corruption_evidence(immediate_report);
+    let mut report = RecoveryStabilityReport {
+        immediate_passed: immediate_report.passed,
+        reread_attempted_keys: attempted_keys.clone(),
+        reread_recovered_keys: Vec::new(),
+        still_unavailable_keys: immediate_still_unavailable_keys(immediate_report, &attempted_keys),
+        hash_mismatches,
+        data_corruption_evidence,
+        harness_errors: Vec::new(),
+        max_recovery_seconds: max_recovery.as_secs(),
+        classification: classify_without_reread(immediate_report),
+    };
+
+    if immediate_report.passed || attempted_keys.is_empty() || max_recovery.is_zero() {
+        finish_recovery_stability_report(&mut report, immediate_report);
+        return Ok(report);
+    }
+
+    let expected = attempted_keys
+        .iter()
+        .filter_map(|key| {
+            model
+                .live
+                .get(key)
+                .cloned()
+                .map(|expected| (key.clone(), expected))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut pending = expected.keys().cloned().collect::<BTreeSet<_>>();
+    let deadline = Instant::now() + max_recovery;
+    let mut delay = Duration::from_secs(1);
+    let concurrency = concurrency.max(1);
+
+    'retry: while !pending.is_empty() && report.hash_mismatches.is_empty() {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        async_sleep(delay.min(remaining)).await;
+        delay = delay.saturating_mul(2);
+        if Instant::now() >= deadline {
+            break;
+        }
+        let pending_keys = pending.iter().cloned().collect::<Vec<_>>();
+        let mut batch = stream::iter(pending_keys.into_iter().map(|key| {
+            let s3 = s3.clone();
+            let recorder = recorder.clone();
+            let expected = expected.get(&key).expect("pending key").clone();
+            async move {
+                let get = s3.get_object_result(&key, &recorder).await;
+                (key, expected, get)
+            }
+        }))
+        .buffer_unordered(concurrency);
+
+        while let Some((key, expected, get)) = {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break 'retry;
+            }
+            match timeout(remaining, batch.next()).await {
+                Ok(item) => item,
+                Err(_) => break 'retry,
+            }
+        } {
+            match get {
+                Ok(get) if committed_get_matches(&expected, &get) => {
+                    pending.remove(&key);
+                    report.reread_recovered_keys.push(key);
+                }
+                Ok(get) => {
+                    if let Some(body) = get.body {
+                        report
+                            .hash_mismatches
+                            .push(hash_mismatch_message(&key, &expected, &body));
+                        pending.remove(&key);
+                    }
+                }
+                Err(error) => {
+                    report.still_unavailable_keys.push(key);
+                    report.classification = RecoveryStabilityClassification::HarnessError;
+                    report
+                        .harness_errors
+                        .push(format!("reread failed: {error}"));
+                    pending.clear();
+                    break;
+                }
+            }
+        }
+
+        if pending.is_empty() || !report.hash_mismatches.is_empty() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+
+    report.still_unavailable_keys.extend(pending);
+    report.reread_recovered_keys.sort();
+    report.still_unavailable_keys.sort();
+    report.hash_mismatches.sort();
+    report.data_corruption_evidence.sort();
+    report.harness_errors.sort();
+    finish_recovery_stability_report(&mut report, immediate_report);
+    Ok(report)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExpectedObject {
     sha256: String,
@@ -268,6 +444,194 @@ fn read_failure_message(
         .map(|error| format!(" error={error:?}"))
         .unwrap_or_default();
     format!("{key}: outcome={outcome:?}{status}{error}")
+}
+
+fn recovery_tail_candidate_keys(
+    immediate_records: &[OperationRecord],
+    model: &ObjectModel,
+) -> Vec<String> {
+    immediate_records
+        .iter()
+        .filter_map(|record| {
+            let key = record.key.as_ref()?;
+            (record.kind == OperationKind::Get
+                && model.live.contains_key(key)
+                && is_recovery_tail_read_failure(
+                    record.outcome,
+                    record.http_status,
+                    record.error.as_deref(),
+                ))
+            .then(|| key.clone())
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn is_recovery_tail_read_failure(
+    outcome: OperationOutcome,
+    http_status: Option<u16>,
+    error: Option<&str>,
+) -> bool {
+    if !matches!(
+        outcome,
+        OperationOutcome::Timeout | OperationOutcome::Unknown
+    ) || http_status != Some(200)
+    {
+        return false;
+    }
+    let Some(error) = error else {
+        return false;
+    };
+    let error = error.to_ascii_lowercase();
+    error.contains("body read timed out")
+        || error.contains("body read timeout")
+        || error.contains("streaming error")
+}
+
+fn committed_get_matches(expected: &ExpectedObject, get: &GetObjectResult) -> bool {
+    get.outcome == OperationOutcome::Ok
+        && get.body.as_deref().is_some_and(|body| {
+            body.len() == expected.size_bytes && sha256_hex(body) == expected.sha256
+        })
+}
+
+fn hash_mismatch_message(key: &str, expected: &ExpectedObject, body: &[u8]) -> String {
+    let actual_hash = sha256_hex(body);
+    format!(
+        "{key}: expected {} ({} bytes), got {actual_hash} ({} bytes)",
+        expected.sha256,
+        expected.size_bytes,
+        body.len()
+    )
+}
+
+fn classify_without_reread(report: &CheckerReport) -> RecoveryStabilityClassification {
+    if !report.hash_mismatches.is_empty()
+        || !report.successful_corrupted_reads.is_empty()
+        || !report.unexpected_visible_deleted_objects.is_empty()
+        || !report.unknown_writes_materialized.is_empty()
+        || report.final_list_warning_count > 0
+    {
+        RecoveryStabilityClassification::DataCorruption
+    } else if !report.missing_committed_objects.is_empty()
+        || !report.unavailable_committed_objects.is_empty()
+        || !report.unknown_committed_read_failures.is_empty()
+    {
+        RecoveryStabilityClassification::CommittedObjectUnavailable
+    } else {
+        RecoveryStabilityClassification::HarnessError
+    }
+}
+
+fn immediate_data_corruption_evidence(report: &CheckerReport) -> Vec<String> {
+    let mut evidence = Vec::new();
+    evidence.extend(
+        report
+            .unexpected_visible_deleted_objects
+            .iter()
+            .map(|item| format!("unexpected_visible_deleted_object: {item}")),
+    );
+    evidence.extend(
+        report
+            .unknown_writes_materialized
+            .iter()
+            .map(|item| format!("unknown_write_materialized: {item}")),
+    );
+    evidence.extend(
+        report
+            .list_warnings
+            .iter()
+            .map(|item| format!("final_list_warning: {item}")),
+    );
+    if report.final_list_warning_count > report.list_warnings.len() {
+        evidence.push(format!(
+            "final_list_warning_count: {} total, {} sampled",
+            report.final_list_warning_count,
+            report.list_warnings.len()
+        ));
+    }
+    evidence.sort();
+    evidence
+}
+
+fn immediate_still_unavailable_keys(
+    report: &CheckerReport,
+    reread_attempted_keys: &[String],
+) -> Vec<String> {
+    let attempted = reread_attempted_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut keys = report
+        .missing_committed_objects
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for failure in report
+        .unavailable_committed_objects
+        .iter()
+        .chain(report.unknown_committed_read_failures.iter())
+    {
+        let key = read_failure_key(failure);
+        if !attempted.contains(key.as_str()) {
+            keys.insert(key);
+        }
+    }
+    keys.into_iter().collect()
+}
+
+fn read_failure_key(message: &str) -> String {
+    message
+        .split_once(':')
+        .map(|(key, _)| key)
+        .unwrap_or(message)
+        .to_string()
+}
+
+fn finish_recovery_stability_report(
+    report: &mut RecoveryStabilityReport,
+    immediate_report: &CheckerReport,
+) {
+    if !report.hash_mismatches.is_empty() || !report.data_corruption_evidence.is_empty() {
+        report.classification = RecoveryStabilityClassification::DataCorruption;
+        return;
+    }
+    if !report.harness_errors.is_empty() {
+        report.classification = RecoveryStabilityClassification::HarnessError;
+        return;
+    }
+    if !report.still_unavailable_keys.is_empty() {
+        report.classification = RecoveryStabilityClassification::CommittedObjectUnavailable;
+        return;
+    }
+    if !report.reread_attempted_keys.is_empty()
+        && immediate_failures_are_only_reread_candidates(immediate_report, report)
+    {
+        report.classification = RecoveryStabilityClassification::RecoveryTailReadLatency;
+        return;
+    }
+    report.classification = classify_without_reread(immediate_report);
+}
+
+fn immediate_failures_are_only_reread_candidates(
+    immediate_report: &CheckerReport,
+    recovery_report: &RecoveryStabilityReport,
+) -> bool {
+    immediate_report.tenant_recovered
+        && immediate_report.missing_committed_objects.is_empty()
+        && immediate_report.hash_mismatches.is_empty()
+        && immediate_report.successful_corrupted_reads.is_empty()
+        && immediate_report
+            .unexpected_visible_deleted_objects
+            .is_empty()
+        && immediate_report.unknown_writes_materialized.is_empty()
+        && immediate_report.final_list_warning_count == 0
+        && immediate_report.unavailable_committed_objects.len()
+            + immediate_report.unknown_committed_read_failures.len()
+            == recovery_report.reread_attempted_keys.len()
+        && recovery_report.reread_recovered_keys.len()
+            == recovery_report.reread_attempted_keys.len()
 }
 
 fn object_model(records: &[OperationRecord]) -> ObjectModel {
@@ -410,8 +774,10 @@ fn record_object(record: &OperationRecord) -> Option<(String, ExpectedObject)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckerReport, ExpectedObject, WarningSummary, evaluate_committed_get,
-        list_history_warnings, object_model, successful_read_anomalies,
+        CheckerReport, ExpectedObject, RecoveryStabilityClassification, RecoveryStabilityReport,
+        WarningSummary, evaluate_committed_get, finish_recovery_stability_report,
+        immediate_still_unavailable_keys, is_recovery_tail_read_failure, list_history_warnings,
+        object_model, recovery_tail_candidate_keys, successful_read_anomalies,
     };
     use crate::fault::history::{OperationKind, OperationOutcome, OperationRecord};
     use crate::fault::workload::GetObjectResult;
@@ -586,6 +952,192 @@ mod tests {
     }
 
     #[test]
+    fn recovery_tail_candidates_require_status_200_body_timeout_or_streaming_error() {
+        let put = record("op-1", OperationKind::Put, "k", "sha", OperationOutcome::Ok);
+        let model = object_model(&[put]);
+        let eligible_timeout = OperationRecord {
+            kind: OperationKind::Get,
+            outcome: OperationOutcome::Timeout,
+            http_status: Some(200),
+            error: Some("get body read timed out".to_string()),
+            ..record(
+                "op-2",
+                OperationKind::Get,
+                "k",
+                "",
+                OperationOutcome::Timeout,
+            )
+        };
+        let eligible_streaming = OperationRecord {
+            kind: OperationKind::Get,
+            outcome: OperationOutcome::Unknown,
+            http_status: Some(200),
+            error: Some("get body read failed: streaming error".to_string()),
+            ..record(
+                "op-3",
+                OperationKind::Get,
+                "k",
+                "",
+                OperationOutcome::Unknown,
+            )
+        };
+        let request_timeout = OperationRecord {
+            kind: OperationKind::Get,
+            outcome: OperationOutcome::Timeout,
+            http_status: None,
+            error: Some("get object timed out".to_string()),
+            ..record(
+                "op-4",
+                OperationKind::Get,
+                "k",
+                "",
+                OperationOutcome::Timeout,
+            )
+        };
+        let other_error = OperationRecord {
+            kind: OperationKind::Get,
+            outcome: OperationOutcome::Unknown,
+            http_status: Some(200),
+            error: Some("unexpected EOF".to_string()),
+            ..record(
+                "op-5",
+                OperationKind::Get,
+                "k",
+                "",
+                OperationOutcome::Unknown,
+            )
+        };
+
+        assert!(is_recovery_tail_read_failure(
+            eligible_timeout.outcome,
+            eligible_timeout.http_status,
+            eligible_timeout.error.as_deref()
+        ));
+        let keys = recovery_tail_candidate_keys(
+            &[
+                eligible_timeout,
+                eligible_streaming,
+                request_timeout,
+                other_error,
+            ],
+            &model,
+        );
+
+        assert_eq!(keys, vec!["k"]);
+    }
+
+    #[test]
+    fn recovery_stability_report_classifies_tail_latency_only_when_all_candidates_recover() {
+        let mut immediate = empty_report();
+        immediate
+            .unavailable_committed_objects
+            .push("k: outcome=Timeout status=200 error=\"get body read timed out\"".to_string());
+        let mut recovery = recovery_report_with_attempted_key("k");
+        recovery.reread_recovered_keys.push("k".to_string());
+
+        finish_recovery_stability_report(&mut recovery, &immediate);
+
+        assert_eq!(
+            recovery.classification,
+            RecoveryStabilityClassification::RecoveryTailReadLatency
+        );
+    }
+
+    #[test]
+    fn recovery_stability_report_keeps_unavailable_and_corrupt_classifications_hard() {
+        let mut immediate = empty_report();
+        immediate
+            .unavailable_committed_objects
+            .push("k: outcome=Timeout status=200 error=\"get body read timed out\"".to_string());
+        let mut unavailable = recovery_report_with_attempted_key("k");
+        unavailable.still_unavailable_keys.push("k".to_string());
+        finish_recovery_stability_report(&mut unavailable, &immediate);
+        assert_eq!(
+            unavailable.classification,
+            RecoveryStabilityClassification::CommittedObjectUnavailable
+        );
+
+        let mut corrupt = recovery_report_with_attempted_key("k");
+        corrupt.reread_recovered_keys.push("k".to_string());
+        corrupt
+            .hash_mismatches
+            .push("k: expected sha (1 bytes), got bad (1 bytes)".to_string());
+        finish_recovery_stability_report(&mut corrupt, &immediate);
+        assert_eq!(
+            corrupt.classification,
+            RecoveryStabilityClassification::DataCorruption
+        );
+    }
+
+    #[test]
+    fn recovery_stability_classifies_list_and_visibility_anomalies_as_data_corruption() {
+        let mut final_list_warning = empty_report();
+        final_list_warning.final_list_warning_count = 1;
+        final_list_warning
+            .list_warnings
+            .push("LIST prefix did not include expected live key k".to_string());
+        assert_eq!(
+            super::classify_without_reread(&final_list_warning),
+            RecoveryStabilityClassification::DataCorruption
+        );
+        assert_eq!(
+            super::immediate_data_corruption_evidence(&final_list_warning),
+            vec!["final_list_warning: LIST prefix did not include expected live key k"]
+        );
+
+        let mut history_list_warning = empty_report();
+        history_list_warning.list_history_warning_count = 1;
+        history_list_warning
+            .list_history_warnings
+            .push("LIST op-1 warning during workload".to_string());
+        assert_eq!(
+            super::classify_without_reread(&history_list_warning),
+            RecoveryStabilityClassification::HarnessError
+        );
+
+        let mut visible_deleted = empty_report();
+        visible_deleted
+            .unexpected_visible_deleted_objects
+            .push("k: deleted object returned body".to_string());
+        assert_eq!(
+            super::classify_without_reread(&visible_deleted),
+            RecoveryStabilityClassification::DataCorruption
+        );
+        assert_eq!(
+            super::immediate_data_corruption_evidence(&visible_deleted),
+            vec!["unexpected_visible_deleted_object: k: deleted object returned body"]
+        );
+    }
+
+    #[test]
+    fn recovery_stability_keeps_non_candidate_immediate_failures_unavailable() {
+        let mut immediate = empty_report();
+        immediate
+            .unavailable_committed_objects
+            .push("k: outcome=Timeout error=\"get object timed out\"".to_string());
+        let keys = immediate_still_unavailable_keys(&immediate, &[]);
+        let mut recovery = RecoveryStabilityReport {
+            immediate_passed: false,
+            reread_attempted_keys: Vec::new(),
+            reread_recovered_keys: Vec::new(),
+            still_unavailable_keys: keys,
+            hash_mismatches: Vec::new(),
+            data_corruption_evidence: Vec::new(),
+            harness_errors: Vec::new(),
+            max_recovery_seconds: 60,
+            classification: RecoveryStabilityClassification::HarnessError,
+        };
+
+        finish_recovery_stability_report(&mut recovery, &immediate);
+
+        assert_eq!(recovery.still_unavailable_keys, vec!["k"]);
+        assert_eq!(
+            recovery.classification,
+            RecoveryStabilityClassification::CommittedObjectUnavailable
+        );
+    }
+
+    #[test]
     fn warning_summary_caps_samples_but_counts_all() {
         let mut warnings = WarningSummary::default();
         for idx in 0..(super::MAX_WARNING_SAMPLES + 3) {
@@ -644,6 +1196,20 @@ mod tests {
             final_listed_objects: None,
             tenant_recovered: true,
             passed: false,
+        }
+    }
+
+    fn recovery_report_with_attempted_key(key: &str) -> RecoveryStabilityReport {
+        RecoveryStabilityReport {
+            immediate_passed: false,
+            reread_attempted_keys: vec![key.to_string()],
+            reread_recovered_keys: Vec::new(),
+            still_unavailable_keys: Vec::new(),
+            hash_mismatches: Vec::new(),
+            data_corruption_evidence: Vec::new(),
+            harness_errors: Vec::new(),
+            max_recovery_seconds: 60,
+            classification: RecoveryStabilityClassification::CommittedObjectUnavailable,
         }
     }
 }

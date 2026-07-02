@@ -22,10 +22,12 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use crate::fault::{
-    checker::CheckerReport,
+    checker::RecoveryStabilityReport,
+    checker::{CheckerReport, RecoveryStabilityClassification},
     config::{
-        DEFAULT_RUSTFS_POD_COUNT, DEFAULT_RUSTFS_POD_STABLE_WINDOW_SECONDS,
-        DEFAULT_RUSTFS_VOLUME_PATH, DEFAULT_WORKLOAD_CONCURRENCY, DEFAULT_WORKLOAD_OBJECTS,
+        DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS, DEFAULT_RUSTFS_POD_COUNT,
+        DEFAULT_RUSTFS_POD_STABLE_WINDOW_SECONDS, DEFAULT_RUSTFS_VOLUME_PATH,
+        DEFAULT_WORKLOAD_CONCURRENCY, DEFAULT_WORKLOAD_OBJECTS,
     },
     events::{RunEvent, RunEventStatus},
     scenarios,
@@ -44,6 +46,7 @@ pub struct ArtifactValidationOptions {
     pub expected_workload_concurrency: usize,
     pub expected_rustfs_pod_count: usize,
     pub expected_stable_window_seconds: u64,
+    pub expected_recovery_stability_reread_seconds: u64,
     pub expected_rustfs_volume_path: String,
 }
 
@@ -91,6 +94,10 @@ impl ArtifactValidationOptions {
                 "RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS",
                 DEFAULT_RUSTFS_POD_STABLE_WINDOW_SECONDS,
             )?,
+            expected_recovery_stability_reread_seconds: env_u64(
+                "RUSTFS_FAULT_TEST_RECOVERY_STABILITY_REREAD_SECONDS",
+                DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS,
+            )?,
             expected_rustfs_volume_path: env_string(
                 "RUSTFS_FAULT_TEST_RUSTFS_VOLUME_PATH",
                 DEFAULT_RUSTFS_VOLUME_PATH,
@@ -103,9 +110,19 @@ pub fn validate_fault_artifacts(
     options: &ArtifactValidationOptions,
 ) -> Result<ArtifactValidationReport> {
     let scenario_spec = scenarios::scenario_spec(&options.scenario)?;
+    validate_conditional_recovery_stability_artifact(
+        &options.artifact_root,
+        scenario_spec.case_name,
+    )?;
     let artifacts = locate_required_artifacts(&options.artifact_root, scenario_spec.case_name)?;
 
-    let metadata = read_json::<RunMetadataArtifact>(required(&artifacts, "run-metadata.json")?)?;
+    let metadata_path = required(&artifacts, "run-metadata.json")?;
+    ensure_json_field_present(
+        metadata_path,
+        "/recovery_stability_reread_seconds",
+        "run-metadata.json recovery_stability_reread_seconds",
+    )?;
+    let metadata = read_json::<RunMetadataArtifact>(metadata_path)?;
     ensure!(
         metadata.scenario == options.scenario,
         "run-metadata.json scenario {:?} does not match selected scenario {:?}",
@@ -128,6 +145,13 @@ pub fn validate_fault_artifacts(
         metadata.workload_concurrency,
         options.expected_workload_concurrency
     );
+    ensure!(
+        metadata.recovery_stability_reread_seconds
+            == options.expected_recovery_stability_reread_seconds,
+        "run-metadata.json recovery_stability_reread_seconds {} does not match expected {}",
+        metadata.recovery_stability_reread_seconds,
+        options.expected_recovery_stability_reread_seconds
+    );
 
     let workload_plan = read_json::<WorkloadPlan>(required(&artifacts, "workload-plan.json")?)?;
     ensure!(
@@ -143,8 +167,20 @@ pub fn validate_fault_artifacts(
         options.expected_workload_concurrency
     );
 
-    let json_spec = read_json::<FaultRunSpec>(required(&artifacts, "run-spec.json")?)?;
-    let yaml_spec = read_yaml::<FaultRunSpec>(required(&artifacts, "run-spec.yaml")?)?;
+    let json_spec_path = required(&artifacts, "run-spec.json")?;
+    let yaml_spec_path = required(&artifacts, "run-spec.yaml")?;
+    ensure_json_field_present(
+        json_spec_path,
+        "/recovery/recovery_stability_reread_seconds",
+        "run-spec.json recovery.recovery_stability_reread_seconds",
+    )?;
+    ensure_yaml_field_present(
+        yaml_spec_path,
+        "/recovery/recovery_stability_reread_seconds",
+        "run-spec.yaml recovery.recovery_stability_reread_seconds",
+    )?;
+    let json_spec = read_json::<FaultRunSpec>(json_spec_path)?;
+    let yaml_spec = read_yaml::<FaultRunSpec>(yaml_spec_path)?;
     ensure!(
         json_spec == yaml_spec,
         "run spec JSON and YAML artifacts do not describe the same contract"
@@ -256,6 +292,13 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
         options.expected_stable_window_seconds
     );
     ensure!(
+        spec.recovery.recovery_stability_reread_seconds
+            == options.expected_recovery_stability_reread_seconds,
+        "run-spec recovery.recovery_stability_reread_seconds {} does not match expected {}",
+        spec.recovery.recovery_stability_reread_seconds,
+        options.expected_recovery_stability_reread_seconds
+    );
+    ensure!(
         spec.artifacts.event_stream == "run-events.jsonl",
         "run-spec artifacts.event_stream must be run-events.jsonl"
     );
@@ -340,6 +383,105 @@ fn locate_required_artifacts(root: &Path, case_name: &str) -> Result<BTreeMap<St
     Ok(artifacts)
 }
 
+fn validate_conditional_recovery_stability_artifact(root: &Path, case_name: &str) -> Result<()> {
+    let Some(events_path) = optional_artifact(root, case_name, "run-events.jsonl")? else {
+        return Ok(());
+    };
+    let events = read_jsonl::<RunEvent>(&events_path)?;
+    let should_validate = events.iter().any(|event| {
+        (event.stage == "checker-pre-recommit" && event.status == RunEventStatus::Failed)
+            || event.stage == "recovery-stability-reread"
+    });
+    if !should_validate {
+        return Ok(());
+    }
+
+    let recovery_path = locate_artifact(root, case_name, "recovery-stability-report.json")
+        .with_context(|| "locate conditional artifact recovery-stability-report.json")?;
+    let failure_summary_path = locate_artifact(root, case_name, "failure-summary.json")
+        .with_context(|| "locate conditional artifact failure-summary.json")?;
+    let recovery = read_json::<RecoveryStabilityReport>(&recovery_path)?;
+    validate_recovery_stability_report(&recovery)?;
+    let failure_summary = read_json::<FailureSummaryArtifact>(&failure_summary_path)?;
+    ensure!(
+        failure_summary.classification == recovery.classification.as_str(),
+        "failure-summary.json classification {:?} does not match recovery-stability-report.json classification {:?}",
+        failure_summary.classification,
+        recovery.classification.as_str()
+    );
+    ensure!(
+        failure_summary.stage == "checker-pre-recommit"
+            || failure_summary.stage == "checker-pre-recommit-verdict",
+        "failure-summary.json stage {:?} is not a pre-recommit recovery-stability stage",
+        failure_summary.stage
+    );
+    ensure!(
+        !failure_summary.scenario.trim().is_empty() && !failure_summary.message.trim().is_empty(),
+        "failure-summary.json must include non-empty scenario and message"
+    );
+    Ok(())
+}
+
+fn validate_recovery_stability_report(report: &RecoveryStabilityReport) -> Result<()> {
+    ensure_sorted_unique(
+        &report.reread_attempted_keys,
+        "recovery-stability-report.json reread_attempted_keys",
+    )?;
+    ensure_sorted_unique(
+        &report.reread_recovered_keys,
+        "recovery-stability-report.json reread_recovered_keys",
+    )?;
+    ensure_sorted_unique(
+        &report.still_unavailable_keys,
+        "recovery-stability-report.json still_unavailable_keys",
+    )?;
+    ensure_sorted_unique(
+        &report.data_corruption_evidence,
+        "recovery-stability-report.json data_corruption_evidence",
+    )?;
+    match report.classification {
+        RecoveryStabilityClassification::RecoveryTailReadLatency => {
+            ensure!(
+                !report.reread_attempted_keys.is_empty()
+                    && report.reread_attempted_keys == report.reread_recovered_keys
+                    && report.still_unavailable_keys.is_empty()
+                    && report.hash_mismatches.is_empty()
+                    && report.harness_errors.is_empty(),
+                "recovery_tail_read_latency requires all attempted keys to be recovered without hard failures"
+            );
+        }
+        RecoveryStabilityClassification::CommittedObjectUnavailable => {
+            ensure!(
+                !report.still_unavailable_keys.is_empty(),
+                "committed_object_unavailable requires still_unavailable_keys"
+            );
+        }
+        RecoveryStabilityClassification::DataCorruption => {
+            ensure!(
+                !report.hash_mismatches.is_empty() || !report.data_corruption_evidence.is_empty(),
+                "data_corruption requires hash_mismatches or data_corruption_evidence"
+            );
+        }
+        RecoveryStabilityClassification::HarnessError => {
+            ensure!(
+                !report.harness_errors.is_empty(),
+                "harness_error requires harness_errors"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_sorted_unique(values: &[String], field: &str) -> Result<()> {
+    for pair in values.windows(2) {
+        ensure!(
+            pair[0] < pair[1],
+            "{field} must be sorted and contain no duplicates"
+        );
+    }
+    Ok(())
+}
+
 fn locate_artifact(root: &Path, case_name: &str, name: &str) -> Result<PathBuf> {
     for candidate in [root.join(case_name).join(name), root.join(name)] {
         if candidate.is_file() {
@@ -347,6 +489,15 @@ fn locate_artifact(root: &Path, case_name: &str, name: &str) -> Result<PathBuf> 
         }
     }
     recursive_find(root, name)?.with_context(|| format!("required artifact {name} is missing"))
+}
+
+fn optional_artifact(root: &Path, case_name: &str, name: &str) -> Result<Option<PathBuf>> {
+    for candidate in [root.join(case_name).join(name), root.join(name)] {
+        if candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+    }
+    recursive_find(root, name)
 }
 
 fn recursive_find(root: &Path, name: &str) -> Result<Option<PathBuf>> {
@@ -383,6 +534,24 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
 fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     serde_yaml_ng::from_str(&raw).with_context(|| format!("parse yaml {}", path.display()))
+}
+
+fn ensure_json_field_present(path: &Path, pointer: &str, field: &str) -> Result<()> {
+    let value = read_json::<Value>(path)?;
+    ensure!(
+        value.pointer(pointer).is_some(),
+        "{field} must be explicitly present"
+    );
+    Ok(())
+}
+
+fn ensure_yaml_field_present(path: &Path, pointer: &str, field: &str) -> Result<()> {
+    let value = read_yaml::<Value>(path)?;
+    ensure!(
+        value.pointer(pointer).is_some(),
+        "{field} must be explicitly present"
+    );
+    Ok(())
 }
 
 fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
@@ -444,6 +613,12 @@ struct RunMetadataArtifact {
     rustfs_image: String,
     workload_objects: usize,
     workload_concurrency: usize,
+    #[serde(default = "default_recovery_stability_reread_seconds")]
+    recovery_stability_reread_seconds: u64,
+}
+
+fn default_recovery_stability_reread_seconds() -> u64 {
+    DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS
 }
 
 #[derive(Debug, Deserialize)]
@@ -463,6 +638,14 @@ struct RecommitReportArtifact {
     failed: usize,
     harness_errors: usize,
     attempts: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FailureSummaryArtifact {
+    scenario: String,
+    stage: String,
+    classification: String,
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -526,6 +709,7 @@ mod tests {
             expected_workload_concurrency: 4,
             expected_rustfs_pod_count: 4,
             expected_stable_window_seconds: 60,
+            expected_recovery_stability_reread_seconds: 60,
             expected_rustfs_volume_path: "/data/rustfs0".to_string(),
         };
 
@@ -555,12 +739,110 @@ mod tests {
             expected_workload_concurrency: 4,
             expected_rustfs_pod_count: 4,
             expected_stable_window_seconds: 60,
+            expected_recovery_stability_reread_seconds: 60,
             expected_rustfs_volume_path: "/data/rustfs0".to_string(),
         };
 
         let error = validate_fault_artifacts(&options).expect_err("missing checker");
 
         assert!(error.to_string().contains("checker-report.json"));
+    }
+
+    #[test]
+    fn rejects_missing_explicit_recovery_stability_reread_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_success_artifacts(dir.path(), "io-eio");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        let metadata_path = case_dir.join("run-metadata.json");
+        let mut metadata = serde_json::from_str::<serde_json::Value>(
+            &fs::read_to_string(&metadata_path).expect("metadata"),
+        )
+        .expect("metadata json");
+        metadata
+            .as_object_mut()
+            .expect("metadata object")
+            .remove("recovery_stability_reread_seconds");
+        fs::write(
+            &metadata_path,
+            serde_json::to_string_pretty(&metadata).expect("json"),
+        )
+        .expect("rewrite metadata");
+        let options = ArtifactValidationOptions {
+            scenario: "io-eio".to_string(),
+            artifact_root: dir.path().to_path_buf(),
+            expected_workload_objects: 12,
+            expected_workload_concurrency: 4,
+            expected_rustfs_pod_count: 4,
+            expected_stable_window_seconds: 60,
+            expected_recovery_stability_reread_seconds: 60,
+            expected_rustfs_volume_path: "/data/rustfs0".to_string(),
+        };
+
+        let error = validate_fault_artifacts(&options).expect_err("missing metadata field");
+
+        assert!(
+            error
+                .to_string()
+                .contains("recovery_stability_reread_seconds")
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_recovery_stability_failure_summary_classification() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let case_dir = dir.path().join("fault_io_eio_preserves_committed_objects");
+        fs::create_dir_all(&case_dir).expect("case dir");
+        fs::write(
+            case_dir.join("run-events.jsonl"),
+            [
+                json!({"at_ms":1,"scenario":"io-eio","run_id":"run-1","stage":"checker-pre-recommit","status":"failed","message":"failed"}).to_string(),
+                json!({"at_ms":2,"scenario":"io-eio","run_id":"run-1","stage":"recovery-stability-reread","status":"succeeded","message":"done"}).to_string(),
+            ].join("\n"),
+        )
+        .expect("events");
+        write_json(
+            &case_dir,
+            "recovery-stability-report.json",
+            &json!({
+                "immediate_passed": false,
+                "reread_attempted_keys": ["k"],
+                "reread_recovered_keys": ["k"],
+                "still_unavailable_keys": [],
+                "hash_mismatches": [],
+                "data_corruption_evidence": [],
+                "harness_errors": [],
+                "max_recovery_seconds": 60,
+                "classification": "recovery_tail_read_latency"
+            }),
+        );
+        write_json(
+            &case_dir,
+            "failure-summary.json",
+            &json!({
+                "scenario": "io-eio",
+                "stage": "checker-pre-recommit-verdict",
+                "classification": "committed_object_unavailable",
+                "message": "immediate checker failed"
+            }),
+        );
+        let options = ArtifactValidationOptions {
+            scenario: "io-eio".to_string(),
+            artifact_root: dir.path().to_path_buf(),
+            expected_workload_objects: 12,
+            expected_workload_concurrency: 4,
+            expected_rustfs_pod_count: 4,
+            expected_stable_window_seconds: 60,
+            expected_recovery_stability_reread_seconds: 60,
+            expected_rustfs_volume_path: "/data/rustfs0".to_string(),
+        };
+
+        let error = validate_fault_artifacts(&options).expect_err("classification mismatch");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failure-summary.json classification")
+        );
     }
 
     fn write_success_artifacts(root: &std::path::Path, scenario: &str) {
@@ -602,6 +884,7 @@ mod tests {
                 "timeout_seconds": 300,
                 "expected_rustfs_pod_count": 4,
                 "stable_pod_window_seconds": 60,
+                "recovery_stability_reread_seconds": 60,
                 "recommit_unconfirmed_writes": true
             },
             "faults": [{
@@ -656,6 +939,7 @@ mod tests {
                 "workload_concurrency": 4,
                 "prefill_concurrency": 4,
                 "request_timeout_seconds": 30,
+                "recovery_stability_reread_seconds": 60,
                 "use_cluster_ip": false,
                 "require_client_disruption": true,
                 "chaos_namespace": "chaos-mesh"

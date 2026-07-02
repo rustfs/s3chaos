@@ -15,11 +15,8 @@
 use crate::{
     fault::{
         backends::{
-            chaos_mesh::{
-                self, ChaosGuard, IoChaosSpec, IoLatencyParameters, NetworkChaosSpec,
-                NetworkDelayParameters, PodChaosSpec, StressChaosSpec,
-            },
-            host::{self, DmFlakeyGuard, DmFlakeySpec, DmStatusSnapshot},
+            chaos_mesh::{self, ChaosGuard},
+            host::{self, DmFlakeyGuard, DmStatusSnapshot},
         },
         checker,
         config::FaultTestConfig,
@@ -27,7 +24,10 @@ use crate::{
         events::{RunEventRecorder, RunEventStatus},
         fixture,
         history::{OperationOutcome, OperationRecord, Recorder},
-        plan::{FaultInjection, FaultKind, FaultPlan, FaultPlanOptions},
+        plan::{FaultInjection, FaultPlan, FaultPlanOptions},
+        pods::{
+            rustfs_pod_identities, wait_for_rustfs_pod_deletion, wait_for_rustfs_pod_replacement,
+        },
         reporting::{
             FailureSummary, FaultEvidence, FaultStatusSnapshot, PodIdentity, RunMetadata,
             write_checker_error, write_failure_summary, write_failure_summary_if_absent,
@@ -54,7 +54,6 @@ use futures::{StreamExt, TryStreamExt, stream};
 use kube::core::DynamicObject;
 use serde::Serialize;
 use std::collections::BTreeSet;
-use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tokio::time::sleep as async_sleep;
 use uuid::Uuid;
@@ -1146,6 +1145,7 @@ async fn run_fault_case(
         "checking recovered object model before recommit",
         None,
     )?;
+    let pre_recommit_record_start = history.records().len();
     let pre_recommit_report =
         match checker::check_s3_history(&s3, &history, true, workload_plan.concurrency).await {
             Ok(report) => report,
@@ -1165,13 +1165,22 @@ async fn run_fault_case(
                     "checker-pre-recommit-error.txt",
                     &message,
                 )?;
+                let recovery_stability_report = checker::RecoveryStabilityReport::harness_error(
+                    message.clone(),
+                    config.recovery_stability_reread,
+                );
+                collector.write_text(
+                    scenario.case_name,
+                    "recovery-stability-report.json",
+                    &serde_json::to_string_pretty(&recovery_stability_report)?,
+                )?;
                 write_failure_summary(
                     collector,
                     scenario.case_name,
                     FailureSummary::new(
                         &scenario.name,
                         "checker-pre-recommit",
-                        "checker_or_environment",
+                        recovery_stability_report.classification.as_str(),
                         message,
                     ),
                 )?;
@@ -1192,13 +1201,71 @@ async fn run_fault_case(
                 None,
             )
             .ok();
+        events
+            .record(
+                "recovery-stability-reread",
+                RunEventStatus::Started,
+                "bounded reread of recovery-tail committed GET failures",
+                Some(serde_json::json!({
+                    "max_recovery_seconds": config.recovery_stability_reread.as_secs()
+                })),
+            )
+            .ok();
+        let recovery_stability_report = match checker::recovery_stability_reread(
+            &s3,
+            &history,
+            &pre_recommit_report,
+            pre_recommit_record_start,
+            workload_plan.concurrency,
+            config.recovery_stability_reread,
+        )
+        .await
+        {
+            Ok(report) => {
+                events
+                    .record(
+                        "recovery-stability-reread",
+                        RunEventStatus::Succeeded,
+                        "bounded recovery stability reread completed",
+                        Some(serde_json::json!({
+                            "classification": report.classification.as_str(),
+                            "attempted_keys": report.reread_attempted_keys.len(),
+                            "recovered_keys": report.reread_recovered_keys.len(),
+                            "still_unavailable_keys": report.still_unavailable_keys.len(),
+                            "hash_mismatches": report.hash_mismatches.len()
+                        })),
+                    )
+                    .ok();
+                report
+            }
+            Err(reread_error) => {
+                let message = format!("recovery stability reread failed: {reread_error}");
+                events
+                    .record(
+                        "recovery-stability-reread",
+                        RunEventStatus::Failed,
+                        message.clone(),
+                        None,
+                    )
+                    .ok();
+                checker::RecoveryStabilityReport::harness_error(
+                    message,
+                    config.recovery_stability_reread,
+                )
+            }
+        };
+        collector.write_text(
+            scenario.case_name,
+            "recovery-stability-report.json",
+            &serde_json::to_string_pretty(&recovery_stability_report)?,
+        )?;
         write_failure_summary(
             collector,
             scenario.case_name,
             FailureSummary::new(
                 &scenario.name,
                 "checker-pre-recommit-verdict",
-                "product_or_environment",
+                recovery_stability_report.classification.as_str(),
                 error.to_string(),
             ),
         )?;
@@ -1764,12 +1831,12 @@ fn apply_fault_backend(
         resource_name_suffix,
     };
     match injection.backend() {
-        FaultBackend::DeviceMapper => HostFaultBackendFactory.apply(&request),
+        FaultBackend::DeviceMapper => apply_host_fault_backend(&request),
         FaultBackend::ChaosMeshIoChaos
         | FaultBackend::ChaosMeshPodChaos
         | FaultBackend::ChaosMeshNetworkChaos
         | FaultBackend::ChaosMeshStressChaos
-        | FaultBackend::MinioWarpWithChaos => ChaosMeshFaultBackendFactory.apply(&request),
+        | FaultBackend::MinioWarpWithChaos => apply_chaos_mesh_fault_backend(&request),
     }
 }
 
@@ -1783,307 +1850,44 @@ struct FaultApplyRequest<'a> {
     resource_name_suffix: &'a str,
 }
 
-trait FaultBackendFactory {
-    fn apply(&self, request: &FaultApplyRequest<'_>) -> Result<AppliedFault>;
-}
-
-struct ChaosMeshFaultBackendFactory;
-struct HostFaultBackendFactory;
-
-impl FaultBackendFactory for ChaosMeshFaultBackendFactory {
-    fn apply(&self, request: &FaultApplyRequest<'_>) -> Result<AppliedFault> {
-        apply_chaos_mesh_fault_backend(request)
-    }
-}
-
-impl FaultBackendFactory for HostFaultBackendFactory {
-    fn apply(&self, request: &FaultApplyRequest<'_>) -> Result<AppliedFault> {
-        apply_host_fault_backend(request)
-    }
-}
-
 fn apply_chaos_mesh_fault_backend(request: &FaultApplyRequest<'_>) -> Result<AppliedFault> {
-    let config = request.config;
-    let collector = request.collector;
-    let scenario = request.scenario;
-    let injection = request.injection;
-    let run_id = request.run_id;
-    let manifest_name = request.manifest_name;
-    let resource_name_suffix = request.resource_name_suffix;
-    let cluster = &config.cluster;
-    match injection.kind() {
-        FaultKind::RustfsVolumeEnospc => {
-            let chaos = IoChaosSpec::enospc_on_rustfs_volume(
-                cluster,
-                &config.chaos_namespace,
-                run_id,
-                &scenario.name,
-                injection.rustfs_volume_path()?,
-                injection.percent()?,
-                injection.duration(),
-            )?
-            .with_name_suffix(resource_name_suffix);
-            collector.write_text(scenario.case_name, manifest_name, &chaos.manifest())?;
-            Ok(Box::new(ChaosFaultHandle {
-                guard: Box::new(chaos_mesh::apply_iochaos(cluster, &chaos)?),
-                active_required: true,
-            }))
-        }
-        FaultKind::RustfsVolumeReadMistake => {
-            let chaos = IoChaosSpec::read_mistake_on_rustfs_volume(
-                cluster,
-                &config.chaos_namespace,
-                run_id,
-                &scenario.name,
-                injection.rustfs_volume_path()?,
-                injection.percent()?,
-                injection.duration(),
-            )?
-            .with_name_suffix(resource_name_suffix);
-            collector.write_text(scenario.case_name, manifest_name, &chaos.manifest())?;
-            Ok(Box::new(ChaosFaultHandle {
-                guard: Box::new(chaos_mesh::apply_iochaos(cluster, &chaos)?),
-                active_required: true,
-            }))
-        }
-        FaultKind::RustfsVolumeLatency => {
-            let (delay, methods) = injection.parameters().io_latency()?;
-            let chaos = IoChaosSpec::latency_on_rustfs_volume(
-                cluster,
-                &config.chaos_namespace,
-                run_id,
-                &scenario.name,
-                injection.rustfs_volume_path()?,
-                IoLatencyParameters {
-                    methods,
-                    delay,
-                    percent: injection.percent()?,
-                },
-                injection.duration(),
-            )?
-            .with_name_suffix(resource_name_suffix);
-            collector.write_text(scenario.case_name, manifest_name, &chaos.manifest())?;
-            Ok(Box::new(ChaosFaultHandle {
-                guard: Box::new(chaos_mesh::apply_iochaos(cluster, &chaos)?),
-                active_required: true,
-            }))
-        }
-        FaultKind::RustfsVolumeIoError => {
-            let chaos = IoChaosSpec::eio_on_rustfs_volume(
-                cluster,
-                &config.chaos_namespace,
-                run_id,
-                &scenario.name,
-                injection.rustfs_volume_path()?,
-                injection.percent()?,
-                injection.duration(),
-            )?
-            .with_name_suffix(resource_name_suffix);
-            collector.write_text(scenario.case_name, manifest_name, &chaos.manifest())?;
-            Ok(Box::new(ChaosFaultHandle {
-                guard: Box::new(chaos_mesh::apply_iochaos(cluster, &chaos)?),
-                active_required: true,
-            }))
-        }
-        FaultKind::RustfsServerPodKill => {
-            let before_pods = rustfs_pod_identities(cluster)?;
-            let chaos = PodChaosSpec::kill_one_rustfs_pod(
-                cluster,
-                &config.chaos_namespace,
-                run_id,
-                &scenario.name,
-            )
-            .with_name_suffix(resource_name_suffix);
-            collector.write_text(scenario.case_name, manifest_name, &chaos.manifest())?;
+    let applied = chaos_mesh::apply_fault(&chaos_mesh::FaultApplyRequest {
+        config: request.config,
+        collector: request.collector,
+        scenario: request.scenario,
+        injection: request.injection,
+        run_id: request.run_id,
+        manifest_name: request.manifest_name,
+        resource_name_suffix: request.resource_name_suffix,
+    })?;
+    match applied {
+        chaos_mesh::AppliedFault::Experiment {
+            guard,
+            active_required,
+        } => Ok(Box::new(ChaosFaultHandle {
+            guard: Box::new(guard),
+            active_required,
+        })),
+        chaos_mesh::AppliedFault::PodKill { guard, before_pods } => {
             Ok(Box::new(PodKillFaultHandle {
-                guard: Box::new(chaos_mesh::apply_podchaos(cluster, &chaos)?),
+                guard: Box::new(guard),
                 before_pods,
-                config: Box::new(cluster.clone()),
+                config: Box::new(request.config.cluster.clone()),
             }))
-        }
-        FaultKind::RustfsServerPodFailure => {
-            let chaos = PodChaosSpec::fail_one_rustfs_pod(
-                cluster,
-                &config.chaos_namespace,
-                run_id,
-                &scenario.name,
-                injection.duration(),
-            )?
-            .with_name_suffix(resource_name_suffix);
-            collector.write_text(scenario.case_name, manifest_name, &chaos.manifest())?;
-            Ok(Box::new(ChaosFaultHandle {
-                guard: Box::new(chaos_mesh::apply_podchaos(cluster, &chaos)?),
-                active_required: true,
-            }))
-        }
-        FaultKind::RustfsServerNetworkPartition => {
-            let chaos = NetworkChaosSpec::partition_one_rustfs_pod(
-                cluster,
-                &config.chaos_namespace,
-                run_id,
-                &scenario.name,
-                injection.duration(),
-            )?
-            .with_name_suffix(resource_name_suffix);
-            collector.write_text(scenario.case_name, manifest_name, &chaos.manifest())?;
-            Ok(Box::new(ChaosFaultHandle {
-                guard: Box::new(chaos_mesh::apply_networkchaos(cluster, &chaos)?),
-                active_required: true,
-            }))
-        }
-        FaultKind::RustfsServerNetworkDelay
-        | FaultKind::RustfsServerNetworkLoss
-        | FaultKind::RustfsServerNetworkCorrupt
-        | FaultKind::RustfsServerNetworkDuplicate => {
-            let chaos = match injection.kind() {
-                FaultKind::RustfsServerNetworkDelay => {
-                    let (latency, jitter, correlation_percent) =
-                        injection.parameters().network_delay()?;
-                    NetworkChaosSpec::delay_one_rustfs_pod(
-                        cluster,
-                        &config.chaos_namespace,
-                        run_id,
-                        &scenario.name,
-                        injection.duration(),
-                        NetworkDelayParameters {
-                            latency,
-                            jitter,
-                            correlation_percent,
-                        },
-                    )?
-                }
-                FaultKind::RustfsServerNetworkLoss => {
-                    let (loss_percent, correlation_percent) =
-                        injection.parameters().network_loss()?;
-                    NetworkChaosSpec::loss_one_rustfs_pod(
-                        cluster,
-                        &config.chaos_namespace,
-                        run_id,
-                        &scenario.name,
-                        injection.duration(),
-                        loss_percent,
-                        correlation_percent,
-                    )?
-                }
-                FaultKind::RustfsServerNetworkCorrupt => {
-                    let (corrupt_percent, correlation_percent) =
-                        injection.parameters().network_corrupt()?;
-                    NetworkChaosSpec::corrupt_one_rustfs_pod(
-                        cluster,
-                        &config.chaos_namespace,
-                        run_id,
-                        &scenario.name,
-                        injection.duration(),
-                        corrupt_percent,
-                        correlation_percent,
-                    )?
-                }
-                FaultKind::RustfsServerNetworkDuplicate => {
-                    let (duplicate_percent, correlation_percent) =
-                        injection.parameters().network_duplicate()?;
-                    NetworkChaosSpec::duplicate_one_rustfs_pod(
-                        cluster,
-                        &config.chaos_namespace,
-                        run_id,
-                        &scenario.name,
-                        injection.duration(),
-                        duplicate_percent,
-                        correlation_percent,
-                    )?
-                }
-                _ => unreachable!(),
-            }
-            .with_name_suffix(resource_name_suffix);
-            collector.write_text(scenario.case_name, manifest_name, &chaos.manifest())?;
-            Ok(Box::new(ChaosFaultHandle {
-                guard: Box::new(chaos_mesh::apply_networkchaos(cluster, &chaos)?),
-                active_required: true,
-            }))
-        }
-        FaultKind::RustfsServerCpuStress | FaultKind::RustfsServerMemoryStress => {
-            let chaos = match injection.kind() {
-                FaultKind::RustfsServerCpuStress => {
-                    let (workers, load) = injection.parameters().stress_cpu()?;
-                    StressChaosSpec::cpu_on_one_rustfs_pod(
-                        cluster,
-                        &config.chaos_namespace,
-                        run_id,
-                        &scenario.name,
-                        injection.duration(),
-                        workers,
-                        load,
-                    )?
-                }
-                FaultKind::RustfsServerMemoryStress => {
-                    let (workers, size) = injection.parameters().stress_memory()?;
-                    StressChaosSpec::memory_on_one_rustfs_pod(
-                        cluster,
-                        &config.chaos_namespace,
-                        run_id,
-                        &scenario.name,
-                        injection.duration(),
-                        workers,
-                        size,
-                    )?
-                }
-                _ => unreachable!(),
-            }
-            .with_name_suffix(resource_name_suffix);
-            collector.write_text(scenario.case_name, manifest_name, &chaos.manifest())?;
-            Ok(Box::new(ChaosFaultHandle {
-                guard: Box::new(chaos_mesh::apply_stresschaos(cluster, &chaos)?),
-                active_required: true,
-            }))
-        }
-        FaultKind::RustfsBlockDeviceFlakey => {
-            bail!("fault kind rustfs_block_device_flakey must be applied by the host backend")
         }
     }
 }
 
 fn apply_host_fault_backend(request: &FaultApplyRequest<'_>) -> Result<AppliedFault> {
-    let config = request.config;
-    let cluster = &config.cluster;
-    match request.injection.kind() {
-        FaultKind::RustfsBlockDeviceFlakey => {
-            let name = config
-                .dm_name
-                .as_deref()
-                .context("RUSTFS_FAULT_TEST_DM_NAME is required for dm-flakey")?;
-            let fault_table = config
-                .dm_fault_table
-                .as_deref()
-                .context("RUSTFS_FAULT_TEST_DM_FAULT_TABLE is required for dm-flakey")?;
-            let node = config
-                .dm_node
-                .as_deref()
-                .context("RUSTFS_FAULT_TEST_DM_NODE is required for dm-flakey")?;
-            let mount_path = config
-                .dm_mount_path
-                .as_deref()
-                .context("RUSTFS_FAULT_TEST_DM_MOUNT_PATH is required for dm-flakey")?;
-            Ok(Box::new(DmFlakeyFaultHandle {
-                guard: Box::new(host::apply_dm_flakey(
-                    cluster,
-                    &DmFlakeySpec {
-                        node,
-                        mount_path,
-                        helper_image: &config.dm_helper_image,
-                        name,
-                        fault_table,
-                        recovery_table: config.dm_recovery_table.as_deref(),
-                        run_id: request.run_id,
-                    },
-                    request.collector,
-                    request.scenario.case_name,
-                )?),
-            }))
-        }
-        other => bail!(
-            "fault kind {} must be applied by a Chaos Mesh backend",
-            other.as_str()
-        ),
-    }
+    Ok(Box::new(DmFlakeyFaultHandle {
+        guard: Box::new(host::apply_fault(&host::FaultApplyRequest {
+            config: request.config,
+            collector: request.collector,
+            scenario: request.scenario,
+            injection: request.injection,
+            run_id: request.run_id,
+        })?),
+    }))
 }
 
 impl FaultBackendHandle for ChaosFaultHandle {
@@ -2889,36 +2693,6 @@ struct PodRuntimeState {
     terminating: bool,
 }
 
-fn rustfs_pod_identities(config: &ClusterTestConfig) -> Result<Vec<PodIdentity>> {
-    let selector = format!("rustfs.tenant={}", config.tenant_name);
-    let output = Kubectl::new(config)
-        .namespaced(&config.test_namespace)
-        .command(["get", "pod", "-l", &selector, "-o", "json"])
-        .run_checked()?;
-    let value = serde_json::from_str::<serde_json::Value>(&output.stdout)
-        .context("parse RustFS pod list json")?;
-    let items = value
-        .pointer("/items")
-        .and_then(serde_json::Value::as_array)
-        .context("RustFS pod list did not contain an items array")?;
-    let pods = items
-        .iter()
-        .filter_map(|item| {
-            let metadata = item.get("metadata")?;
-            Some(PodIdentity {
-                name: metadata.get("name")?.as_str()?.to_string(),
-                uid: metadata.get("uid")?.as_str()?.to_string(),
-            })
-        })
-        .collect::<Vec<_>>();
-    ensure!(
-        !pods.is_empty(),
-        "no RustFS pods found for selector {selector} in namespace {}",
-        config.test_namespace
-    );
-    Ok(pods)
-}
-
 fn rustfs_pod_runtime_states(config: &ClusterTestConfig) -> Result<Vec<PodRuntimeState>> {
     let selector = format!("rustfs.tenant={}", config.tenant_name);
     let output = Kubectl::new(config)
@@ -3050,102 +2824,6 @@ async fn wait_for_stable_rustfs_pods(
 
         async_sleep(Duration::from_secs(1)).await;
     }
-}
-
-fn wait_for_rustfs_pod_replacement(
-    config: &ClusterTestConfig,
-    before: &[PodIdentity],
-    timeout: Duration,
-) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    let mut last_snapshot = Vec::new();
-    let mut last_error = "not checked yet".to_string();
-
-    loop {
-        if Instant::now() >= deadline {
-            bail!(
-                "timed out waiting for PodChaos to replace a RustFS pod after {timeout:?}\nbefore: {before:?}\nlast: {last_snapshot:?}\nlast error: {last_error}",
-            );
-        }
-
-        match rustfs_pod_identities(config) {
-            Ok(current) => {
-                if pod_replacement_observed(before, &current) {
-                    return Ok(());
-                }
-                last_snapshot = current;
-                last_error = "none".to_string();
-            }
-            Err(error) => {
-                last_error = error.to_string();
-            }
-        }
-
-        sleep(Duration::from_secs(1));
-    }
-}
-
-fn wait_for_rustfs_pod_deletion(
-    config: &ClusterTestConfig,
-    before: &[PodIdentity],
-    timeout: Duration,
-) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    let mut last_snapshot = Vec::new();
-    let mut last_error = "not checked yet".to_string();
-
-    loop {
-        if Instant::now() >= deadline {
-            bail!(
-                "timed out waiting for PodChaos to delete a RustFS pod after {timeout:?}\nbefore: {before:?}\nlast: {last_snapshot:?}\nlast error: {last_error}",
-            );
-        }
-
-        match rustfs_pod_identities(config) {
-            Ok(current) => {
-                if pod_deletion_observed(before, &current) {
-                    return Ok(());
-                }
-                last_snapshot = current;
-                last_error = "none".to_string();
-            }
-            Err(error) => {
-                last_error = error.to_string();
-            }
-        }
-
-        sleep(Duration::from_millis(250));
-    }
-}
-
-fn pod_deletion_observed(before: &[PodIdentity], current: &[PodIdentity]) -> bool {
-    let current_uids = current
-        .iter()
-        .map(|pod| pod.uid.as_str())
-        .collect::<BTreeSet<_>>();
-    !before.is_empty()
-        && before
-            .iter()
-            .any(|pod| !current_uids.contains(pod.uid.as_str()))
-}
-
-fn pod_replacement_observed(before: &[PodIdentity], current: &[PodIdentity]) -> bool {
-    if before.is_empty() || current.is_empty() {
-        return false;
-    }
-
-    let before_uids = before
-        .iter()
-        .map(|pod| pod.uid.as_str())
-        .collect::<BTreeSet<_>>();
-    let current_uids = current
-        .iter()
-        .map(|pod| pod.uid.as_str())
-        .collect::<BTreeSet<_>>();
-    let old_uid_removed = before_uids.iter().any(|uid| !current_uids.contains(uid));
-    let new_uid_added = current_uids.iter().any(|uid| !before_uids.contains(uid));
-
-    old_uid_removed && new_uid_added
 }
 
 async fn wait_for_ready_tenant(config: &ClusterTestConfig) -> Result<DynamicObject> {
@@ -3803,11 +3481,10 @@ fn warp_bucket_name(run_id: &str) -> String {
 mod tests {
     use super::{
         AppliedFaults, DaemonUnmountLogEvidence, FaultBackendHandle, FaultFailureArtifacts,
-        IoChaosFinalizerRecoveryReport, OutcomeCounts, PodIdentity, PodIoChaosRecoveryEvidence,
-        PodRuntimeState, RecommitAttempt, RecommitReport, TargetPodRecoveryEvidence,
-        WorkloadSummary, bucket_name, chaos_daemon_pods_from_json, chaos_manifest_artifact_name,
-        chaos_resource_name_suffix, finalizers_from_resource, iochaos_finalizer_patch_allowed,
-        pod_deletion_observed, pod_replacement_observed, podiochaos_recovery_evidence,
+        IoChaosFinalizerRecoveryReport, OutcomeCounts, PodIoChaosRecoveryEvidence, PodRuntimeState,
+        RecommitAttempt, RecommitReport, TargetPodRecoveryEvidence, WorkloadSummary, bucket_name,
+        chaos_daemon_pods_from_json, chaos_manifest_artifact_name, chaos_resource_name_suffix,
+        finalizers_from_resource, iochaos_finalizer_patch_allowed, podiochaos_recovery_evidence,
         resource_has_deletion_timestamp, resource_label_matches, stable_pod_fingerprint,
         target_pods_from_json, unmount_success_log_lines, warp_bucket_name,
     };
@@ -4267,35 +3944,6 @@ mod tests {
                 .failure_message()
                 .contains("object-a=harness_error(record PUT: disk full)")
         );
-    }
-
-    #[test]
-    fn pod_replacement_requires_old_uid_removed_and_new_uid_added() {
-        let before = vec![
-            PodIdentity {
-                name: "rustfs-0".to_string(),
-                uid: "uid-a".to_string(),
-            },
-            PodIdentity {
-                name: "rustfs-1".to_string(),
-                uid: "uid-b".to_string(),
-            },
-        ];
-
-        assert!(!pod_replacement_observed(&before, &before));
-        assert!(!pod_replacement_observed(&before, &before[..1]));
-        assert!(!pod_deletion_observed(&before, &before));
-        assert!(pod_deletion_observed(&before, &before[..1]));
-        assert!(pod_replacement_observed(
-            &before,
-            &[
-                PodIdentity {
-                    name: "rustfs-0".to_string(),
-                    uid: "uid-c".to_string(),
-                },
-                before[1].clone(),
-            ],
-        ));
     }
 
     #[test]
