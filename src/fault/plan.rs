@@ -647,7 +647,18 @@ fn fault_kind_accepts_selection(kind: FaultKind, selection: FaultSelection) -> b
         | FaultKind::RustfsServerCpuStress
         | FaultKind::RustfsServerMemoryStress
         | FaultKind::RustfsBlockDeviceFlakey => match selection {
-            FaultSelection::FixedTargets(count) => count > 0,
+            // Only single-target is honored today: the Chaos Mesh backend
+            // renders every pod/network/stress fault with `mode: one`
+            // (see `*_one_rustfs_pod` in backends/chaos_mesh.rs) and never
+            // reads the count. Accepting `FixedTargets(n > 1)` here would let
+            // a plan declare an n-pod blast radius that the backend silently
+            // narrows to one — a weaker fault than requested, i.e. a false
+            // sense of coverage. Reject it until multi-target rendering AND
+            // same-erasure-set-aware target selection land together (a random
+            // n-of-tenant selection would not hit a specific erasure set's
+            // P+1 volumes anyway). Quorum-boundary scenarios must not ship on
+            // top of silent single-targeting.
+            FaultSelection::FixedTargets(count) => count == 1,
             FaultSelection::Percent(_) => false,
         },
     }
@@ -1087,6 +1098,34 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn fault_injection_rejects_unsupported_multi_target_selection() {
+        // The chaos_mesh backend renders pod/network faults with `mode: one`
+        // and ignores the requested count, so a plan asking for more than one
+        // target would be silently narrowed to a single pod. Fail closed
+        // instead of shipping a weaker-than-declared fault.
+        let single = FaultInjection::new(
+            FaultKind::RustfsServerPodKill,
+            FaultBackend::ChaosMeshPodChaos,
+            FaultTarget::RustfsServerPod,
+            FaultSelection::FixedTargets(1),
+            Duration::from_secs(60),
+        );
+        assert!(single.is_ok(), "single-target pod kill must stay valid");
+
+        let multi = FaultInjection::new(
+            FaultKind::RustfsServerPodKill,
+            FaultBackend::ChaosMeshPodChaos,
+            FaultTarget::RustfsServerPod,
+            FaultSelection::FixedTargets(2),
+            Duration::from_secs(60),
+        );
+        assert!(
+            multi.is_err(),
+            "multi-target selection must be rejected until the backend honors it"
+        );
     }
 
     #[test]
