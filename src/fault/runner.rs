@@ -46,6 +46,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 mod access;
+mod ack;
 mod injection;
 mod recovery;
 mod setup;
@@ -166,34 +167,43 @@ async fn run_fault_case(
         .await?;
     let mut staged_multipart_uploads = BTreeMap::new();
     // Keep the S3 client and access guard alive through cleanup on every exit.
-    let result = async {
-        run.stage_uploads(&prepared.s3, &mut staged_multipart_uploads)
-            .await?;
-        let target = deadline
-            .run(run.prove_target(&prepared.endpoint, &mut preflight_phases))
-            .await?;
-        deadline.check()?;
-        let mut active = run.activate_fault(&target)?;
-        let mut workload = run
-            .exercise_fault(&mut prepared, &target, &active, &staged_multipart_uploads)
-            .await?;
-        deadline.check()?;
-        run.prepare_crash_boundary(&mut active.fault, active.fault_active_at_ms)?;
-        let removal = run.remove_fault(&mut active.fault)?;
-        let recovered = run
-            .recover_access(&mut prepared, &mut staged_multipart_uploads)
-            .await?;
-        let mut evidence =
-            run.write_recovery_evidence(&target, &active, &workload, &removal, &recovered)?;
-        deadline.run(run.verify_recovered(&prepared.s3)).await?;
-        deadline
-            .run(run.recommit(&prepared.s3, &mut workload.workload))
-            .await?;
-        deadline
-            .run(run.verify_final(&prepared.s3, &workload.workload, &mut evidence))
-            .await
-    }
-    .await;
+    let result = if scenarios::acknowledged_mutation_kind(&scenario.name).is_some() {
+        run.run_ack_triggered_case(
+            &mut prepared,
+            &mut preflight_phases,
+            &mut staged_multipart_uploads,
+        )
+        .await
+    } else {
+        async {
+            run.stage_uploads(&prepared.s3, &mut staged_multipart_uploads)
+                .await?;
+            let target = deadline
+                .run(run.prove_target(&prepared.endpoint, &mut preflight_phases))
+                .await?;
+            deadline.check()?;
+            let mut active = run.activate_fault(&target)?;
+            let mut workload = run
+                .exercise_fault(&mut prepared, &target, &active, &staged_multipart_uploads)
+                .await?;
+            deadline.check()?;
+            run.prepare_crash_boundary(&mut active.fault, active.fault_active_at_ms)?;
+            let removal = run.remove_fault(&mut active.fault)?;
+            let recovered = run
+                .recover_access(&mut prepared, &mut staged_multipart_uploads)
+                .await?;
+            let mut evidence =
+                run.write_recovery_evidence(&target, &active, &workload, &removal, &recovered)?;
+            deadline.run(run.verify_recovered(&prepared.s3)).await?;
+            deadline
+                .run(run.recommit(&prepared.s3, &mut workload.workload))
+                .await?;
+            deadline
+                .run(run.verify_final(&prepared.s3, &workload.workload, &mut evidence))
+                .await
+        }
+        .await
+    };
     let cleanup = cleanup_staged_multipart_uploads(
         &prepared.s3,
         &context.history,

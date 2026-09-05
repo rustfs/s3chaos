@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::fault::{
+    acknowledged_mutation::AcknowledgedMutationKind,
     config::FaultTestConfig,
     workload::{
         WorkloadHotspot, WorkloadOperationMix, WorkloadPayloadClass, WorkloadPayloadDistribution,
@@ -40,6 +41,14 @@ pub const STRESS_CPU_SCENARIO: &str = "stress-cpu";
 pub const STRESS_MEMORY_SCENARIO: &str = "stress-memory";
 pub const DM_FLAKEY_SCENARIO: &str = "dm-flakey";
 pub const DM_FLAKEY_VERSIONED_HOT_SCENARIO: &str = "dm-flakey-versioned-hot";
+pub const DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO: &str = "dm-drop-writes-after-ack-put";
+pub const DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO: &str = "dm-drop-writes-after-ack-overwrite";
+pub const DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO: &str =
+    "dm-drop-writes-after-ack-delete-marker";
+pub const DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO: &str =
+    "dm-drop-writes-after-ack-zero-byte-put";
+pub const DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO: &str =
+    "dm-drop-writes-after-ack-multipart-complete";
 pub const POD_CRASH_VERSIONED_HOT_SCENARIO: &str = "pod-crash-versioned-hot";
 pub const WARP_UNDER_CHAOS_SCENARIO: &str = "warp-under-chaos";
 pub const QUORUM_P_IO_FAULT_SCENARIO: &str = "quorum-p-io-fault";
@@ -77,6 +86,7 @@ impl FaultScenarioStatus {
 pub enum FaultScenarioWorkloadProfile {
     Default,
     VersionedHotMutations,
+    AckTriggeredQuietMutation,
 }
 
 impl FaultScenarioWorkloadProfile {
@@ -84,6 +94,7 @@ impl FaultScenarioWorkloadProfile {
         match self {
             Self::Default => "default",
             Self::VersionedHotMutations => "versioned-hot-mutations",
+            Self::AckTriggeredQuietMutation => "ack-triggered-quiet-mutation",
         }
     }
 
@@ -95,7 +106,11 @@ impl FaultScenarioWorkloadProfile {
     }
 
     pub fn expected_versioning(self, env_value: bool) -> bool {
-        env_value || matches!(self, Self::VersionedHotMutations)
+        env_value
+            || matches!(
+                self,
+                Self::VersionedHotMutations | Self::AckTriggeredQuietMutation
+            )
     }
 
     fn apply_to_config(self, config: &mut FaultTestConfig) {
@@ -111,7 +126,27 @@ impl FaultScenarioWorkloadProfile {
                     operation_percent: 80,
                 });
             }
+            Self::AckTriggeredQuietMutation => {
+                config.workload_versioning = true;
+            }
         }
+    }
+}
+
+pub fn acknowledged_mutation_kind(scenario: &str) -> Option<AcknowledgedMutationKind> {
+    match scenario {
+        DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO => Some(AcknowledgedMutationKind::Put),
+        DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO => Some(AcknowledgedMutationKind::Overwrite),
+        DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO => {
+            Some(AcknowledgedMutationKind::DeleteMarker)
+        }
+        DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO => {
+            Some(AcknowledgedMutationKind::ZeroBytePut)
+        }
+        DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO => {
+            Some(AcknowledgedMutationKind::MultipartComplete)
+        }
+        _ => None,
     }
 }
 
@@ -819,6 +854,157 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         conflict_domain: "dedicated Linux runner or lab host with an explicitly assigned block device; never part of shared test storage",
     },
     FaultScenarioSpec {
+        scenario: DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::CommitMetadataLoss,
+            DurabilityBugFamily::DataShardLoss,
+        ]),
+        case_name: "fault_dm_drop_writes_after_ack_put_preserves_commit",
+        description: "Commit one new versioned object, activate block-level drop_writes only after its successful ACK, crash the owning Pod, and verify the acknowledged version survives recovery.",
+        priority: FaultPriority::P0,
+        backend: FaultBackend::DeviceMapper,
+        status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::AckTriggeredQuietMutation,
+        isolation: FaultIsolation::DedicatedLinuxBlockDevice,
+        crds: &[],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
+        boundary: "rustfs-workload/ack-triggered-soft-power-loss",
+        ci_phase: "faults",
+        target: "one dedicated Linux block-device-backed PV; one quiet versioned PUT arms drop_writes only after a definite ACK",
+        target_proof: &[
+            "host-storage proof must bind the exact node, device, PV, Pod, mount, mapper and recovery table before the trigger mutation",
+            "the trigger PUT must have a 2xx status, non-null version ID, and an ACK-to-fault interval within maxAckToFaultMs",
+            "the owning Pod must be force-deleted and the filesystem unmounted while drop_writes remains active",
+        ],
+        validation: "the exact acknowledged PUT version remains readable with its committed hash after crash recovery; missing or ambiguous ACK identity is a harness failure, never PASS",
+        observability: "ack-to-fault-evidence.json, history.jsonl, dm-crash-boundary.json, dm-crash-recovered.json, checker reports, host-storage proof/cleanup, events, RustFS logs",
+        conflict_domain: "dedicated Linux runner or lab host with an explicitly assigned block device; never part of shared test storage",
+    },
+    FaultScenarioSpec {
+        scenario: DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::CommitMetadataLoss,
+            DurabilityBugFamily::VersionLineageLoss,
+        ]),
+        case_name: "fault_dm_drop_writes_after_ack_overwrite_preserves_lineage",
+        description: "Overwrite one pre-existing versioned object, activate block-level drop_writes only after the overwrite ACK, crash the owning Pod, and verify both versions remain coherent.",
+        priority: FaultPriority::P0,
+        backend: FaultBackend::DeviceMapper,
+        status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::AckTriggeredQuietMutation,
+        isolation: FaultIsolation::DedicatedLinuxBlockDevice,
+        crds: &[],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
+        boundary: "rustfs-workload/ack-triggered-soft-power-loss",
+        ci_phase: "faults",
+        target: "one dedicated Linux block-device-backed PV; one quiet versioned overwrite arms drop_writes only after a definite ACK",
+        target_proof: &[
+            "host-storage proof must bind the exact node, device, PV, Pod, mount, mapper and recovery table before the trigger mutation",
+            "the overwrite target must have a committed baseline version before target proof",
+            "the trigger overwrite must have a 2xx status, non-null version ID, and an ACK-to-fault interval within maxAckToFaultMs",
+        ],
+        validation: "the acknowledged overwrite is latest with its committed hash and the baseline version remains addressable after recovery",
+        observability: "ack-to-fault-evidence.json, history.jsonl, dm-crash-boundary.json, dm-crash-recovered.json, checker reports, host-storage proof/cleanup, events, RustFS logs",
+        conflict_domain: "dedicated Linux runner or lab host with an explicitly assigned block device; never part of shared test storage",
+    },
+    FaultScenarioSpec {
+        scenario: DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::CommitMetadataLoss,
+            DurabilityBugFamily::VersionLineageLoss,
+        ]),
+        case_name: "fault_dm_drop_writes_after_ack_delete_marker_preserves_tombstone",
+        description: "Create one versioned object, ACK its delete marker, activate drop_writes, crash the owning Pod, and verify the acknowledged tombstone remains latest.",
+        priority: FaultPriority::P0,
+        backend: FaultBackend::DeviceMapper,
+        status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::AckTriggeredQuietMutation,
+        isolation: FaultIsolation::DedicatedLinuxBlockDevice,
+        crds: &[],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
+        boundary: "rustfs-workload/ack-triggered-soft-power-loss",
+        ci_phase: "faults",
+        target: "one dedicated Linux block-device-backed PV; one quiet versioned DELETE marker arms drop_writes only after a definite ACK",
+        target_proof: &[
+            "host-storage proof must bind the exact node, device, PV, Pod, mount, mapper and recovery table before the trigger mutation",
+            "the delete target must have a committed baseline version before target proof",
+            "the trigger DELETE must prove is-delete-marker, a non-null version ID, and an ACK-to-fault interval within maxAckToFaultMs",
+        ],
+        validation: "the acknowledged delete marker remains latest, an unversioned GET stays absent, and the prior version remains addressable after recovery",
+        observability: "ack-to-fault-evidence.json, history.jsonl, dm-crash-boundary.json, dm-crash-recovered.json, checker reports, host-storage proof/cleanup, events, RustFS logs",
+        conflict_domain: "dedicated Linux runner or lab host with an explicitly assigned block device; never part of shared test storage",
+    },
+    FaultScenarioSpec {
+        scenario: DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::CommitMetadataLoss,
+            DurabilityBugFamily::VersionLineageLoss,
+        ]),
+        case_name: "fault_dm_drop_writes_after_ack_zero_byte_put_preserves_metadata",
+        description: "Commit one zero-byte versioned object, activate drop_writes only after its ACK, crash the owning Pod, and verify the metadata-only version survives.",
+        priority: FaultPriority::P0,
+        backend: FaultBackend::DeviceMapper,
+        status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::AckTriggeredQuietMutation,
+        isolation: FaultIsolation::DedicatedLinuxBlockDevice,
+        crds: &[],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
+        boundary: "rustfs-workload/ack-triggered-soft-power-loss",
+        ci_phase: "faults",
+        target: "one dedicated Linux block-device-backed PV; one quiet zero-byte versioned PUT arms drop_writes only after a definite ACK",
+        target_proof: &[
+            "host-storage proof must bind the exact node, device, PV, Pod, mount, mapper and recovery table before the trigger mutation",
+            "the trigger PUT must record size zero, a 2xx status, non-null version ID, and an ACK-to-fault interval within maxAckToFaultMs",
+            "the owning Pod must be force-deleted and the filesystem unmounted while drop_writes remains active",
+        ],
+        validation: "the exact acknowledged zero-byte version remains latest and readable as an empty object after crash recovery",
+        observability: "ack-to-fault-evidence.json, history.jsonl, dm-crash-boundary.json, dm-crash-recovered.json, checker reports, host-storage proof/cleanup, events, RustFS logs",
+        conflict_domain: "dedicated Linux runner or lab host with an explicitly assigned block device; never part of shared test storage",
+    },
+    FaultScenarioSpec {
+        scenario: DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::CommitMetadataLoss,
+            DurabilityBugFamily::DataShardLoss,
+            DurabilityBugFamily::VersionLineageLoss,
+        ]),
+        case_name: "fault_dm_drop_writes_after_ack_multipart_complete_preserves_commit",
+        description: "Stage one multipart upload, activate drop_writes only after CompleteMultipartUpload ACK, crash the owning Pod, and verify the acknowledged version survives.",
+        priority: FaultPriority::P0,
+        backend: FaultBackend::DeviceMapper,
+        status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::AckTriggeredQuietMutation,
+        isolation: FaultIsolation::DedicatedLinuxBlockDevice,
+        crds: &[],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
+        boundary: "rustfs-workload/ack-triggered-soft-power-loss",
+        ci_phase: "faults",
+        target: "one dedicated Linux block-device-backed PV; pre-staged parts and one quiet CompleteMultipartUpload arm drop_writes only after a definite ACK",
+        target_proof: &[
+            "host-storage proof must bind the exact node, device, PV, Pod, mount, mapper and recovery table before the trigger mutation",
+            "multipart create and part uploads must finish before target proof; only CompleteMultipartUpload may occur in the ACK trigger interval",
+            "the completion must have a 2xx status, non-null version ID, and an ACK-to-fault interval within maxAckToFaultMs",
+        ],
+        validation: "the exact acknowledged multipart version remains readable with the committed full-object hash after crash recovery",
+        observability: "ack-to-fault-evidence.json, history.jsonl, dm-crash-boundary.json, dm-crash-recovered.json, checker reports, host-storage proof/cleanup, events, RustFS logs",
+        conflict_domain: "dedicated Linux runner or lab host with an explicitly assigned block device; never part of shared test storage",
+    },
+    FaultScenarioSpec {
         scenario: POD_CRASH_VERSIONED_HOT_SCENARIO,
         detector: FaultDetectorSpec::diagnostic_only(&[
             DurabilityBugFamily::VersionLineageLoss,
@@ -1176,6 +1362,11 @@ impl FaultScenario {
             spec.scenario,
             spec.backend
         );
+        ensure!(
+            acknowledged_mutation_kind(spec.scenario).is_none()
+                || !config.require_client_disruption,
+            "ACK-triggered quiet mutation scenarios cannot require client disruption because no S3 traffic is issued after fault activation"
+        );
 
         Ok(Self {
             name: spec.scenario.to_string(),
@@ -1243,15 +1434,20 @@ pub fn scenario_spec(name: &str) -> Result<&'static FaultScenarioSpec> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DM_FLAKEY_VERSIONED_HOT_SCENARIO, DetectorQualification, DurabilityBugFamily,
-        FaultDetectorContract, FaultParameterSchema, FaultScenario, FaultScenarioStatus,
-        FaultScenarioWorkloadProfile, IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, NETWORK_DELAY_SCENARIO,
-        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO,
-        POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
-        WARP_UNDER_CHAOS_SCENARIO, apply_catalog_defaults, executable_scenario_catalog,
+        DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
+        DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
+        DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
+        DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO, DM_FLAKEY_VERSIONED_HOT_SCENARIO,
+        DetectorQualification, DurabilityBugFamily, FaultDetectorContract, FaultParameterSchema,
+        FaultScenario, FaultScenarioStatus, FaultScenarioWorkloadProfile, IO_EIO_SCENARIO,
+        IO_LATENCY_SCENARIO, NETWORK_DELAY_SCENARIO, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+        POD_CRASH_VERSIONED_HOT_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
+        QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, WARP_UNDER_CHAOS_SCENARIO, acknowledged_mutation_kind,
+        apply_catalog_defaults, executable_scenario_catalog,
         expected_workload_versioning_for_scenario, scenario_catalog, scenario_catalog_json,
         scenario_spec,
     };
+    use crate::fault::acknowledged_mutation::AcknowledgedMutationKind;
     use crate::fault::config::{FaultTestConfig, FaultWorkloadProfile};
     use crate::fault::workload::{
         WorkloadHotspot, WorkloadOperationMix, WorkloadPayloadClass, WorkloadPayloadDistribution,
@@ -1326,8 +1522,8 @@ mod tests {
             );
         }
 
-        assert_eq!(executable_scenario_catalog().count(), 18);
-        assert_eq!(scenario_catalog().len(), 26);
+        assert_eq!(executable_scenario_catalog().count(), 23);
+        assert_eq!(scenario_catalog().len(), 31);
     }
 
     #[test]
@@ -1421,6 +1617,13 @@ mod tests {
                 .expect("scenario")
         );
         assert!(
+            expected_workload_versioning_for_scenario(
+                DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO,
+                false,
+            )
+            .expect("ACK scenario")
+        );
+        assert!(
             expected_workload_versioning_for_scenario(IO_EIO_SCENARIO, true).expect("scenario")
         );
         assert!(
@@ -1432,6 +1635,42 @@ mod tests {
                 .workload_profile,
             FaultScenarioWorkloadProfile::VersionedHotMutations
         );
+    }
+
+    #[test]
+    fn ack_triggered_family_has_five_typed_catalog_cases() {
+        let cases = [
+            (
+                DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
+                AcknowledgedMutationKind::Put,
+            ),
+            (
+                DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO,
+                AcknowledgedMutationKind::Overwrite,
+            ),
+            (
+                DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
+                AcknowledgedMutationKind::DeleteMarker,
+            ),
+            (
+                DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO,
+                AcknowledgedMutationKind::ZeroBytePut,
+            ),
+            (
+                DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
+                AcknowledgedMutationKind::MultipartComplete,
+            ),
+        ];
+        for (scenario, expected) in cases {
+            let spec = scenario_spec(scenario).expect("ACK catalog case");
+            assert_eq!(acknowledged_mutation_kind(scenario), Some(expected));
+            assert_eq!(spec.status, FaultScenarioStatus::Executable);
+            assert_eq!(spec.backend, super::FaultBackend::DeviceMapper);
+            assert_eq!(
+                spec.workload_profile,
+                FaultScenarioWorkloadProfile::AckTriggeredQuietMutation
+            );
+        }
     }
 
     #[test]

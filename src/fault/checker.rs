@@ -62,6 +62,8 @@ pub struct CheckerReport {
     #[serde(default)]
     pub verified_committed_versions: usize,
     #[serde(default)]
+    pub verified_committed_version_refs: Vec<String>,
+    #[serde(default)]
     pub committed_writes_missing_version_id_count: usize,
     #[serde(default)]
     pub committed_writes_missing_version_id: Vec<String>,
@@ -73,6 +75,8 @@ pub struct CheckerReport {
     pub version_hash_mismatches: Vec<String>,
     #[serde(default)]
     pub missing_committed_delete_markers: Vec<String>,
+    #[serde(default)]
+    pub verified_committed_delete_marker_refs: Vec<String>,
     #[serde(default)]
     pub resurrected_deleted_objects: Vec<String>,
     #[serde(default)]
@@ -272,12 +276,14 @@ pub async fn check_s3_history(
         versioning_expected: expect_versioning,
         expected_committed_versions: 0,
         verified_committed_versions: 0,
+        verified_committed_version_refs: Vec::new(),
         committed_writes_missing_version_id_count: 0,
         committed_writes_missing_version_id: Vec::new(),
         missing_committed_versions: Vec::new(),
         unavailable_committed_versions: Vec::new(),
         version_hash_mismatches: Vec::new(),
         missing_committed_delete_markers: Vec::new(),
+        verified_committed_delete_marker_refs: Vec::new(),
         resurrected_deleted_objects: Vec::new(),
         delete_marker_lineage_incomplete: Vec::new(),
         multipart_upload_lineage_incomplete: Vec::new(),
@@ -387,8 +393,10 @@ pub async fn check_s3_history(
                 report
                     .multipart_upload_lineage_incomplete
                     .extend(multipart_lineage);
-                report.missing_committed_delete_markers =
-                    missing_committed_delete_markers(&lineage.delete_markers, &entries);
+                let (verified_delete_markers, missing_delete_markers) =
+                    committed_delete_marker_presence(&lineage.delete_markers, &entries);
+                report.verified_committed_delete_marker_refs = verified_delete_markers;
+                report.missing_committed_delete_markers = missing_delete_markers;
                 evaluate_deleted_latest_versions(
                     &mut report,
                     &model.deleted,
@@ -452,6 +460,8 @@ pub async fn check_s3_history(
     report.unavailable_committed_versions.sort();
     report.version_hash_mismatches.sort();
     report.missing_committed_delete_markers.sort();
+    report.verified_committed_version_refs.sort();
+    report.verified_committed_delete_marker_refs.sort();
     sort_dedup(&mut report.resurrected_deleted_objects);
     sort_dedup(&mut report.delete_marker_lineage_incomplete);
     sort_dedup(&mut report.multipart_upload_lineage_incomplete);
@@ -770,6 +780,7 @@ fn evaluate_committed_version_get(
                 ));
             } else {
                 report.verified_committed_versions += 1;
+                report.verified_committed_version_refs.push(reference);
             }
         }
         (OperationOutcome::NotFound, None) => {
@@ -851,25 +862,28 @@ fn evaluate_deleted_latest_versions(
     }
 }
 
-fn missing_committed_delete_markers(
+fn committed_delete_marker_presence(
     committed: &[CommittedDeleteMarker],
     entries: &[ObjectVersionEntry],
-) -> Vec<String> {
+) -> (Vec<String>, Vec<String>) {
     let present = entries
         .iter()
         .filter(|entry| entry.is_delete_marker)
         .filter_map(|entry| Some((entry.key.clone(), entry.version_id.clone()?)))
         .collect::<BTreeSet<_>>();
-    committed
-        .iter()
-        .filter(|marker| !present.contains(&(marker.key.clone(), marker.version_id.clone())))
-        .map(|marker| {
-            format!(
-                "{}@{}: committed delete marker missing from ListObjectVersions",
-                marker.key, marker.version_id
-            )
-        })
-        .collect()
+    let mut verified = Vec::new();
+    let mut missing = Vec::new();
+    for marker in committed {
+        let reference = format!("{}@{}", marker.key, marker.version_id);
+        if present.contains(&(marker.key.clone(), marker.version_id.clone())) {
+            verified.push(reference);
+        } else {
+            missing.push(format!(
+                "{reference}: committed delete marker missing from ListObjectVersions"
+            ));
+        }
+    }
+    (verified, missing)
 }
 
 fn ambiguous_version_candidates(
@@ -3095,7 +3109,7 @@ mod tests {
         let delete_lineage = super::committed_version_lineage(&[committed_delete]);
         let mut delete_marker_missing = empty_report();
         delete_marker_missing.missing_committed_delete_markers =
-            super::missing_committed_delete_markers(&delete_lineage.delete_markers, &[]);
+            super::committed_delete_marker_presence(&delete_lineage.delete_markers, &[]).1;
 
         let delete_without_marker_id = record(
             "delete-204-no-version-id",
@@ -4347,6 +4361,7 @@ mod tests {
             },
         );
         assert_eq!(report.verified_committed_versions, 1);
+        assert_eq!(report.verified_committed_version_refs, vec!["k@ver-1"]);
 
         super::evaluate_committed_version_get(
             &mut report,
@@ -4515,8 +4530,10 @@ mod tests {
             is_delete_marker: true,
         }];
         let mut report = empty_report();
-        report.missing_committed_delete_markers =
-            super::missing_committed_delete_markers(&lineage.delete_markers, &entries);
+        let (verified, missing) =
+            super::committed_delete_marker_presence(&lineage.delete_markers, &entries);
+        report.verified_committed_delete_marker_refs = verified;
+        report.missing_committed_delete_markers = missing;
         super::evaluate_deleted_latest_versions(
             &mut report,
             &model.deleted,
@@ -4560,8 +4577,9 @@ mod tests {
             },
         ];
 
-        let missing = super::missing_committed_delete_markers(&committed, &entries);
+        let (verified, missing) = super::committed_delete_marker_presence(&committed, &entries);
 
+        assert_eq!(verified, vec!["k@marker-1".to_string()]);
         assert_eq!(
             missing,
             vec!["k@marker-2: committed delete marker missing from ListObjectVersions".to_string()]
@@ -5284,12 +5302,14 @@ mod tests {
             versioning_expected: false,
             expected_committed_versions: 0,
             verified_committed_versions: 0,
+            verified_committed_version_refs: Vec::new(),
             committed_writes_missing_version_id_count: 0,
             committed_writes_missing_version_id: Vec::new(),
             missing_committed_versions: Vec::new(),
             unavailable_committed_versions: Vec::new(),
             version_hash_mismatches: Vec::new(),
             missing_committed_delete_markers: Vec::new(),
+            verified_committed_delete_marker_refs: Vec::new(),
             resurrected_deleted_objects: Vec::new(),
             delete_marker_lineage_incomplete: Vec::new(),
             multipart_upload_lineage_incomplete: Vec::new(),
@@ -5327,12 +5347,14 @@ mod tests {
             versioning_expected: false,
             expected_committed_versions: 0,
             verified_committed_versions: 0,
+            verified_committed_version_refs: Vec::new(),
             committed_writes_missing_version_id_count: 0,
             committed_writes_missing_version_id: Vec::new(),
             missing_committed_versions: Vec::new(),
             unavailable_committed_versions: Vec::new(),
             version_hash_mismatches: Vec::new(),
             missing_committed_delete_markers: Vec::new(),
+            verified_committed_delete_marker_refs: Vec::new(),
             resurrected_deleted_objects: Vec::new(),
             delete_marker_lineage_incomplete: Vec::new(),
             multipart_upload_lineage_incomplete: Vec::new(),

@@ -22,7 +22,9 @@ use crate::fault::{
         FaultInjection, FaultInjectionParameters, FaultPlan, FaultSelection, FaultTarget,
         FaultWorkloadMode,
     },
-    scenarios::{FaultDetectorContract, FaultScenario, FaultScenarioSpec},
+    scenarios::{
+        FaultDetectorContract, FaultScenario, FaultScenarioSpec, acknowledged_mutation_kind,
+    },
     workload::WorkloadPlan,
 };
 
@@ -72,6 +74,15 @@ pub struct FaultRunScenarioSpec {
     pub validation: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detector: Option<FaultDetectorContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_trigger: Option<FaultRunAckTriggerSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FaultRunAckTriggerSpec {
+    pub mutation: crate::fault::acknowledged_mutation::AcknowledgedMutationKind,
+    pub operation_timeout_ms: u64,
+    pub max_ack_to_fault_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,7 +180,10 @@ impl FaultRunSpec {
         run_id: &str,
         bucket: &str,
     ) -> Self {
-        let mut artifacts = FaultRunArtifactSpec::default();
+        let mut artifacts = FaultRunArtifactSpec {
+            required: FaultRunArtifactSpec::required_names_for_scenario(&scenario.name),
+            event_stream: "run-events.jsonl".to_string(),
+        };
         if plan.requires_static_storage() {
             artifacts.required.extend(
                 [HOST_STORAGE_PROOF_ARTIFACT, HOST_STORAGE_CLEANUP_ARTIFACT].map(str::to_string),
@@ -201,6 +215,13 @@ impl FaultRunSpec {
                 boundary: scenario_spec.boundary.to_string(),
                 validation: scenario_spec.validation.to_string(),
                 detector: Some(scenario_spec.detector.contract()),
+                ack_trigger: acknowledged_mutation_kind(&scenario.name).map(|mutation| {
+                    FaultRunAckTriggerSpec {
+                        mutation,
+                        operation_timeout_ms: config.ack_operation_timeout.as_millis() as u64,
+                        max_ack_to_fault_ms: config.max_ack_to_fault.as_millis() as u64,
+                    }
+                }),
             },
             workload: FaultRunWorkloadSpec {
                 mode: workload_mode_name(plan.workload_mode).to_string(),
@@ -222,7 +243,7 @@ impl FaultRunSpec {
                 expected_rustfs_pod_count: config.expected_rustfs_pod_count,
                 stable_pod_window_seconds: config.rustfs_pod_stable_window.as_secs(),
                 recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
-                recommit_unconfirmed_writes: true,
+                recommit_unconfirmed_writes: acknowledged_mutation_kind(&scenario.name).is_none(),
             },
             faults: plan
                 .faults()
@@ -258,6 +279,31 @@ impl FaultRunArtifactSpec {
             "history.jsonl",
             "workload-summary.json",
             "recommit-report.json",
+            "checker-pre-recommit-report.json",
+            "checker-report.json",
+            "fault-evidence.json",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    pub fn required_names_for_scenario(scenario: &str) -> Vec<String> {
+        if acknowledged_mutation_kind(scenario).is_none() {
+            return Self::required_names();
+        }
+        [
+            "run-spec.yaml",
+            "run-spec.json",
+            "preflight-summary.json",
+            "target-proof.json",
+            "run-events.jsonl",
+            "run-metadata.json",
+            "workload-plan.json",
+            "history.jsonl",
+            "ack-to-fault-evidence.json",
+            "dm-crash-boundary.json",
+            "dm-crash-recovered.json",
             "checker-pre-recommit-report.json",
             "checker-report.json",
             "fault-evidence.json",
@@ -355,6 +401,7 @@ fn workload_mode_name(mode: FaultWorkloadMode) -> &'static str {
     match mode {
         FaultWorkloadMode::S3Mixed => "s3-mixed",
         FaultWorkloadMode::S3MixedWithWarp => "s3-mixed-with-warp",
+        FaultWorkloadMode::AckTriggeredQuietMutation => "ack-triggered-quiet-mutation",
     }
 }
 
@@ -362,9 +409,13 @@ fn workload_mode_name(mode: FaultWorkloadMode) -> &'static str {
 mod tests {
     use super::{FAULT_RUN_API_VERSION, FaultRunSpec};
     use crate::fault::{
+        acknowledged_mutation::AcknowledgedMutationKind,
         config::FaultTestConfig,
-        plan::{FaultPlan, FaultPlanOptions},
-        scenarios::{FaultScenario, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, scenario_spec},
+        plan::{FaultInjectionParameters, FaultPlan, FaultPlanOptions},
+        scenarios::{
+            DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO, FaultScenario,
+            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, apply_catalog_defaults, scenario_spec,
+        },
         workload::WorkloadPlan,
     };
 
@@ -465,6 +516,71 @@ mod tests {
             spec.to_json()
                 .expect("json")
                 .contains("\"erasure_set_proof_required\": true")
+        );
+    }
+
+    #[test]
+    fn resolved_ack_spec_records_trigger_and_quiet_artifact_contract() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "rustfs-fault-dm");
+        config.scenario = DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO.to_string();
+        config.ack_operation_timeout = std::time::Duration::from_millis(2_300);
+        config.max_ack_to_fault = std::time::Duration::from_millis(175);
+        apply_catalog_defaults(&mut config).expect("catalog defaults");
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let catalog = scenario_spec(&scenario.name).expect("scenario spec");
+        let plan = FaultPlan::from_scenario(&scenario, catalog).expect("plan");
+        let workload_plan =
+            WorkloadPlan::seeded(42, scenario.object_count, config.workload.concurrency);
+
+        let spec = FaultRunSpec::resolved(
+            &config,
+            &scenario,
+            catalog,
+            &plan,
+            &workload_plan,
+            "run-1",
+            "bucket-1",
+        );
+
+        let trigger = spec.scenario.ack_trigger.as_ref().expect("ACK trigger");
+        assert_eq!(trigger.mutation, AcknowledgedMutationKind::Put);
+        assert_eq!(trigger.operation_timeout_ms, 2_300);
+        assert_eq!(trigger.max_ack_to_fault_ms, 175);
+        assert_eq!(spec.workload.mode, "ack-triggered-quiet-mutation");
+        assert!(spec.workload.versioning);
+        assert!(!spec.recovery.recommit_unconfirmed_writes);
+        assert_eq!(spec.faults[0].parameters, FaultInjectionParameters::Default);
+        assert!(
+            spec.artifacts
+                .required
+                .contains(&"ack-to-fault-evidence.json".to_string())
+                && spec
+                    .artifacts
+                    .required
+                    .contains(&"dm-crash-boundary.json".to_string())
+                && spec
+                    .artifacts
+                    .required
+                    .contains(&"dm-crash-recovered.json".to_string())
+        );
+        assert!(
+            !spec
+                .artifacts
+                .required
+                .contains(&"workload-summary.json".to_string())
+                && !spec
+                    .artifacts
+                    .required
+                    .contains(&"recommit-report.json".to_string())
+        );
+        assert!(
+            spec.artifacts
+                .required
+                .contains(&"host-storage-proof.json".to_string())
+                && spec
+                    .artifacts
+                    .required
+                    .contains(&"host-storage-post-cleanup.json".to_string())
         );
     }
 }

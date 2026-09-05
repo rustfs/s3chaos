@@ -55,6 +55,63 @@ pub(crate) struct StagedMultipartUpload {
     completed_parts: Vec<CompletedPart>,
 }
 
+pub(crate) struct StagedMultipartCleanupGuard {
+    cleanup: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl StagedMultipartCleanupGuard {
+    pub(crate) fn new(
+        client: S3WorkloadClient,
+        recorder: Recorder,
+        staged: StagedMultipartUpload,
+    ) -> Self {
+        let key = staged.spec.key.clone();
+        Self::from_cleanup(move || {
+            let thread = std::thread::Builder::new()
+                .name("s3chaos-multipart-cleanup".to_string())
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .context("build multipart cancellation cleanup runtime")?;
+                    runtime.block_on(client.abort_staged_multipart_object(&staged, &recorder))
+                });
+            match thread {
+                Ok(thread) => match thread.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => eprintln!(
+                        "warning: failed to abort staged multipart upload for {key} during cancellation: {error:#}"
+                    ),
+                    Err(_) => eprintln!(
+                        "warning: staged multipart cancellation cleanup thread panicked for {key}"
+                    ),
+                },
+                Err(error) => eprintln!(
+                    "warning: failed to start staged multipart cancellation cleanup for {key}: {error}"
+                ),
+            }
+        })
+    }
+
+    fn from_cleanup(cleanup: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            cleanup: Some(Box::new(cleanup)),
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.cleanup = None;
+    }
+}
+
+impl Drop for StagedMultipartCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkloadSizeClass {
     pub size_bytes: usize,
@@ -1249,6 +1306,8 @@ impl S3WorkloadClient {
             upload_id,
             completed_parts: Vec::new(),
         };
+        let mut cancellation_cleanup =
+            StagedMultipartCleanupGuard::new(self.clone(), recorder.clone(), staged.clone());
         let result: Result<bool> = async {
             for (index, chunk) in object.body.chunks(5 * 1024 * 1024).enumerate() {
                 let Some(part) = self
@@ -1269,10 +1328,15 @@ impl S3WorkloadClient {
         }
         .await;
         if !matches!(result, Ok(true)) {
-            self.abort_staged_multipart_object(&staged, recorder)
-                .await?;
+            let cleanup = self.abort_staged_multipart_object(&staged, recorder).await;
+            // The guard remains armed while the async abort is in flight, so
+            // cancellation retries it. A completed attempt is recorded and
+            // reported exactly once, even when the server rejects cleanup.
+            cancellation_cleanup.disarm();
+            cleanup?;
             return result.map(|_| None);
         }
+        cancellation_cleanup.disarm();
         Ok(Some(staged))
     }
 
@@ -1287,7 +1351,7 @@ impl S3WorkloadClient {
             .outcome)
     }
 
-    async fn complete_staged_multipart_object_record(
+    pub(crate) async fn complete_staged_multipart_object_record(
         &self,
         staged: &StagedMultipartUpload,
         recorder: &Recorder,
@@ -1839,8 +1903,9 @@ fn sdk_error_status<E>(error: &SdkError<E>) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ObjectSpec, SplitMix64, WorkloadHotspot, WorkloadOperation, WorkloadOperationMix,
-        WorkloadPayloadClass, WorkloadPayloadDistribution, WorkloadPlan, sha256_hex,
+        ObjectSpec, SplitMix64, StagedMultipartCleanupGuard, WorkloadHotspot, WorkloadOperation,
+        WorkloadOperationMix, WorkloadPayloadClass, WorkloadPayloadDistribution, WorkloadPlan,
+        sha256_hex,
     };
 
     #[tokio::test]
@@ -1879,6 +1944,32 @@ mod tests {
                 .max_attempts(),
             1
         );
+    }
+
+    #[test]
+    fn staged_multipart_cleanup_guard_runs_on_cancellation_and_can_be_disarmed() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = Arc::clone(&calls);
+            let _guard = StagedMultipartCleanupGuard::from_cleanup(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        {
+            let calls = Arc::clone(&calls);
+            let mut guard = StagedMultipartCleanupGuard::from_cleanup(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+            });
+            guard.disarm();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

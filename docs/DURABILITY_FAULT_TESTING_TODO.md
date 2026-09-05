@@ -87,8 +87,10 @@ Status legend:
 
 - [ ] PARTIAL: Durability cohorts and fault-window evidence.
   Meaning: history/checker can report `pre_fault`, `fault_active`,
-  `post_recovery`, and fault-window relations. This is not the same as a true
-  ack-triggered fault executor.
+  `post_recovery`, and fault-window relations. The typed ACK cases additionally
+  bind the exact pre-fault trigger record to ACK, apply, activation, and crash
+  timestamps; remaining planned scenario families still need equivalent
+  scenario-specific evidence contracts.
 
 - [x] DONE: LIST timeout/non-completion is separated from successful LIST
   content errors in checker classification.
@@ -270,20 +272,27 @@ guardrails when implementing the ordered TODO below.
   exact dirty pages the test is trying to lose. Any crash-like dm path must avoid
   implicit flushes.
 
-- [ ] TODO: Implement true ack-triggered fault execution.
+- [x] DONE: Implement true ack-triggered fault execution.
   Meaning: the runner must wait for an eligible committed operation, record
   `trigger_operation_id`, version id, ACK timestamp, and apply the fault within
-  `maxAckToFaultMs`. Timeout/unknown/interrupted operations must not arm the
-  trigger. The hot DM proxy now records an acknowledged mutation before its
-  forced crash boundary, but the drop-writes table is active before that ACK;
-  the calibrated quiet single-write detector still needs the stricter
-  ACK-then-activate timing contract.
+  `maxAckToFaultMs`. Timeout/unknown/interrupted operations do not arm the
+  trigger. Five typed cases cover create PUT, overwrite, DELETE marker,
+  zero-byte PUT, and pre-staged MPU completion. The older
+  `dm-flakey-versioned-hot` diagnostic deliberately retains its original
+  fault-active hot-workload semantics.
 
-- [ ] TODO: Add a quiet single-write calibration workload.
+- [ ] PARTIAL: Add a quiet single-write calibration workload.
   Meaning: hot workloads can self-defeat metadata-loss tests because later
   fdatasync/journal activity may persist earlier metadata. The first detector
   should use one committed operation, tight ack-to-fault timing, bounded retry,
-  and recorded filesystem commit/writeback parameters.
+  and recorded filesystem commit/writeback parameters. The ACK cases now
+  create only the bucket and case-specific prerequisite version or multipart
+  parts, prove the target, issue exactly one eligible commit, activate
+  `drop_writes`, and send no further S3 request before the crash boundary.
+  Runtime artifacts bind the typed mutation, operation/version identity, ACK
+  and activation timestamps, `maxAckToFaultMs`, and the DM crash/recovery
+  evidence. Recording host filesystem/journal writeback parameters for
+  cross-run calibration remains TODO.
 
 - [x] DONE: Assert a non-empty crash-window cohort.
   Meaning: if no committed operation actually fell inside the requested
@@ -400,10 +409,16 @@ Reporting only projects this typed checker result into failure-summary fields.
 
 ### 8. Add The First Calibrated Destructive Smoke Scenarios
 
-- [ ] TODO: Add `dm-drop-writes-after-ack`.
-  Meaning: this is the first executable soft-power-loss detector. It should use
-  ack-trigger, quiet single-write calibration, `drop_writes`, strict/relaxed/none
-  calibration, target proof, and precise final checker classification.
+- [x] DONE: Add the typed `dm-drop-writes-after-ack-*` family.
+  Meaning: five independent executable cases cover PUT create, overwrite,
+  DELETE marker, zero-byte PUT, and pre-staged MPU completion. Each uses the
+  ACK trigger, quiet single-write execution, `drop_writes`, target proof, a
+  forced crash boundary, and precise final checker classification.
+
+- [ ] TODO: Add strict/relaxed/none host writeback calibration controls.
+  Meaning: the ACK detectors fail closed on late activation and record the
+  measured window, but cross-host comparisons still need explicit filesystem
+  and journal writeback parameter capture plus controlled calibration modes.
 
 - [x] DONE: Add `dm-flakey-versioned-hot` as a diagnostic single-volume
   soft-power-loss proxy.

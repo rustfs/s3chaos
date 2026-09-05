@@ -217,6 +217,8 @@ Optional:
 ```bash
 export RUSTFS_FAULT_TEST_DM_RECOVERY_TABLE='<dmsetup recovery table>'
 export RUSTFS_FAULT_TEST_DM_HELPER_IMAGE='rancher/mirrored-library-busybox:1.37.0'
+export RUSTFS_FAULT_TEST_ACK_OPERATION_TIMEOUT_MS=30000
+export RUSTFS_FAULT_TEST_MAX_ACK_TO_FAULT_MS=1000
 ```
 
 Run:
@@ -234,6 +236,30 @@ unset RUSTFS_FAULT_TEST_DM_FAULT_TABLE
 make fault-preflight SCENARIO=dm-flakey-versioned-hot
 make fault-run SCENARIO=dm-flakey-versioned-hot
 ```
+
+Run one true ACK-then-activate detector by selecting its typed scenario:
+
+```bash
+make fault-run SCENARIO=dm-drop-writes-after-ack-put
+make fault-run SCENARIO=dm-drop-writes-after-ack-overwrite
+make fault-run SCENARIO=dm-drop-writes-after-ack-delete-marker
+make fault-run SCENARIO=dm-drop-writes-after-ack-zero-byte-put
+make fault-run SCENARIO=dm-drop-writes-after-ack-multipart-complete
+```
+
+These five cases share the same DeviceMapper actuator but remain independent
+catalog entries and suite attempts. Each prepares only its required baseline,
+proves the host-storage target, issues one typed mutation, and starts
+`drop_writes` only after a definite 2xx response with a non-null version ID.
+`ack-to-fault-evidence.json` records the operation ID, key, version ID, ACK
+timestamp, fault activation timestamp, measured ACK-to-fault interval, and
+`maxAckToFaultMs`. No S3 request is allowed between that ACK and the forced
+crash boundary. A timeout, unknown result, missing version identity, late
+activation, or extra request invalidates the run rather than producing PASS.
+The gate contract rejects `maxAckToFaultMs` above 1000 ms. Both checker reports
+must enumerate the exact history-derived `key@version` values, including the
+trigger version or DELETE marker. Multipart staging is registered for normal
+error cleanup and guarded for cancellation before the completion ACK.
 
 Its recovery boundary is intentionally owned by the host backend:
 

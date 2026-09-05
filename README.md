@@ -77,8 +77,9 @@ export RUSTFS_FAULT_TEST_TENANT='<run-tenant>'
 make fault-cleanup                                # release cluster fixtures
 ```
 
-Runnable scenario families (18 executable entries): I/O faults (`io-eio`,
-`io-read-mistake`, `io-latency`, `disk-full`, `dm-flakey*`), network faults
+Runnable scenario families (23 executable entries): I/O faults (`io-eio`,
+`io-read-mistake`, `io-latency`, `disk-full`, `dm-flakey*`, and the five
+typed `dm-drop-writes-after-ack-*` cases), network faults
 (`network-partition-one`, `network-partition-write-quorum-loss`,
 `network-delay/loss/corrupt/duplicate`), pod faults (`pod-kill-one`,
 `pod-failure`, `pod-crash-versioned-hot`), stress (`stress-cpu`,
@@ -98,7 +99,7 @@ execution environments and verdicts separate:
 | --- | --- | --- |
 | `smoke.yaml` | Six short correctness and recovery checks across I/O, pod, and network faults | Dedicated cluster with Chaos Mesh |
 | `regression.yaml` | Remaining ordinary Chaos Mesh scenarios, including the write-quorum boundary | Reference four-server single-erasure-set topology for `network-partition-write-quorum-loss` |
-| `dm-lab.yaml` | `dm-flakey` and the versioned hot-key soft-power-loss proxy | Prepared dedicated block device and static local PV from `docs/DM_FLAKEY.md` |
+| `dm-lab.yaml` | `dm-flakey`, the versioned hot-key diagnostic, and five independent ACK-then-activate durability cases | Prepared dedicated block device and static local PV from `docs/DM_FLAKEY.md` |
 | `warp-performance.yaml` | Performance-only Warp-under-chaos campaign; correctness still comes from the normal checker | `warp` on `PATH`; Warp defaults to 60 seconds |
 
 The Rust runner owns `budgets.maxDuration` for both `make fault-suite-run`

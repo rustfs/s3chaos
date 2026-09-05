@@ -24,7 +24,9 @@ use crate::{
         pods::rustfs_target_inventory,
         preflight::{PreflightCheck, PreflightPhase, TargetProof},
         reporting::FailureSummary,
-        scenarios::{FaultBackend, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO},
+        scenarios::{
+            FaultBackend, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, acknowledged_mutation_kind,
+        },
         workload::S3WorkloadClient,
     },
     framework::resources,
@@ -293,7 +295,11 @@ impl FaultRun<'_> {
             None,
         )?;
         self.create_workload_bucket(&s3).await?;
-        let prefilled = self.prefill_workload(&s3).await?;
+        let prefilled = if acknowledged_mutation_kind(&scenario.name).is_some() {
+            Vec::new()
+        } else {
+            self.prefill_workload(&s3).await?
+        };
         Ok(PreparedWorkload {
             s3,
             endpoint,

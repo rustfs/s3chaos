@@ -23,3 +23,13 @@ scenarios:
   - name: dm-flakey-versioned-hot
     faultDuration: 15m
     workloadProfile: dm-lab
+  - name: dm-drop-writes-after-ack-put
+    faultDuration: 15m
+  - name: dm-drop-writes-after-ack-overwrite
+    faultDuration: 15m
+  - name: dm-drop-writes-after-ack-delete-marker
+    faultDuration: 15m
+  - name: dm-drop-writes-after-ack-zero-byte-put
+    faultDuration: 15m
+  - name: dm-drop-writes-after-ack-multipart-complete
+    faultDuration: 15m

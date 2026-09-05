@@ -20,13 +20,17 @@ use std::time::Duration;
 use crate::fault::{
     config::{DEFAULT_RUSTFS_VOLUME_PATH, FaultTestConfig, validate_rustfs_volume_path},
     scenarios::{
-        DISK_FULL_SCENARIO, DM_FLAKEY_SCENARIO, DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultBackend,
-        FaultParameterSchema, FaultScenario, FaultScenarioSpec, IO_EIO_SCENARIO,
-        IO_LATENCY_SCENARIO, IO_READ_MISTAKE_SCENARIO, NETWORK_CORRUPT_SCENARIO,
-        NETWORK_DELAY_SCENARIO, NETWORK_DUPLICATE_SCENARIO, NETWORK_LOSS_SCENARIO,
-        NETWORK_PARTITION_ONE_SCENARIO, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
-        POD_CRASH_VERSIONED_HOT_SCENARIO, POD_FAILURE_SCENARIO, POD_KILL_ONE_SCENARIO,
-        STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO, WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
+        DISK_FULL_SCENARIO, DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
+        DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
+        DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
+        DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO, DM_FLAKEY_SCENARIO,
+        DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultBackend, FaultParameterSchema, FaultScenario,
+        FaultScenarioSpec, IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, IO_READ_MISTAKE_SCENARIO,
+        NETWORK_CORRUPT_SCENARIO, NETWORK_DELAY_SCENARIO, NETWORK_DUPLICATE_SCENARIO,
+        NETWORK_LOSS_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
+        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO,
+        POD_FAILURE_SCENARIO, POD_KILL_ONE_SCENARIO, STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO,
+        WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
     },
 };
 
@@ -44,6 +48,7 @@ pub const WRITE_QUORUM_LOSS_PARTITION_TARGETS: u32 = 2;
 pub enum FaultWorkloadMode {
     S3Mixed,
     S3MixedWithWarp,
+    AckTriggeredQuietMutation,
 }
 
 impl FaultWorkloadMode {
@@ -839,11 +844,14 @@ impl FaultPlan {
             spec.scenario
         );
 
-        let workload_mode = if spec.backend == FaultBackend::MinioWarpWithChaos {
-            FaultWorkloadMode::S3MixedWithWarp
-        } else {
-            FaultWorkloadMode::S3Mixed
-        };
+        let workload_mode =
+            if crate::fault::scenarios::acknowledged_mutation_kind(&scenario.name).is_some() {
+                FaultWorkloadMode::AckTriggeredQuietMutation
+            } else if spec.backend == FaultBackend::MinioWarpWithChaos {
+                FaultWorkloadMode::S3MixedWithWarp
+            } else {
+                FaultWorkloadMode::S3Mixed
+            };
         let fault = match scenario.name.as_str() {
             IO_EIO_SCENARIO => volume_fault(
                 FaultKind::RustfsVolumeIoError,
@@ -947,7 +955,12 @@ impl FaultPlan {
                 FaultSelection::FixedTargets(1),
                 scenario.duration,
             )?,
-            DM_FLAKEY_VERSIONED_HOT_SCENARIO => FaultInjection::new(
+            DM_FLAKEY_VERSIONED_HOT_SCENARIO
+            | DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO
+            | DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO
+            | DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO
+            | DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO
+            | DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO => FaultInjection::new(
                 FaultKind::RustfsBlockDeviceDropWritesCrash,
                 spec.backend,
                 FaultTarget::DedicatedBlockDevice,
@@ -1061,8 +1074,12 @@ mod tests {
     use crate::fault::{
         config::FaultTestConfig,
         scenarios::{
-            DM_FLAKEY_VERSIONED_HOT_SCENARIO, FaultBackend, FaultParameterSchema, FaultScenario,
-            WARP_UNDER_CHAOS_SCENARIO, executable_scenario_catalog, scenario_spec,
+            DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
+            DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
+            DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
+            DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO, DM_FLAKEY_VERSIONED_HOT_SCENARIO,
+            FaultBackend, FaultParameterSchema, FaultScenario, WARP_UNDER_CHAOS_SCENARIO,
+            executable_scenario_catalog, scenario_spec,
         },
     };
     use std::time::Duration;
@@ -1121,6 +1138,42 @@ mod tests {
             FaultKind::RustfsBlockDeviceDropWritesCrash
         );
         assert_eq!(plan.required_backends(), vec![FaultBackend::DeviceMapper]);
+    }
+
+    #[test]
+    fn ack_triggered_cases_share_one_typed_backend_plan() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "rustfs-fault-dm");
+        for name in [
+            DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
+            DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO,
+            DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO,
+            DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO,
+            DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO,
+        ] {
+            config.scenario = name.to_string();
+            let scenario = FaultScenario::from_config(&config).expect("scenario");
+            let spec = scenario_spec(name).expect("spec");
+            let plan = FaultPlan::from_scenario(&scenario, spec).expect("plan");
+
+            assert_eq!(
+                plan.workload_mode,
+                FaultWorkloadMode::AckTriggeredQuietMutation
+            );
+            assert_eq!(plan.required_backends(), vec![FaultBackend::DeviceMapper]);
+            assert_eq!(
+                plan.faults()[0].kind(),
+                FaultKind::RustfsBlockDeviceDropWritesCrash
+            );
+            assert_eq!(
+                plan.faults()[0].selection(),
+                FaultSelection::FixedTargets(1)
+            );
+            assert_eq!(
+                plan.faults()[0].parameters(),
+                &FaultInjectionParameters::Default,
+                "{name} must not encode its mutation kind in backend parameters"
+            );
+        }
     }
 
     #[test]

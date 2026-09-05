@@ -27,10 +27,10 @@ use crate::fault::{
     },
     reporting::FailureSeverity,
     scenarios::{
-        FaultDetectorContract, FaultScenario, FaultScenarioSpec, apply_catalog_defaults,
-        scenario_spec,
+        FaultDetectorContract, FaultScenario, FaultScenarioSpec, acknowledged_mutation_kind,
+        apply_catalog_defaults, scenario_spec,
     },
-    spec::FaultRunArtifactSpec,
+    spec::{FaultRunAckTriggerSpec, FaultRunArtifactSpec},
     suite::{
         FaultExpectedFailure, ResolvedFaultSuite, ResolvedFaultSuiteScenario,
         ResolvedFaultSuiteWorkloadOverride, resolve_fault_suite_yaml,
@@ -104,6 +104,8 @@ pub struct FaultSuitePlanAttempt {
     pub catalog_target: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detector: Option<FaultDetectorContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_trigger: Option<FaultRunAckTriggerSpec>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_failure: Option<FaultExpectedFailure>,
     pub fault_duration_seconds: u64,
@@ -419,6 +421,21 @@ impl FaultSuitePlan {
                 "current fault suite plan detector contract does not match scenario {}",
                 attempt.scenario
             );
+            let expected_ack = acknowledged_mutation_kind(&attempt.scenario);
+            ensure!(
+                attempt.ack_trigger.as_ref().map(|trigger| trigger.mutation) == expected_ack,
+                "current fault suite plan ACK trigger does not match scenario {}",
+                attempt.scenario
+            );
+            if let Some(trigger) = &attempt.ack_trigger {
+                ensure!(
+                    trigger.operation_timeout_ms > 0
+                        && (1..=crate::fault::config::MAX_ACK_TO_FAULT_MS)
+                            .contains(&trigger.max_ack_to_fault_ms),
+                    "current fault suite plan ACK trigger requires a positive operation timeout and max_ack_to_fault_ms between 1 and {}",
+                    crate::fault::config::MAX_ACK_TO_FAULT_MS
+                );
+            }
             if let Some(expected) = &attempt.expected_failure {
                 expected.validate(&attempt.scenario)?;
             }
@@ -486,6 +503,13 @@ impl FaultSuitePlanAttempt {
             expected_backend: input.spec.backend.as_str().to_string(),
             catalog_target: input.spec.target.to_string(),
             detector: Some(input.spec.detector.contract()),
+            ack_trigger: acknowledged_mutation_kind(&input.scenario.name).map(|mutation| {
+                FaultRunAckTriggerSpec {
+                    mutation,
+                    operation_timeout_ms: input.config.ack_operation_timeout.as_millis() as u64,
+                    max_ack_to_fault_ms: input.config.max_ack_to_fault.as_millis() as u64,
+                }
+            }),
             expected_failure: input.scenario.expected_failure.clone(),
             fault_duration_seconds: input.config.duration.as_secs(),
             workload: FaultSuitePlanWorkload {
@@ -524,7 +548,7 @@ impl FaultSuitePlanAttempt {
             artifacts: FaultSuitePlanArtifacts {
                 attempt_dir: input.attempt_dir.display().to_string(),
                 case_dir: case_dir.display().to_string(),
-                required: FaultRunArtifactSpec::required_names(),
+                required: FaultRunArtifactSpec::required_names_for_scenario(&input.scenario.name),
                 event_stream: "run-events.jsonl".to_string(),
             },
             budget: input.budget,
@@ -759,6 +783,7 @@ fn workload_mode_name(mode: FaultWorkloadMode) -> &'static str {
     match mode {
         FaultWorkloadMode::S3Mixed => "s3-mixed",
         FaultWorkloadMode::S3MixedWithWarp => "s3-mixed-with-warp",
+        FaultWorkloadMode::AckTriggeredQuietMutation => "ack-triggered-quiet-mutation",
     }
 }
 
@@ -769,8 +794,11 @@ mod tests {
         validate_suite_runtime_contract,
     };
     use crate::fault::{
+        acknowledged_mutation::AcknowledgedMutationKind,
         config::FaultTestConfig,
-        scenarios::{FaultScenario, POD_CRASH_VERSIONED_HOT_SCENARIO},
+        scenarios::{
+            DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO, FaultScenario, POD_CRASH_VERSIONED_HOT_SCENARIO,
+        },
         suite::{FaultSuite, fault_suite_template_yaml},
         workload::{WorkloadHotspot, WorkloadOperationMix},
     };
@@ -1171,6 +1199,67 @@ scenarios:
             legacy.to_json().is_err(),
             "new plan writer must not emit a detector-less plan"
         );
+    }
+
+    #[test]
+    fn suite_plan_keeps_ack_case_independently_typed_and_identifiable() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: ack-case
+scenarios:
+  - name: dm-drop-writes-after-ack-put
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite");
+        let mut base = FaultTestConfig::for_test("real-cluster", "rustfs-fault-dm");
+        base.workload_seed = Some(100);
+        base.ack_operation_timeout = Duration::from_millis(2_300);
+        base.max_ack_to_fault = Duration::from_millis(175);
+
+        let expansion = build_fault_suite_plan_expansion(suite, base, "suite-fixed".to_string())
+            .expect("suite plan expansion");
+        let [attempt] = expansion.plan.attempts.as_slice() else {
+            panic!("expected one independently planned ACK case")
+        };
+        assert_eq!(attempt.scenario, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO);
+        assert_eq!(attempt.workload.mode, "ack-triggered-quiet-mutation");
+        assert!(attempt.workload.versioning);
+        assert_eq!(
+            attempt.ack_trigger.as_ref().expect("ACK trigger").mutation,
+            AcknowledgedMutationKind::Put
+        );
+        assert_eq!(
+            serde_json::to_value(attempt).expect("attempt JSON")["ackTrigger"],
+            json!({
+                "mutation": "put",
+                "operation_timeout_ms": 2300,
+                "max_ack_to_fault_ms": 175
+            })
+        );
+        assert!(
+            attempt
+                .artifacts
+                .required
+                .contains(&"ack-to-fault-evidence.json".to_string())
+        );
+        let mut tampered = expansion.plan.clone();
+        tampered.attempts[0]
+            .ack_trigger
+            .as_mut()
+            .expect("ACK trigger")
+            .max_ack_to_fault_ms = 0;
+        assert!(tampered.to_json().is_err());
+        tampered.attempts[0]
+            .ack_trigger
+            .as_mut()
+            .expect("ACK trigger")
+            .max_ack_to_fault_ms = crate::fault::config::MAX_ACK_TO_FAULT_MS + 1;
+        assert!(tampered.to_json().is_err());
     }
 
     #[test]

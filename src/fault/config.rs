@@ -35,6 +35,9 @@ pub const DEFAULT_RUSTFS_VOLUME_PATH: &str = "/data/rustfs0";
 pub const DEFAULT_RUSTFS_POD_STABLE_WINDOW_SECONDS: u64 = 60;
 pub const DEFAULT_FAULT_DURATION_SECONDS: u64 = 7_200;
 pub const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
+pub const DEFAULT_ACK_OPERATION_TIMEOUT_MS: u64 = 30_000;
+pub const MAX_ACK_TO_FAULT_MS: u64 = 1_000;
+pub const DEFAULT_MAX_ACK_TO_FAULT_MS: u64 = MAX_ACK_TO_FAULT_MS;
 pub const DEFAULT_RECOVERY_STABILITY_REREAD_SECONDS: u64 = 60;
 pub const MAX_RECOVERY_STABILITY_REREAD_SECONDS: u64 = 120;
 pub const DEFAULT_CLUSTER_TIMEOUT_SECONDS: u64 = 300;
@@ -89,6 +92,8 @@ pub struct FaultTestConfig {
     pub prefill_concurrency: usize,
     pub workload_seed: Option<u64>,
     pub request_timeout: Duration,
+    pub ack_operation_timeout: Duration,
+    pub max_ack_to_fault: Duration,
     pub recovery_stability_reread: Duration,
     pub expected_rustfs_pod_count: usize,
     pub rustfs_volume_path: String,
@@ -217,6 +222,24 @@ impl FaultTestConfig {
             rustfs_pod_stable_window_seconds < cluster_timeout_seconds,
             "RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS must be less than RUSTFS_FAULT_TEST_TIMEOUT_SECONDS"
         );
+        let ack_operation_timeout_ms = env_u64(
+            &get_env,
+            "RUSTFS_FAULT_TEST_ACK_OPERATION_TIMEOUT_MS",
+            DEFAULT_ACK_OPERATION_TIMEOUT_MS,
+        )?;
+        ensure!(
+            ack_operation_timeout_ms > 0,
+            "RUSTFS_FAULT_TEST_ACK_OPERATION_TIMEOUT_MS must be greater than zero"
+        );
+        let max_ack_to_fault_ms = env_u64(
+            &get_env,
+            "RUSTFS_FAULT_TEST_MAX_ACK_TO_FAULT_MS",
+            DEFAULT_MAX_ACK_TO_FAULT_MS,
+        )?;
+        ensure!(
+            (1..=MAX_ACK_TO_FAULT_MS).contains(&max_ack_to_fault_ms),
+            "RUSTFS_FAULT_TEST_MAX_ACK_TO_FAULT_MS must be between 1 and {MAX_ACK_TO_FAULT_MS}"
+        );
         let cluster = ClusterTestConfig {
             context,
             operator_namespace: env_or(
@@ -278,6 +301,8 @@ impl FaultTestConfig {
                 "RUSTFS_FAULT_TEST_REQUEST_TIMEOUT_SECONDS",
                 DEFAULT_REQUEST_TIMEOUT_SECONDS,
             )?),
+            ack_operation_timeout: Duration::from_millis(ack_operation_timeout_ms),
+            max_ack_to_fault: Duration::from_millis(max_ack_to_fault_ms),
             recovery_stability_reread: Duration::from_secs(recovery_stability_reread_seconds),
             expected_rustfs_pod_count,
             rustfs_volume_path,
@@ -633,7 +658,10 @@ fn ensure_non_sensitive_env_name(source: &str, name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FaultTestConfig, FaultWorkloadProfile, validate_storage_class};
+    use super::{
+        DEFAULT_ACK_OPERATION_TIMEOUT_MS, DEFAULT_MAX_ACK_TO_FAULT_MS, FaultTestConfig,
+        FaultWorkloadProfile, MAX_ACK_TO_FAULT_MS, validate_storage_class,
+    };
 
     #[test]
     fn real_cluster_fault_defaults_are_isolated() {
@@ -670,6 +698,14 @@ mod tests {
         assert_eq!(config.prefill_concurrency, 16);
         assert_eq!(config.workload_seed, None);
         assert_eq!(config.request_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(
+            config.ack_operation_timeout,
+            std::time::Duration::from_millis(DEFAULT_ACK_OPERATION_TIMEOUT_MS)
+        );
+        assert_eq!(
+            config.max_ack_to_fault,
+            std::time::Duration::from_millis(DEFAULT_MAX_ACK_TO_FAULT_MS)
+        );
         assert_eq!(
             config.recovery_stability_reread,
             std::time::Duration::from_secs(60)
@@ -756,6 +792,8 @@ mod tests {
                 "RUSTFS_FAULT_TEST_PREFILL_CONCURRENCY" => Some("4".to_string()),
                 "RUSTFS_FAULT_TEST_SEED" => Some("4242".to_string()),
                 "RUSTFS_FAULT_TEST_REQUEST_TIMEOUT_SECONDS" => Some("7".to_string()),
+                "RUSTFS_FAULT_TEST_ACK_OPERATION_TIMEOUT_MS" => Some("2300".to_string()),
+                "RUSTFS_FAULT_TEST_MAX_ACK_TO_FAULT_MS" => Some("175".to_string()),
                 "RUSTFS_FAULT_TEST_RECOVERY_STABILITY_REREAD_SECONDS" => Some("90".to_string()),
                 "RUSTFS_FAULT_TEST_RUSTFS_POD_COUNT" => Some("6".to_string()),
                 "RUSTFS_FAULT_TEST_RUSTFS_VOLUME_PATH" => Some("/data/rustfs1".to_string()),
@@ -819,6 +857,14 @@ mod tests {
         assert_eq!(config.workload_seed, Some(4242));
         assert_eq!(config.request_timeout, std::time::Duration::from_secs(7));
         assert_eq!(
+            config.ack_operation_timeout,
+            std::time::Duration::from_millis(2300)
+        );
+        assert_eq!(
+            config.max_ack_to_fault,
+            std::time::Duration::from_millis(175)
+        );
+        assert_eq!(
             config.recovery_stability_reread,
             std::time::Duration::from_secs(90)
         );
@@ -875,6 +921,52 @@ mod tests {
     fn workload_object_count_must_cover_all_mixed_operations() {
         assert!(FaultWorkloadProfile::new(11, 1).is_err());
         assert!(FaultWorkloadProfile::new(12, 12).is_ok());
+    }
+
+    #[test]
+    fn zero_ack_timing_limits_are_rejected() {
+        for variable in [
+            "RUSTFS_FAULT_TEST_ACK_OPERATION_TIMEOUT_MS",
+            "RUSTFS_FAULT_TEST_MAX_ACK_TO_FAULT_MS",
+        ] {
+            let result = FaultTestConfig::from_env_with(
+                |name| match name {
+                    "RUSTFS_FAULT_TEST_STORAGE_CLASS" => Some("local-storage".to_string()),
+                    "RUSTFS_FAULT_TEST_SERVER_IMAGE" => Some("rustfs/rustfs:test".to_string()),
+                    name if name == variable => Some("0".to_string()),
+                    _ => None,
+                },
+                "real-cluster".to_string(),
+            );
+            let message = result.unwrap_err().to_string();
+            assert!(
+                message.contains("must be greater than zero")
+                    || message.contains("must be between 1 and"),
+                "{variable} must reject zero: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn ack_to_fault_limit_rejects_a_window_too_wide_for_durability_evidence() {
+        let result = FaultTestConfig::from_env_with(
+            |name| match name {
+                "RUSTFS_FAULT_TEST_STORAGE_CLASS" => Some("local-storage".to_string()),
+                "RUSTFS_FAULT_TEST_SERVER_IMAGE" => Some("rustfs/rustfs:test".to_string()),
+                "RUSTFS_FAULT_TEST_MAX_ACK_TO_FAULT_MS" => {
+                    Some((MAX_ACK_TO_FAULT_MS + 1).to_string())
+                }
+                _ => None,
+            },
+            "real-cluster".to_string(),
+        );
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must be between 1 and 1000")
+        );
     }
 
     #[test]

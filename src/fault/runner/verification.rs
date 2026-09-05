@@ -207,6 +207,24 @@ impl FaultRun<'_> {
         workload: &MixedWorkloadResult,
         evidence: &mut FaultEvidence,
     ) -> Result<()> {
+        self.verify_final_with_disruptions(s3, workload.summary.disrupted(), evidence)
+            .await
+    }
+
+    pub(super) async fn verify_final_without_recommit(
+        &self,
+        s3: &S3WorkloadClient,
+        evidence: &mut FaultEvidence,
+    ) -> Result<()> {
+        self.verify_final_with_disruptions(s3, 0, evidence).await
+    }
+
+    async fn verify_final_with_disruptions(
+        &self,
+        s3: &S3WorkloadClient,
+        client_disruptions: usize,
+        evidence: &mut FaultEvidence,
+    ) -> Result<()> {
         let config = self.config;
         let collector = self.collector;
         let scenario = self.scenario;
@@ -260,7 +278,7 @@ impl FaultRun<'_> {
             &serde_json::to_string_pretty(&report)?,
         )?;
         evidence.recovered = report.tenant_recovered;
-        evidence.client_disruptions = workload.summary.disrupted();
+        evidence.client_disruptions = client_disruptions;
         collector.write_text(
             scenario.case_name,
             "fault-evidence.json",
