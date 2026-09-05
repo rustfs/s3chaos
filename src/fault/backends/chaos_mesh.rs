@@ -21,6 +21,7 @@ use crate::{
         config::FaultTestConfig,
         plan::{FaultInjection, FaultKind, FaultSelection, VolumeTargetSelection},
         pods::rustfs_pod_identities,
+        quorum::MAX_ERASURE_SET_SHARDS,
         reporting::PodIdentity,
         scenarios::FaultScenario,
     },
@@ -724,6 +725,9 @@ fn build_fault_spec(
             let targets = match injection.selection() {
                 FaultSelection::FixedTargets(count) => count,
                 FaultSelection::Percent(_) => 1,
+                FaultSelection::RuntimeQuorum(_) => {
+                    bail!("runtime quorum selection must be resolved before IOChaos rendering")
+                }
             };
             Ok(FaultSpec::Network(
                 NetworkChaosSpec::partition_rustfs_pods(
@@ -1132,8 +1136,8 @@ impl IoChaosSpec {
     fn with_fixed_targets(mut self, targets: Option<u32>) -> Result<Self> {
         if let Some(targets) = targets {
             ensure!(
-                (1..=8).contains(&targets),
-                "IOChaos fixed targets must be in 1..=8, got {targets}"
+                (1..=MAX_ERASURE_SET_SHARDS).contains(&targets),
+                "IOChaos fixed targets must be in 1..={MAX_ERASURE_SET_SHARDS}, got {targets}"
             );
         }
         self.targets = targets;
@@ -1727,6 +1731,7 @@ mod tests {
     use crate::fault::plan::{
         FaultInjection, FaultInjectionParameters, FaultKind, FaultSelection, FaultTarget, IoMethod,
     };
+    use crate::fault::quorum::{ErasureSetShape, QuorumCaseClass, QuorumVolumeBoundary};
     use crate::fault::scenarios::{FaultBackend, FaultScenario};
     use std::{collections::BTreeSet, time::Duration};
 
@@ -1963,6 +1968,44 @@ mod tests {
         outside_proof["status"]["experiment"]["containerRecords"][1]["id"] =
             serde_json::json!("faults/rustfs-9/rustfs");
         assert!(validate_fixed_volume_snapshot(&outside_proof, &contract).is_err());
+    }
+
+    #[test]
+    fn metadata_p_plus_one_renders_nine_iochaos_targets_for_sixteen_shards() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let scenario = test_scenario("quorum-p-plus-one-io-fault");
+        let semantic = FaultInjection::new_with_parameters(
+            FaultKind::RustfsVolumeIoError,
+            FaultBackend::ChaosMeshIoChaos,
+            FaultTarget::RustfsVolume {
+                path: "/data/rustfs0".to_string(),
+            },
+            FaultSelection::RuntimeQuorum(QuorumVolumeBoundary {
+                class: QuorumCaseClass::Metadata,
+                beyond_read_tolerance: true,
+            }),
+            Duration::from_secs(60),
+            FaultInjectionParameters::QuorumIo {
+                class: QuorumCaseClass::Metadata,
+            },
+        )
+        .expect("semantic quorum injection");
+        let shape = ErasureSetShape::from_runtime_single_set(16, 1, &[1], &[16], 4)
+            .expect("16-shard runtime shape");
+        let injection = semantic
+            .resolve_runtime_quorum(&shape)
+            .expect("metadata P+1 target count");
+        assert_eq!(injection.selection(), FaultSelection::FixedTargets(9));
+
+        let FaultSpec::Io(spec) = build_fault_spec(&config, &scenario, &injection, "run-1", "")
+            .expect("IOChaos fault spec")
+        else {
+            panic!("expected IOChaos spec")
+        };
+        assert!(
+            spec.manifest()
+                .contains("\n  mode: fixed\n  value: \"9\"\n")
+        );
     }
 
     #[test]

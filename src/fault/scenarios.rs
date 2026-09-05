@@ -18,6 +18,8 @@ use std::time::Duration;
 
 use crate::fault::{
     config::FaultTestConfig,
+    plan::FaultInjectionParameters,
+    quorum::QuorumCaseClass,
     workload::{
         WorkloadHotspot, WorkloadOperationMix, WorkloadPayloadClass, WorkloadPayloadDistribution,
     },
@@ -168,6 +170,7 @@ impl FaultBackend {
 #[serde(rename_all = "camelCase")]
 pub enum FaultParameterSchema {
     None,
+    QuorumIo,
     IoLatency,
     NetworkDelay,
     NetworkLoss,
@@ -879,26 +882,27 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             DurabilityBugFamily::SilentDataCorruption,
         ]),
         case_name: "fault_quorum_p_io_fault_preserves_read_quorum",
-        description: "Planned quorum-targeted reliability flow: inject storage faults into exactly P volumes of one RustFS erasure set and verify reads survive at read quorum.",
+        description: "Inject storage faults into the runtime-derived read tolerance P for one typed payload or metadata quorum case and verify the boundary without corrupt reads.",
         priority: FaultPriority::P0,
-        backend: FaultBackend::PlannedReliabilityWorkflow,
-        status: FaultScenarioStatus::Planned,
+        backend: FaultBackend::ChaosMeshIoChaos,
+        status: FaultScenarioStatus::Executable,
         workload_profile: FaultScenarioWorkloadProfile::Default,
         isolation: FaultIsolation::FreshTenant,
-        crds: &[],
+        crds: &[IOCHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
-        param_schema: FaultParameterSchema::None,
-        impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
+        param_schema: FaultParameterSchema::QuorumIo,
+        impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
         boundary: "rustfs-reliability/quorum-targeting",
-        ci_phase: "planned",
-        target: "exactly P volumes in one RustFS erasure set, selected by erasure-set membership rather than percentage",
+        ci_phase: "faults",
+        target: "the runtime-derived read tolerance P for payload or metadata volumes in one RustFS erasure set",
         target_proof: &[
             "artifact must prove erasure-set topology and P value before fault activation",
-            "artifact must list the exact volume identities selected for injection",
+            "artifact must bind every candidate and selected Pod/container/PVC/PV/mount to exactly one RustFS drive UUID in the same set",
+            "artifact must prove the complete non-target drive set",
         ],
-        validation: "reads at P failed volumes remain explainable and never return corrupt bytes; writes must either commit fully or fail cleanly with no half-committed versions",
-        observability: "planned topology proof, selected volume identities, workload history, checker reports, heal/admin status, RustFS logs",
+        validation: "the stable typed cohort remains readable at P failed volumes; each mutation must fail without a success ACK when its write quorum exceeds the remaining shard count, and permitted writes must not leave half-committed versions",
+        observability: "runtime topology and volume binding proof, actual IOChaos controller targets at activation and after workload, workload history, checker reports, RustFS logs",
         conflict_domain: "fresh Tenant with topology-owned volume selection; must not share erasure-set targeting with other active faults",
     },
     FaultScenarioSpec {
@@ -908,26 +912,27 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
             DurabilityBugFamily::CommitMetadataLoss,
         ]),
         case_name: "fault_quorum_p_plus_one_io_fault_rejects_past_write_quorum",
-        description: "Planned quorum-targeted reliability flow: inject storage faults into exactly P+1 volumes of one RustFS erasure set and verify writes fail cleanly past quorum.",
+        description: "Inject storage faults into the runtime-derived read tolerance P+1 for one typed payload or metadata quorum case and verify operations fail cleanly past quorum.",
         priority: FaultPriority::P0,
-        backend: FaultBackend::PlannedReliabilityWorkflow,
-        status: FaultScenarioStatus::Planned,
+        backend: FaultBackend::ChaosMeshIoChaos,
+        status: FaultScenarioStatus::Executable,
         workload_profile: FaultScenarioWorkloadProfile::Default,
         isolation: FaultIsolation::FreshTenant,
-        crds: &[],
+        crds: &[IOCHAOS_CRD],
         required_tools: &[],
         percent_supported: false,
-        param_schema: FaultParameterSchema::None,
+        param_schema: FaultParameterSchema::QuorumIo,
         impact_policy: FaultImpactPolicy::ClientDisruptionRequired,
         boundary: "rustfs-reliability/quorum-targeting",
-        ci_phase: "planned",
-        target: "exactly P+1 volumes in one RustFS erasure set, selected by erasure-set membership rather than percentage",
+        ci_phase: "faults",
+        target: "the runtime-derived read tolerance P+1 for payload or metadata volumes in one RustFS erasure set",
         target_proof: &[
             "artifact must prove erasure-set topology, P value, and P+1 target count before fault activation",
-            "artifact must list the exact volume identities selected for injection",
+            "artifact must bind every candidate and selected Pod/container/PVC/PV/mount to exactly one RustFS drive UUID in the same set",
+            "artifact must prove the complete non-target drive set",
         ],
-        validation: "writes past quorum are rejected cleanly, prior committed versions remain readable after recovery, and no successful read returns corrupt bytes",
-        observability: "planned topology proof, selected volume identities, workload history, checker reports, heal/admin status, RustFS logs",
+        validation: "P+1 rejects every mutation whose write quorum exceeds the remaining shard count, deriving PUT, DELETE marker, and multipart completion expectations separately from proven runtime geometry; prior committed versions remain readable after recovery and no successful read returns corrupt bytes",
+        observability: "runtime topology and volume binding proof, actual IOChaos controller targets at activation and after workload, workload history, checker reports, RustFS logs",
         conflict_domain: "fresh Tenant with topology-owned volume selection; must not share erasure-set targeting with other active faults",
     },
     FaultScenarioSpec {
@@ -1193,13 +1198,64 @@ pub fn scenario_catalog_json() -> Result<String> {
 pub fn apply_catalog_defaults(config: &mut FaultTestConfig) -> Result<()> {
     let spec = scenario_spec(&config.scenario)?;
     spec.workload_profile.apply_to_config(config);
+    if matches!(
+        config.scenario.as_str(),
+        QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+    ) && matches!(
+        config.scenario_parameters,
+        FaultInjectionParameters::Default
+    ) {
+        config.scenario_parameters = FaultInjectionParameters::QuorumIo {
+            class: QuorumCaseClass::Payload,
+        };
+    }
+    if matches!(
+        config.scenario.as_str(),
+        QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+    ) {
+        config.workload_versioning = true;
+        match config.scenario_parameters {
+            FaultInjectionParameters::QuorumIo {
+                class: QuorumCaseClass::Payload,
+            } => config.workload_directory_marker_percent = 0,
+            FaultInjectionParameters::QuorumIo {
+                class: QuorumCaseClass::Metadata,
+            } => {
+                // Make the typed metadata case deterministic: every prefilled
+                // key is a zero-byte directory marker, so the P-boundary read
+                // oracle cannot pass on a payload object or become vacuous.
+                config.workload_directory_marker_percent = 100;
+                config.workload_operation_mix = WorkloadOperationMix {
+                    put: 1,
+                    overwrite: 2,
+                    get: 1,
+                    list: 1,
+                    delete: 4,
+                    multipart: 1,
+                };
+            }
+            _ => {}
+        }
+    }
     Ok(())
 }
 
 pub fn expected_workload_versioning_for_scenario(scenario: &str, env_value: bool) -> Result<bool> {
-    Ok(scenario_spec(scenario)?
-        .workload_profile
-        .expected_versioning(env_value))
+    let spec = scenario_spec(scenario)?;
+    Ok(spec.workload_profile.expected_versioning(env_value)
+        || matches!(
+            scenario,
+            QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+        ))
+}
+
+pub(in crate::fault) fn requires_prefault_multipart_staging(scenario: &str) -> bool {
+    matches!(
+        scenario,
+        NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
+            | QUORUM_P_IO_FAULT_SCENARIO
+            | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+    )
 }
 
 pub fn scenario_spec(name: &str) -> Result<&'static FaultScenarioSpec> {
@@ -1227,10 +1283,13 @@ mod tests {
         NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO,
         POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
         STALE_DISK_RETURN_DETECT_SCENARIO, WARP_UNDER_CHAOS_SCENARIO, apply_catalog_defaults,
-        executable_scenario_catalog, expected_workload_versioning_for_scenario, scenario_catalog,
-        scenario_catalog_json, scenario_spec,
+        executable_scenario_catalog, expected_workload_versioning_for_scenario,
+        requires_prefault_multipart_staging, scenario_catalog, scenario_catalog_json,
+        scenario_spec,
     };
     use crate::fault::config::{FaultTestConfig, FaultWorkloadProfile};
+    use crate::fault::plan::FaultInjectionParameters;
+    use crate::fault::quorum::QuorumCaseClass;
     use crate::fault::workload::{
         WorkloadHotspot, WorkloadOperationMix, WorkloadPayloadClass, WorkloadPayloadDistribution,
     };
@@ -1304,31 +1363,30 @@ mod tests {
             );
         }
 
-        assert_eq!(executable_scenario_catalog().count(), 18);
+        assert_eq!(executable_scenario_catalog().count(), 20);
         assert_eq!(scenario_catalog().len(), 25);
         assert_eq!(
             scenario_catalog()
                 .iter()
                 .filter(|scenario| scenario.status == FaultScenarioStatus::Planned)
                 .count(),
-            7
+            5
         );
     }
 
     #[test]
     fn planned_cataloged_fault_scenarios_are_not_selectable() {
+        let planned = scenario_catalog()
+            .iter()
+            .find(|scenario| scenario.status == FaultScenarioStatus::Planned)
+            .expect("planned catalog entry");
         let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
-        config.scenario = QUORUM_P_IO_FAULT_SCENARIO.to_string();
+        config.scenario = planned.scenario.to_string();
 
         let error = FaultScenario::from_config(&config).expect_err("planned scenario");
 
         assert!(error.to_string().contains("not executable yet"));
-        assert_eq!(
-            scenario_spec(QUORUM_P_IO_FAULT_SCENARIO)
-                .expect("planned scenario")
-                .status,
-            FaultScenarioStatus::Planned
-        );
+        assert_eq!(planned.status, FaultScenarioStatus::Planned);
         assert_eq!(
             scenario_spec(STALE_DISK_RETURN_DETECT_SCENARIO)
                 .expect("planned stale-disk scenario")
@@ -1415,6 +1473,10 @@ mod tests {
             expected_workload_versioning_for_scenario(IO_EIO_SCENARIO, true).expect("scenario")
         );
         assert!(
+            expected_workload_versioning_for_scenario(QUORUM_P_IO_FAULT_SCENARIO, false)
+                .expect("scenario")
+        );
+        assert!(
             !expected_workload_versioning_for_scenario(IO_EIO_SCENARIO, false).expect("scenario")
         );
         assert_eq!(
@@ -1423,6 +1485,19 @@ mod tests {
                 .workload_profile,
             FaultScenarioWorkloadProfile::VersionedHotMutations
         );
+    }
+
+    #[test]
+    fn write_quorum_cases_stage_multipart_before_fault_activation() {
+        assert!(requires_prefault_multipart_staging(
+            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
+        ));
+        assert!(requires_prefault_multipart_staging(
+            QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+        ));
+        assert!(requires_prefault_multipart_staging(
+            QUORUM_P_IO_FAULT_SCENARIO
+        ));
     }
 
     #[test]
@@ -1443,6 +1518,51 @@ mod tests {
             scenario_spec(IO_EIO_SCENARIO).expect("io eio").param_schema,
             FaultParameterSchema::None
         );
+        for scenario in [
+            QUORUM_P_IO_FAULT_SCENARIO,
+            QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+        ] {
+            assert_eq!(
+                scenario_spec(scenario)
+                    .expect("quorum scenario")
+                    .param_schema,
+                FaultParameterSchema::QuorumIo
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_quorum_defaults_exercise_versioned_metadata_mutations() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO.to_string();
+        config.scenario_parameters = FaultInjectionParameters::QuorumIo {
+            class: QuorumCaseClass::Metadata,
+        };
+
+        apply_catalog_defaults(&mut config).expect("quorum metadata defaults");
+
+        assert!(config.workload_versioning);
+        assert_eq!(config.workload_directory_marker_percent, 100);
+        assert_eq!(
+            config.workload_operation_mix,
+            WorkloadOperationMix {
+                put: 1,
+                overwrite: 2,
+                get: 1,
+                list: 1,
+                delete: 4,
+                multipart: 1,
+            }
+        );
+
+        let mut payload = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        payload.scenario = QUORUM_P_IO_FAULT_SCENARIO.to_string();
+        payload.workload_directory_marker_percent = 100;
+        payload.scenario_parameters = FaultInjectionParameters::QuorumIo {
+            class: QuorumCaseClass::Payload,
+        };
+        apply_catalog_defaults(&mut payload).expect("quorum payload defaults");
+        assert_eq!(payload.workload_directory_marker_percent, 0);
     }
 
     #[test]
@@ -1479,6 +1599,7 @@ mod tests {
             assert_eq!(
                 scenario.percent_supported,
                 scenario.backend.accepts_percent()
+                    && scenario.param_schema != FaultParameterSchema::QuorumIo
             );
             assert!(!scenario.boundary.is_empty());
             assert!(!scenario.ci_phase.is_empty());

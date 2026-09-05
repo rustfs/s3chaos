@@ -1,0 +1,43 @@
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-volume-quorum-reliability
+budgets:
+  maxDuration: 4h
+  stopOnFirstFailure: true
+  continueOnSeverities: []
+  maxClientDisruptions: 2000
+  recoveryStableWindowSeconds: 60
+observability:
+  chaosDashboard: optional
+artifacts:
+  required: strict
+workloadProfiles:
+  quorum:
+    objects: 240
+    concurrency: 16
+scenarios:
+  - name: quorum-p-io-fault
+    faultDuration: 15m
+    workloadProfile: quorum
+    params:
+      kind: quorumIo
+      class: payload
+  - name: quorum-p-io-fault
+    faultDuration: 15m
+    workloadProfile: quorum
+    params:
+      kind: quorumIo
+      class: metadata
+  - name: quorum-p-plus-one-io-fault
+    faultDuration: 15m
+    workloadProfile: quorum
+    params:
+      kind: quorumIo
+      class: payload
+  - name: quorum-p-plus-one-io-fault
+    faultDuration: 15m
+    workloadProfile: quorum
+    params:
+      kind: quorumIo
+      class: metadata

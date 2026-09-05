@@ -26,7 +26,7 @@ use crate::fault::{
     },
     config::FaultTestConfig,
     reporting::{FailurePhase, FailureSeverity, FailureSummary, ResponsibilityDomain},
-    runner::run_scenario_with_config_and_reference_root,
+    runner::run_prepared_scenario_with_config_and_reference_root,
     shutdown::{RunDeadline, SuiteDeadlineExceeded},
     suite::{FaultExpectedFailure, ResolvedFaultSuite},
     suite_plan::{
@@ -261,7 +261,7 @@ pub async fn run_fault_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
             attempt_dir.display()
         );
 
-        let result = run_scenario_with_config_and_reference_root(
+        let result = run_prepared_scenario_with_config_and_reference_root(
             planned.config.clone(),
             suite_root.clone(),
             attempt.run_id.clone(),

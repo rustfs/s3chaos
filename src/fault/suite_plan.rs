@@ -616,6 +616,11 @@ impl FaultSuitePlanSelection {
                 value: count,
                 summary: selection.summary(),
             },
+            FaultSelection::RuntimeQuorum(boundary) => Self {
+                kind: "runtime-quorum".to_string(),
+                value: u32::from(boundary.beyond_read_tolerance),
+                summary: selection.summary(),
+            },
         }
     }
 }
@@ -1212,6 +1217,52 @@ scenarios:
     }
 
     #[test]
+    fn metadata_quorum_suite_keeps_explicit_operation_mix_override() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-quorum
+scenarios:
+  - name: quorum-p-io-fault
+    params:
+      kind: quorumIo
+      class: metadata
+    workload:
+      operationWeights:
+        put: 3
+        overwrite: 1
+        get: 2
+        list: 1
+        delete: 2
+        multipart: 1
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("resolved suite");
+        let base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let attempt_dir = PathBuf::from("target/fault-tests/quorum/attempt-1");
+
+        let config = scenario_config(&base, &suite, &suite.scenarios[0], 1, 1, &attempt_dir)
+            .expect("scenario config");
+
+        assert_eq!(config.workload_directory_marker_percent, 100);
+        assert_eq!(
+            config.workload_operation_mix,
+            WorkloadOperationMix {
+                put: 3,
+                overwrite: 1,
+                get: 2,
+                list: 1,
+                delete: 2,
+                multipart: 1,
+            }
+        );
+    }
+
+    #[test]
     fn scenario_config_applies_suite_overrides_and_unique_artifacts() {
         let suite = serde_yaml_ng::from_str::<FaultSuite>(
             r#"
@@ -1398,6 +1449,45 @@ scenarios:
     fn attempt_seed_keeps_repetitions_distinct_when_seed_is_fixed() {
         assert_ne!(attempt_seed(Some(42), 1, 1), attempt_seed(Some(42), 2, 1));
         assert_eq!(attempt_seed(None, 1, 1), None);
+    }
+
+    #[test]
+    fn quorum_example_expands_typed_payload_and_metadata_boundaries() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(include_str!(
+            "../../fault/examples/quorum-reliability.yaml"
+        ))
+        .expect("quorum example")
+        .resolve()
+        .expect("resolved quorum example");
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.workload_seed = Some(41);
+
+        let expansion =
+            build_fault_suite_plan_expansion(suite, base, "quorum-suite-test".to_string())
+                .expect("quorum suite plan");
+
+        assert_eq!(expansion.plan.attempts.len(), 4);
+        let selections = expansion
+            .plan
+            .attempts
+            .iter()
+            .map(|attempt| {
+                (
+                    attempt.scenario.as_str(),
+                    attempt.faults[0].selection.kind.as_str(),
+                    attempt.faults[0].selection.value,
+                    attempt.faults[0]
+                        .parameters
+                        .quorum_case()
+                        .expect("typed class"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(selections[0].1, "runtime-quorum");
+        assert_eq!(selections[0].2, 0);
+        assert_eq!(selections[2].2, 1);
+        assert_ne!(selections[0].3, selections[1].3);
+        assert_ne!(selections[2].3, selections[3].3);
     }
 
     #[test]

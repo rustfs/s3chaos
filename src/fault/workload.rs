@@ -173,6 +173,14 @@ impl ObjectSpec {
         format!("fault-test/{run_id}/")
     }
 
+    pub(crate) fn seeded_key(run_id: &str, index: usize) -> String {
+        format!("{}object-{index:06}", Self::key_prefix(run_id))
+    }
+
+    pub(crate) fn directory_marker_key(run_id: &str, index: usize) -> String {
+        format!("{}dir-{index:06}/", Self::key_prefix(run_id))
+    }
+
     pub fn matches_body(&self, body: &[u8]) -> bool {
         body.len() == self.size_bytes && sha256_hex(body) == self.sha256
     }
@@ -183,7 +191,7 @@ impl ObjectSpec {
         size_bytes: usize,
         seed: u64,
     ) -> PreparedObject {
-        let key = format!("{}object-{index:06}", Self::key_prefix(run_id));
+        let key = Self::seeded_key(run_id, index);
         let body = seeded_bytes(seed, index, size_bytes);
         let sha256 = sha256_hex(&body);
 
@@ -207,7 +215,7 @@ impl ObjectSpec {
     /// directory-key delete path, rustfs/backlog#798). Size 0 keeps it off the
     /// erasure-shard and ranged-read paths.
     pub fn prepare_directory_marker(run_id: &str, index: usize, seed: u64) -> PreparedObject {
-        let key = format!("{}dir-{index:06}/", Self::key_prefix(run_id));
+        let key = Self::directory_marker_key(run_id, index);
         let body = Vec::new();
         let sha256 = sha256_hex(&body);
 

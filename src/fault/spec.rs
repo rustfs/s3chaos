@@ -292,6 +292,7 @@ impl FaultRunFaultSpec {
                     .ok()
                     .map(|targeting| targeting.io_sampling_percent),
                 FaultSelection::Percent(_) => None,
+                FaultSelection::RuntimeQuorum(_) => Some(100),
             },
             target_proof_requirements: scenario_spec
                 .target_proof

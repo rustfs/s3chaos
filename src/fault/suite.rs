@@ -489,6 +489,12 @@ impl ResolvedFaultSuiteScenario {
             expected_failure.validate(&scenario.name)?;
         }
         let params = scenario.params.clone().unwrap_or_default();
+        ensure!(
+            spec.param_schema != crate::fault::scenarios::FaultParameterSchema::QuorumIo
+                || scenario.params.is_some(),
+            "scenario {} requires explicit params.kind=quorumIo and class=payload|metadata",
+            scenario.name
+        );
         if let Some(params) = &scenario.params {
             params.validate_explicit_for_schema(spec.param_schema)?;
         }
@@ -785,7 +791,7 @@ mod tests {
     use crate::fault::{
         plan::FaultInjectionParameters,
         reporting::{FailureClassification, FailureSeverity, ResponsibilityDomain},
-        scenarios::{DetectorQualification, QUORUM_P_IO_FAULT_SCENARIO},
+        scenarios::{DetectorQualification, FaultScenarioStatus},
     };
 
     #[test]
@@ -1269,6 +1275,11 @@ scenarios:
 
     #[test]
     fn rejects_planned_scenario_names() {
+        let planned = crate::fault::scenarios::scenario_catalog()
+            .iter()
+            .find(|scenario| scenario.status == FaultScenarioStatus::Planned)
+            .expect("catalog has a planned scenario")
+            .scenario;
         let suite = serde_yaml_ng::from_str::<FaultSuite>(&format!(
             r#"
 apiVersion: rustfs.com/s3chaos/v1alpha1
@@ -1276,7 +1287,7 @@ kind: FaultSuite
 metadata:
   name: rustfs-smoke
 scenarios:
-  - name: {QUORUM_P_IO_FAULT_SCENARIO}
+  - name: {planned}
 "#
         ))
         .expect("suite yaml");

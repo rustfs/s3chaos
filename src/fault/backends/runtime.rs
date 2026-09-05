@@ -155,15 +155,15 @@ pub(in crate::fault) fn apply_fault(
     config: &FaultTestConfig,
     collector: &ArtifactCollector,
     scenario: &FaultScenario,
-    plan: &FaultPlan,
     run_id: &str,
     host_storage_proof: Option<&HostStorageMutationProof>,
+    execution_injection: &FaultInjection,
 ) -> Result<AppliedFault> {
     apply_fault_backend(&FaultApplyRequest {
         config,
         collector,
         scenario,
-        injection: plan.fault(),
+        injection: execution_injection,
         run_id,
         manifest_name: "chaos-manifest.yaml",
         resource_name_suffix: "",

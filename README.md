@@ -77,14 +77,18 @@ export RUSTFS_FAULT_TEST_TENANT='<run-tenant>'
 make fault-cleanup                                # release cluster fixtures
 ```
 
-Runnable scenario families (18 executable entries): I/O faults (`io-eio`,
+Runnable scenario families (20 executable entries): I/O faults (`io-eio`,
 `io-read-mistake`, `io-latency`, `disk-full`, `dm-flakey*`), network faults
 (`network-partition-one`, `network-partition-write-quorum-loss`,
 `network-delay/loss/corrupt/duplicate`), pod faults (`pod-kill-one`,
 `pod-failure`, `pod-crash-versioned-hot`), stress (`stress-cpu`,
-`stress-memory`), and the `warp-under-chaos` benchmark campaign. A further
-seven catalog entries are roadmap placeholders with status `Planned`
-(`quorum-p-*-io-fault`, `fresh-volume-replacement`, admin decommission and
+`stress-memory`), typed volume quorum (`quorum-p-io-fault`,
+`quorum-p-plus-one-io-fault`), and the `warp-under-chaos` benchmark campaign.
+Each typed volume quorum run captures bounded RustFS admin health samples before
+its probes/workload and after the workload/controller recheck; both samples
+require every non-target drive to be healthy and do not claim continuous health.
+A further five catalog entries are roadmap placeholders with status `Planned`
+(`fresh-volume-replacement`, admin decommission and
 rebalance, `on-disk-bitrot`, `stale-disk-return-detect`): they appear in
 `cargo run --bin s3chaos -- fault-catalog-json` but are filtered out of
 `make fault-list` and rejected by preflight and suite validation.
@@ -93,6 +97,9 @@ healthy-cluster scenario. Long-running campaigns remain suite orchestration,
 not a fault backend or scenario family.
 The ordered durability work queue and its safety prerequisites remain in
 [`docs/DURABILITY_FAULT_TESTING_TODO.md`](docs/DURABILITY_FAULT_TESTING_TODO.md).
+Volume-quorum runs require matching RustFS non-target drive-health observations
+before and after the workload. These endpoint guards are not continuous health
+monitoring; live qualification is still required before release gating.
 
 Ready-to-run suites under [`fault/examples/`](fault/examples/) keep different
 execution environments and verdicts separate:

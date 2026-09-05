@@ -24,12 +24,15 @@ use crate::{
         pods::rustfs_target_inventory,
         preflight::{PreflightCheck, PreflightPhase, TargetProof},
         reporting::FailureSummary,
-        scenarios::{FaultBackend, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO},
+        scenarios::{
+            FaultBackend, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
+            QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, requires_prefault_multipart_staging,
+        },
         workload::S3WorkloadClient,
     },
     framework::resources,
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 
 use super::access::{
@@ -37,8 +40,9 @@ use super::access::{
     wait_for_stable_rustfs_pods,
 };
 use super::targets::{
-    fixed_volume_target_count, plan_requires_volume_bindings, require_write_quorum_loss_topology,
-    write_quorum_partition_target_count,
+    plan_requires_volume_bindings, require_volume_quorum_topology,
+    require_write_quorum_loss_topology, requires_fixed_volume_runtime_proof,
+    volume_quorum_boundary, write_quorum_partition_target_count,
 };
 use super::{FaultRun, PreparedWorkload, ProvenTarget, write_preflight_summary};
 use crate::fault::backends::runtime::{
@@ -439,7 +443,7 @@ impl FaultRun<'_> {
         let workload_plan = &self.context.workload_plan;
         let events = &self.context.events;
         let history = &self.context.history;
-        if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
+        if requires_prefault_multipart_staging(&plan.scenario) {
             events.record(
                 "multipart-stage",
                 RunEventStatus::Started,
@@ -504,7 +508,7 @@ impl FaultRun<'_> {
         let target_inventory = match rustfs_target_inventory(
             cluster,
             plan_requires_volume_bindings(plan),
-            fixed_volume_target_count(plan).is_some(),
+            requires_fixed_volume_runtime_proof(plan),
         ) {
             Ok(inventory) => inventory,
             Err(error) => {
@@ -531,6 +535,7 @@ impl FaultRun<'_> {
         let mut target_proof = TargetProof::from_plan(config, scenario, spec, plan, run_id)
             .with_resolved_pod_proofs(target_inventory.pod_proofs);
         let mut topology_observed_at_ms = None;
+        let mut execution_injection = plan.fault().clone();
         if plan.scenario == NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO {
             events.record(
                 "write-quorum-loss-topology-proof",
@@ -586,6 +591,72 @@ impl FaultRun<'_> {
                 observation.observed_at_ms,
             )?;
         }
+        if matches!(
+            plan.scenario.as_str(),
+            QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+        ) {
+            events.record(
+                "volume-quorum-topology-proof",
+                RunEventStatus::Started,
+                "binding the typed quorum boundary to live RustFS drives and Kubernetes volumes",
+                None,
+            )?;
+            let boundary = volume_quorum_boundary(plan)
+                .context("volume quorum scenario lacks a semantic runtime quorum selector")?;
+            let volume_path = plan.fault().rustfs_volume_path()?;
+            let observation = match require_volume_quorum_topology(
+                config,
+                endpoint,
+                access_key,
+                secret_key,
+                boundary,
+                &target_proof.resolved_pods,
+                volume_path,
+            )
+            .await
+            {
+                Ok(observation) => observation,
+                Err(error) => {
+                    preflight_phases.push(PreflightPhase::new(
+                        "volume-quorum-topology-proof",
+                        vec![PreflightCheck::failed(
+                            "volume_quorum_topology",
+                            error.to_string(),
+                            crate::fault::reporting::ResponsibilityDomain::Environment,
+                        )],
+                    ));
+                    write_preflight_summary(collector, scenario, config, run_id, preflight_phases)
+                        .ok();
+                    self.record_failure(
+                        "volume-quorum-topology-proof",
+                        "test_or_environment",
+                        &error,
+                        None,
+                        None,
+                    )?;
+                    return Err(error);
+                }
+            };
+            topology_observed_at_ms = Some(observation.topology.observed_at_ms);
+            target_proof = target_proof.with_erasure_set_topology_proven(
+                observation.topology.shape.clone(),
+                observation.topology.health,
+                observation.topology.membership.clone(),
+                observation.topology.deployment_id.clone(),
+                observation.topology.observed_at_ms,
+            )?;
+            target_proof =
+                target_proof.with_volume_quorum_proven(observation.volume_quorum.clone())?;
+            execution_injection = plan
+                .fault()
+                .resolve_runtime_quorum(&observation.topology.shape)?;
+            events.record(
+                "volume-quorum-topology-proof",
+                RunEventStatus::Succeeded,
+                "runtime quorum count and complete drive-to-volume candidate set were proven",
+                Some(serde_json::to_value(&observation)?),
+            )?;
+        }
         let host_storage_proof = self.prove_host_storage(preflight_phases).await?;
         collector.write_text(
             scenario.case_name,
@@ -612,6 +683,7 @@ impl FaultRun<'_> {
             target_proof,
             topology_observed_at_ms,
             host_storage_proof,
+            execution_injection,
         })
     }
     pub(super) async fn prove_host_storage(
