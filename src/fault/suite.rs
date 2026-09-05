@@ -785,7 +785,10 @@ mod tests {
     use crate::fault::{
         plan::FaultInjectionParameters,
         reporting::{FailureClassification, FailureSeverity, ResponsibilityDomain},
-        scenarios::{DetectorQualification, QUORUM_P_IO_FAULT_SCENARIO},
+        scenarios::{
+            ADMIN_DECOMMISSION_SCENARIO, ADMIN_REBALANCE_SCENARIO, DetectorQualification,
+            QUORUM_P_IO_FAULT_SCENARIO,
+        },
     };
 
     #[test]
@@ -1269,21 +1272,27 @@ scenarios:
 
     #[test]
     fn rejects_planned_scenario_names() {
-        let suite = serde_yaml_ng::from_str::<FaultSuite>(&format!(
-            r#"
+        for scenario in [
+            QUORUM_P_IO_FAULT_SCENARIO,
+            ADMIN_DECOMMISSION_SCENARIO,
+            ADMIN_REBALANCE_SCENARIO,
+        ] {
+            let suite = serde_yaml_ng::from_str::<FaultSuite>(&format!(
+                r#"
 apiVersion: rustfs.com/s3chaos/v1alpha1
 kind: FaultSuite
 metadata:
   name: rustfs-smoke
 scenarios:
-  - name: {QUORUM_P_IO_FAULT_SCENARIO}
+  - name: {scenario}
 "#
-        ))
-        .expect("suite yaml");
+            ))
+            .expect("suite yaml");
 
-        let error = suite.resolve().expect_err("planned scenario");
+            let error = suite.resolve().expect_err("planned scenario");
 
-        assert!(error.to_string().contains("not executable"));
+            assert!(error.to_string().contains("not executable"));
+        }
     }
 
     #[test]

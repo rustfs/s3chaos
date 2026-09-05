@@ -12,15 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::rustfs::RustfsAdminTransport;
 use anyhow::{Context, Result};
-use aws_credential_types::Credentials;
-use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningSettings, sign};
-use aws_sigv4::sign::v4;
-use http::{Method, Request};
+use http::Method;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use std::time::{Duration, SystemTime};
 
 use crate::protocol::credentials::{ActorCredential, AdminCredentials};
 use crate::protocol::ports::{
@@ -35,9 +31,7 @@ type AdminResult<T> = std::result::Result<T, ProtocolAdminError>;
 #[derive(Debug, Clone)]
 pub struct RustfsAdminClient {
     endpoint: String,
-    region: String,
-    credentials: AdminCredentials,
-    http: reqwest::Client,
+    transport: RustfsAdminTransport,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,17 +54,20 @@ impl RustfsAdminClient {
         credentials: AdminCredentials,
     ) -> Result<Self> {
         let endpoint = endpoint.into().trim_end_matches('/').to_string();
+        let region = region.into();
         reqwest::Url::parse(&endpoint)
             .with_context(|| format!("parse RustFS admin endpoint {endpoint}"))?;
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .context("build RustFS admin HTTP client")?;
+        let transport = RustfsAdminTransport::new(
+            &endpoint,
+            &region,
+            credentials.access_key(),
+            credentials.secret_key(),
+            credentials.session_token(),
+            "s3chaos-protocol-admin-env",
+        )?;
         Ok(Self {
             endpoint,
-            region: region.into(),
-            credentials,
-            http,
+            transport,
         })
     }
 
@@ -394,92 +391,27 @@ impl RustfsAdminClient {
         if !path.starts_with('/') {
             return Err(ProtocolAdminError::protocol("InvalidAdminRequestPath"));
         }
-        let mut url = reqwest::Url::parse(&format!("{}{}{}", self.endpoint, ADMIN_PREFIX, path))
-            .map_err(|_| ProtocolAdminError::protocol("InvalidAdminRequestUrl"))?;
-        if !query.is_empty() {
-            url.query_pairs_mut().extend_pairs(query.iter().copied());
-        }
-
-        let payload_sha256 = hex::encode(Sha256::digest(&body));
-        let mut request = Request::builder()
-            .method(method.clone())
-            .uri(url.as_str())
-            .header("x-amz-content-sha256", payload_sha256);
-        if let Some(content_type) = content_type {
-            request = request.header(http::header::CONTENT_TYPE, content_type);
-        }
-        let mut request = request
-            .body(body)
-            .map_err(|_| ProtocolAdminError::protocol("BuildAdminRequest"))?;
-        self.sign(&mut request)?;
-
-        let (parts, body) = request.into_parts();
         let response = self
-            .http
-            .request(method, url)
-            .headers(parts.headers)
-            .body(body)
-            .send()
+            .transport
+            .request(
+                method,
+                &format!("{ADMIN_PREFIX}{path}"),
+                query,
+                body,
+                content_type,
+            )
             .await
             .map_err(|_| ProtocolAdminError::transport("AdminTransportError"))?;
-        let status = response.status();
-        let request_id = response
-            .headers()
-            .get("x-amz-request-id")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let response_body = response
-            .bytes()
-            .await
-            .map_err(|_| ProtocolAdminError::transport("AdminResponseBodyError"))?;
-        if !status.is_success() {
-            let code = protocol_error_code(&response_body)
+        if !(200..300).contains(&response.status) {
+            let code = protocol_error_code(&response.body)
                 .unwrap_or_else(|| "AdminRequestFailed".to_string());
             return Err(ProtocolAdminError::service(
                 code,
-                status.as_u16(),
-                request_id,
+                response.status,
+                response.request_id,
             ));
         }
-        Ok(response_body.to_vec())
-    }
-
-    fn sign(&self, request: &mut Request<Vec<u8>>) -> AdminResult<()> {
-        let identity = Credentials::new(
-            self.credentials.access_key(),
-            self.credentials.secret_key(),
-            self.credentials.session_token().map(str::to_string),
-            None,
-            "s3chaos-protocol-admin-env",
-        )
-        .into();
-        let params = v4::SigningParams::builder()
-            .identity(&identity)
-            .region(&self.region)
-            .name("s3")
-            .time(SystemTime::now())
-            .settings(SigningSettings::default())
-            .build()
-            .map_err(|_| ProtocolAdminError::protocol("BuildAdminSigningParameters"))?
-            .into();
-        let headers = request.headers().iter().map(|(name, value)| {
-            (
-                name.as_str(),
-                value.to_str().expect("admin request headers are ASCII"),
-            )
-        });
-        let signable = SignableRequest::new(
-            request.method().as_str(),
-            request.uri().to_string(),
-            headers,
-            SignableBody::Bytes(request.body()),
-        )
-        .map_err(|_| ProtocolAdminError::protocol("BuildSignableAdminRequest"))?;
-        let (instructions, _) = sign(signable, &params)
-            .map_err(|_| ProtocolAdminError::protocol("SignAdminRequest"))?
-            .into_parts();
-        instructions.apply_to_request_http1x(request);
-        Ok(())
+        Ok(response.body)
     }
 }
 

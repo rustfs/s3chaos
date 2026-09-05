@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Narrow, read-only adapters for runtime facts shared by fault and protocol
-//! workflows. Mutation-capable protocol administration stays in `protocol`.
+//! Shared signed RustFS admin transport plus narrow runtime facts. Product
+//! workflows own mutation policy; this module only provides HTTP mechanics.
 
 use anyhow::{Context, Result, bail, ensure};
 use aws_credential_types::Credentials;
@@ -25,6 +25,151 @@ use sha2::{Digest, Sha256};
 use std::time::{Duration, SystemTime};
 
 const ADMIN_INFO_PATH: &str = "/rustfs/admin/v3/info";
+
+#[derive(Clone)]
+pub(crate) struct RustfsAdminTransport {
+    endpoint: String,
+    region: String,
+    access_key: String,
+    secret_key: String,
+    session_token: Option<String>,
+    source: &'static str,
+    http: reqwest::Client,
+}
+
+pub(crate) struct RustfsAdminResponse {
+    pub status: u16,
+    pub request_id: Option<String>,
+    pub body: Vec<u8>,
+}
+
+impl std::fmt::Debug for RustfsAdminTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RustfsAdminTransport")
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("access_key", &"[REDACTED]")
+            .field("secret_key", &"[REDACTED]")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+impl RustfsAdminTransport {
+    pub(crate) fn new(
+        endpoint: &str,
+        region: &str,
+        access_key: &str,
+        secret_key: &str,
+        session_token: Option<&str>,
+        source: &'static str,
+    ) -> Result<Self> {
+        let endpoint = endpoint.trim_end_matches('/').to_string();
+        let parsed = reqwest::Url::parse(&endpoint)
+            .with_context(|| format!("parse RustFS admin endpoint {endpoint}"))?;
+        ensure!(
+            matches!(parsed.scheme(), "http" | "https")
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.path() == "/"
+                && parsed.query().is_none()
+                && parsed.fragment().is_none(),
+            "RustFS admin endpoint must be an HTTP(S) origin without credentials, query, or fragment"
+        );
+        ensure!(
+            !region.trim().is_empty(),
+            "RustFS admin region must not be empty"
+        );
+        ensure!(
+            !access_key.is_empty() && !secret_key.is_empty(),
+            "RustFS admin credentials must not be empty"
+        );
+        Ok(Self {
+            endpoint,
+            region: region.to_string(),
+            access_key: access_key.to_string(),
+            secret_key: secret_key.to_string(),
+            session_token: session_token.map(str::to_string),
+            source,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+                .context("build RustFS admin HTTP client")?,
+        })
+    }
+
+    pub(crate) async fn request(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> Result<RustfsAdminResponse> {
+        ensure!(
+            path.starts_with('/'),
+            "RustFS admin request path must be absolute"
+        );
+        let mut url = reqwest::Url::parse(&self.endpoint).context("parse RustFS admin endpoint")?;
+        url.set_path(path);
+        url.set_query(None);
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query.iter().copied());
+        }
+        let payload_sha256 = hex::encode(Sha256::digest(&body));
+        let mut request = Request::builder()
+            .method(method.clone())
+            .uri(url.as_str())
+            .header("x-amz-content-sha256", payload_sha256);
+        if let Some(content_type) = content_type {
+            request = request.header(http::header::CONTENT_TYPE, content_type);
+        }
+        let mut request = request.body(body).context("build RustFS admin request")?;
+        sign_request(
+            &mut request,
+            &self.region,
+            &self.access_key,
+            &self.secret_key,
+            self.session_token.as_deref(),
+            self.source,
+        )?;
+        let (parts, body) = request.into_parts();
+        let response = self
+            .http
+            .request(method, url)
+            .headers(parts.headers)
+            .body(body)
+            .send()
+            .await
+            .context("send RustFS admin request")?;
+        let status = response.status().as_u16();
+        let request_id = ["x-amz-request-id", "x-request-id"]
+            .into_iter()
+            .find_map(|name| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            });
+        let body = response
+            .bytes()
+            .await
+            .context("read RustFS admin response")?
+            .to_vec();
+        Ok(RustfsAdminResponse {
+            status,
+            request_id,
+            body,
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -105,51 +250,24 @@ pub(crate) async fn read_erasure_layout(
     access_key: &str,
     secret_key: &str,
 ) -> Result<RustfsErasureLayout> {
-    let endpoint = endpoint.trim_end_matches('/');
-    let mut url = reqwest::Url::parse(endpoint)
-        .with_context(|| format!("parse RustFS runtime endpoint {endpoint}"))?;
-    url.set_path(ADMIN_INFO_PATH);
-    url.set_query(None);
-
-    let body = Vec::new();
-    let payload_sha256 = hex::encode(Sha256::digest(&body));
-    let mut request = Request::builder()
-        .method(Method::GET)
-        .uri(url.as_str())
-        .header("x-amz-content-sha256", payload_sha256)
-        .body(body)
-        .context("build RustFS runtime info request")?;
-    sign_request(&mut request, region, access_key, secret_key)?;
-
-    let (parts, body) = request.into_parts();
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .context("build RustFS runtime info HTTP client")?
-        .request(Method::GET, url)
-        .headers(parts.headers)
-        .body(body)
-        .send()
-        .await
-        .context("send RustFS runtime info request")?;
-    let status = response.status();
-    let request_id = response
-        .headers()
-        .get("x-amz-request-id")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
-    let response = response
-        .bytes()
-        .await
-        .context("read RustFS runtime info response")?;
-    if !status.is_success() {
+    let response = RustfsAdminTransport::new(
+        endpoint,
+        region,
+        access_key,
+        secret_key,
+        None,
+        "s3chaos-rustfs-runtime-info",
+    )?
+    .request(Method::GET, ADMIN_INFO_PATH, &[], Vec::new(), None)
+    .await?;
+    if !(200..300).contains(&response.status) {
         bail!(
             "RustFS runtime info request failed: status={} request_id={request_id}",
-            status.as_u16()
+            response.status,
+            request_id = response.request_id.as_deref().unwrap_or("unknown")
         );
     }
-    parse_erasure_layout(&response)
+    parse_erasure_layout(&response.body)
 }
 
 fn sign_request(
@@ -157,13 +275,15 @@ fn sign_request(
     region: &str,
     access_key: &str,
     secret_key: &str,
+    session_token: Option<&str>,
+    source: &'static str,
 ) -> Result<()> {
     let identity = Credentials::new(
         access_key,
         secret_key,
+        session_token.map(str::to_string),
         None,
-        None,
-        "s3chaos-rustfs-runtime-info",
+        source,
     )
     .into();
     let params = v4::SigningParams::builder()
@@ -173,7 +293,7 @@ fn sign_request(
         .time(SystemTime::now())
         .settings(SigningSettings::default())
         .build()
-        .context("build RustFS runtime info signing parameters")?
+        .context("build RustFS admin signing parameters")?
         .into();
     let headers = request
         .headers()
@@ -181,9 +301,7 @@ fn sign_request(
         .map(|(name, value)| {
             Ok((
                 name.as_str(),
-                value
-                    .to_str()
-                    .context("RustFS runtime info header is not ASCII")?,
+                value.to_str().context("RustFS admin header is not ASCII")?,
             ))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -193,9 +311,9 @@ fn sign_request(
         headers.into_iter(),
         SignableBody::Bytes(request.body()),
     )
-    .context("build signable RustFS runtime info request")?;
+    .context("build signable RustFS admin request")?;
     let (instructions, _) = sign(signable, &params)
-        .context("sign RustFS runtime info request")?
+        .context("sign RustFS admin request")?
         .into_parts();
     instructions.apply_to_request_http1x(request);
     Ok(())
@@ -256,7 +374,35 @@ fn parse_erasure_layout(response: &[u8]) -> Result<RustfsErasureLayout> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_erasure_layout;
+    use super::{RustfsAdminTransport, parse_erasure_layout};
+
+    #[test]
+    fn admin_transport_rejects_ambiguous_endpoint_and_redacts_credentials() {
+        assert!(
+            RustfsAdminTransport::new(
+                "https://rustfs.example/base",
+                "us-east-1",
+                "access",
+                "secret",
+                None,
+                "test",
+            )
+            .is_err()
+        );
+        let transport = RustfsAdminTransport::new(
+            "https://rustfs.example",
+            "us-east-1",
+            "visible-access",
+            "visible-secret",
+            Some("visible-token"),
+            "test",
+        )
+        .expect("transport");
+        let debug = format!("{transport:?}");
+        assert!(!debug.contains("visible-access"));
+        assert!(!debug.contains("visible-secret"));
+        assert!(!debug.contains("visible-token"));
+    }
 
     #[test]
     fn parses_runtime_erasure_layout_and_drive_health() {

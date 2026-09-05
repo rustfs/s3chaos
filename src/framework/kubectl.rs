@@ -33,6 +33,15 @@ impl Kubectl {
         self
     }
 
+    pub(crate) fn cluster_scoped(mut self) -> Self {
+        self.namespace = None;
+        self
+    }
+
+    pub(crate) fn context(&self) -> &str {
+        &self.context
+    }
+
     pub fn command<I, S>(&self, args: I) -> CommandSpec
     where
         I: IntoIterator<Item = S>,

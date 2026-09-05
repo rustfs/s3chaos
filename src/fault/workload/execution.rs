@@ -437,8 +437,12 @@ async fn execute_mixed_operation(
             } else {
                 result.unconfirmed_puts.push(spec);
             }
-            let abort_object =
-                ObjectSpec::prepare_seeded(run_id, plan.object_count + index, 4 * 1024, seed);
+            let abort_object = ObjectSpec::prepare_seeded(
+                run_id,
+                plan.object_count + index,
+                super::ABORTED_MULTIPART_FIXTURE_BYTES as usize,
+                seed,
+            );
             result
                 .multipart_aborts
                 .push(s3.abort_multipart_object(&abort_object, history).await?);

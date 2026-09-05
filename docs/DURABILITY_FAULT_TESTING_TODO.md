@@ -170,15 +170,15 @@ guardrails when implementing the ordered TODO below.
   not implemented yet.
   Meaning: current executable catalog scenarios still mostly cover
   inject-recover-verify faults. The stateful RustFS reliability flows remain in
-  the ordered TODO below: quorum P/P+1, fresh volume replacement, admin heal/
-  decommission/rebalance, on-disk bitrot, stale disk, dangling cleanup, and
-  long-run campaigns.
+  the ordered TODO below: quorum P/P+1, fresh volume replacement, heal recovery,
+  admin decommission/rebalance, on-disk bitrot, stale disk, dangling cleanup,
+  and long-run campaigns.
 
-- [ ] TODO: Keep admin operations as scenario-owned product/recovery steps.
-  Meaning: RustFS admin APIs such as heal, decommission, and rebalance should be
-  orchestrated by scenarios and observed through workload/history/checker
-  verdicts. They are not generic fault backend behavior. Decommission needs a
-  multi-pool Tenant shape first.
+- [ ] PARTIAL: Keep admin operations as scenario-owned product/recovery steps.
+  Meaning: decommission/rebalance now have a fault-owned narrow port, typed
+  RustFS signed-HTTP adapter, multi-pool Tenant model, and fail-closed evidence
+  contracts. They remain scenario workflows rather than generic fault backend
+  behavior. Heal is a recovery mode, not a standalone healthy scenario.
 
 ### Console And Reporting Boundary
 
@@ -446,7 +446,39 @@ Reporting only projects this typed checker result into failure-summary fields.
   convergence/non-convergence, but checker/history remain the S3-visible verdict
   source.
 
-### 10. Add Stale Disk, Dangling Cleanup, And Campaign Scenarios
+### 10. Complete Admin Topology Workflows
+
+- [x] DONE: Add typed multi-pool Tenant rendering and RustFS admin topology
+  operations.
+  Meaning: each pool owns its server, volume, storage, placement, and class
+  configuration. The fault-owned adapter supports pool list plus decommission
+  start/status/cancel/clear and rebalance start/status/stop without using an
+  `rc` subprocess or putting scenario policy in the IAM-oriented protocol port.
+
+- [ ] PARTIAL: Add fail-closed decommission/rebalance evidence contracts.
+  Meaning: preflight binds named pools and the fresh Tenant UID's endpoint sets
+  to exact runtime pool IDs/cmdlines without array-order inference; it checks
+  health, mutual exclusion, and the decommission 130% capacity guard plus a
+  bounded workload budget. Timestamped pool lists bound to the same attempt
+  must repeat those checks immediately before the start request and prove the
+  post-terminal health/topology observation.
+  Operation/progress evidence is bound to the current run, case, Tenant UID,
+  and attempt time window and requires a successful terminal state, monotonic
+  scenario-specific state transitions, and before/after topology. Failed,
+  canceled, stopped, mismatched, zero-movement, or incomplete evidence cannot
+  pass.
+
+- [ ] BLOCKED: Keep `admin-decommission` and `admin-rebalance` Planned until the
+  runner supports scenario-owned operation phases.
+  Meaning: the current run plan and artifact validator require one generic
+  `FaultInjection`; marking either admin workflow Executable would claim an
+  end-to-end path that cannot run. Runner integration must create the fresh
+  multi-pool Tenant, keep the S3 workload active while polling, invoke
+  cancel/stop during rollback, persist all three admin artifacts, run the final
+  checker, and receive live RustFS API calibration before an executable suite is
+  added.
+
+### 11. Add Stale Disk, Dangling Cleanup, And Campaign Scenarios
 
 - [ ] TODO: Add disk generation evidence.
   Meaning: stale-disk and fresh-volume flows need PV/PVC/node/device generation,
@@ -466,7 +498,7 @@ Reporting only projects this typed checker result into failure-summary fields.
   periodic full verification and fd/RSS/artifact-size trend gates for release
   qualification.
 
-### 11. Document Network Faults As A Separate Axis
+### 12. Document Network Faults As A Separate Axis
 
 - [ ] TODO: Mark network partitions as availability/consistency coverage, not
   static durability-loss coverage.
@@ -474,7 +506,7 @@ Reporting only projects this typed checker result into failure-summary fields.
   not substitute for stale disk, data shard loss, or ACK-then-lost storage
   physics. Multi-target/asymmetric partition can be tracked separately.
 
-### 12. Keep Physical Power Deferred
+### 13. Keep Physical Power Deferred
 
 - [ ] DEFERRED: Real power-cycle backend and power scenarios.
   Meaning: `single-node-power-cycle-after-ack`,

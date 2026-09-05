@@ -33,6 +33,12 @@ use crate::fault::history::{
     ByteRange, OperationKind, OperationOutcome, OperationRecord, PayloadRef, Recorder,
 };
 
+const S3_WORKLOAD_MUTATION_MAX_ATTEMPTS: u32 = 3;
+const MULTIPART_PART_SIZE_BYTES: u64 = 5 * 1024 * 1024;
+const ABORTED_MULTIPART_FIXTURE_BYTES: u64 = 4 * 1024;
+const RUSTFS_METADATA_RESERVE_BYTES_PER_ATTEMPT: u64 = 1024 * 1024;
+const RUSTFS_MAX_ERASURE_EXPANSION: u64 = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectSpec {
     pub key: String,
@@ -353,6 +359,77 @@ impl WorkloadPlan {
         }
     }
 
+    /// Conservative storage-byte upper bound for one finite mixed workload.
+    ///
+    /// The bound assumes versioning, charges every configured SDK attempt, adds
+    /// a per-request RustFS metadata reserve, and applies the maximum supported
+    /// standard erasure expansion (parity never exceeds data shards). This is
+    /// intentionally stricter than net payload growth: topology operations must
+    /// fail closed instead of exhausting a pool through retries, delete markers,
+    /// multipart staging, shard headers, or version metadata. Prefill is excluded
+    /// because the admin topology snapshot is taken after it completes.
+    pub(crate) fn mixed_write_upper_bound(
+        &self,
+        prefilled_count: usize,
+        mixed_count: usize,
+    ) -> Result<u64> {
+        ensure!(
+            prefilled_count
+                .checked_add(mixed_count)
+                .is_some_and(|count| count <= self.object_count),
+            "finite mixed workload range exceeds workload object_count"
+        );
+        let mut payload_bytes = 0_u64;
+        let mut mutating_requests = 0_u64;
+        for offset in 0..mixed_count {
+            let index = prefilled_count + offset;
+            let operation = self.operation_mix.operation_at(offset);
+            let (mutation_bytes, request_count) = match operation {
+                WorkloadOperation::Put => (self.size_at(index) as u64, 1),
+                WorkloadOperation::Overwrite => {
+                    ensure!(
+                        prefilled_count > 0,
+                        "finite mixed workload cannot overwrite without prefilled objects"
+                    );
+                    let existing = self.existing_object_offset(offset, prefilled_count);
+                    (self.size_at(existing) as u64, 1)
+                }
+                WorkloadOperation::Get | WorkloadOperation::List => (0, 0),
+                WorkloadOperation::Delete => (0, 1),
+                WorkloadOperation::Multipart => {
+                    let size = self.size_at(index) as u64;
+                    let upload_parts = size.max(1).div_ceil(MULTIPART_PART_SIZE_BYTES);
+                    let requests = upload_parts
+                        .checked_add(4)
+                        .context("finite mixed workload multipart request count overflowed")?;
+                    (
+                        size.checked_add(ABORTED_MULTIPART_FIXTURE_BYTES)
+                            .context("finite mixed workload multipart payload overflowed")?,
+                        requests,
+                    )
+                }
+            };
+            payload_bytes = payload_bytes
+                .checked_add(mutation_bytes)
+                .context("finite mixed workload write-byte bound overflowed")?;
+            mutating_requests = mutating_requests
+                .checked_add(request_count)
+                .context("finite mixed workload request-count bound overflowed")?;
+        }
+        let attempts = u64::from(S3_WORKLOAD_MUTATION_MAX_ATTEMPTS);
+        let retried_payload_bytes = payload_bytes
+            .checked_mul(attempts)
+            .context("finite mixed workload retry payload bound overflowed")?;
+        let metadata_bytes = mutating_requests
+            .checked_mul(attempts)
+            .and_then(|count| count.checked_mul(RUSTFS_METADATA_RESERVE_BYTES_PER_ATTEMPT))
+            .context("finite mixed workload metadata bound overflowed")?;
+        retried_payload_bytes
+            .checked_add(metadata_bytes)
+            .and_then(|bytes| bytes.checked_mul(RUSTFS_MAX_ERASURE_EXPANSION))
+            .context("finite mixed workload erasure-expanded bound overflowed")
+    }
+
     fn from_serialized(raw: SerializedWorkloadPlan) -> std::result::Result<Self, String> {
         if raw.generator != Self::GENERATOR {
             return Err(format!("unsupported workload generator {}", raw.generator));
@@ -623,6 +700,10 @@ impl S3WorkloadClient {
             .await;
         let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
             .force_path_style(true)
+            .retry_config(
+                aws_sdk_s3::config::retry::RetryConfig::standard()
+                    .with_max_attempts(S3_WORKLOAD_MUTATION_MAX_ATTEMPTS),
+            )
             .build();
 
         Ok(Self {
@@ -1250,7 +1331,11 @@ impl S3WorkloadClient {
             completed_parts: Vec::new(),
         };
         let result: Result<bool> = async {
-            for (index, chunk) in object.body.chunks(5 * 1024 * 1024).enumerate() {
+            for (index, chunk) in object
+                .body
+                .chunks(MULTIPART_PART_SIZE_BYTES as usize)
+                .enumerate()
+            {
                 let Some(part) = self
                     .upload_part(
                         &staged.spec.key,
@@ -1839,8 +1924,9 @@ fn sdk_error_status<E>(error: &SdkError<E>) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ObjectSpec, SplitMix64, WorkloadHotspot, WorkloadOperation, WorkloadOperationMix,
-        WorkloadPayloadClass, WorkloadPayloadDistribution, WorkloadPlan, sha256_hex,
+        ObjectSpec, S3_WORKLOAD_MUTATION_MAX_ATTEMPTS, SplitMix64, WorkloadHotspot,
+        WorkloadOperation, WorkloadOperationMix, WorkloadPayloadClass, WorkloadPayloadDistribution,
+        WorkloadPlan, sha256_hex,
     };
 
     #[tokio::test]
@@ -1869,6 +1955,10 @@ mod tests {
         assert_eq!(
             client.client.config().retry_config(),
             original_retry.as_ref()
+        );
+        assert_eq!(
+            original_retry.expect("workload retries").max_attempts(),
+            S3_WORKLOAD_MUTATION_MAX_ATTEMPTS
         );
         assert_eq!(
             quiet
@@ -2036,6 +2126,39 @@ mod tests {
                 "100% hotspot operations should stay inside the hot set"
             );
         }
+    }
+
+    #[test]
+    fn finite_write_bound_charges_retries_versions_delete_markers_multipart_and_overhead() {
+        let plan = WorkloadPlan::seeded_with_profile(
+            42,
+            24,
+            4,
+            WorkloadOperationMix::default(),
+            Some(WorkloadPayloadDistribution {
+                classes: vec![WorkloadPayloadClass {
+                    size_bytes: 1024,
+                    weight: 1,
+                }],
+            }),
+            Some(WorkloadHotspot {
+                object_percent: 1,
+                operation_percent: 100,
+            }),
+        )
+        .expect("finite workload plan");
+
+        // Twelve mixed operations contain two complete operation-mix cycles.
+        // Per cycle: 7 KiB of mutation bodies and eight mutating requests
+        // (PUT, overwrite, delete marker, plus five MPU requests). Each is
+        // charged for three SDK attempts, 1 MiB of metadata per request, and
+        // the maximum 2x RustFS standard-erasure expansion.
+        assert_eq!(
+            plan.mixed_write_upper_bound(12, 12)
+                .expect("finite write bound"),
+            2 * ((14 * 1024 * 3) + (16 * 3 * 1024 * 1024))
+        );
+        assert!(plan.mixed_write_upper_bound(12, 13).is_err());
     }
 
     #[test]

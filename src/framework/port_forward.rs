@@ -17,6 +17,7 @@ use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::framework::{command::CommandSpec, kubectl::Kubectl};
@@ -32,8 +33,32 @@ pub struct PortForwardSpec {
 #[derive(Debug)]
 pub struct PortForwardGuard {
     child: Child,
+    kubectl: Kubectl,
+    spec: PortForwardSpec,
+    started_at_ms: u64,
     log_path: PathBuf,
     command_display: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PortForwardTargetSnapshot {
+    kubernetes_context: String,
+    spec: PortForwardSpec,
+    command_display: String,
+    port_forward_started_at_ms: u64,
+    cluster_started_at_ms: u64,
+    cluster_observed_at_ms: u64,
+    cluster_response_body: String,
+    service_started_at_ms: u64,
+    service_observed_at_ms: u64,
+    service_response_body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KubernetesRawGetSnapshot {
+    started_at_ms: u64,
+    observed_at_ms: u64,
+    response_body: String,
 }
 
 impl PortForwardSpec {
@@ -98,9 +123,13 @@ impl PortForwardSpec {
     ) -> Result<PortForwardGuard> {
         let log_path = log_path.into();
         let command = self.command(kubectl);
+        let started_at_ms = now_ms();
         let child = command.spawn_background_with_log(&log_path)?;
         Ok(PortForwardGuard {
             child,
+            kubectl: kubectl.clone().cluster_scoped(),
+            spec: self.clone(),
+            started_at_ms,
             log_path,
             command_display: command.display(),
         })
@@ -129,6 +158,83 @@ fn available_local_port() -> Result<u16> {
 }
 
 impl PortForwardGuard {
+    pub(crate) fn capture_target(&mut self) -> Result<PortForwardTargetSnapshot> {
+        self.ensure_running()?;
+        let cluster_started_at_ms = now_ms();
+        let cluster = self
+            .kubectl
+            .command(["get", "namespace", "kube-system", "-o", "json"])
+            .run_checked()
+            .context("capture Kubernetes cluster identity namespace")?;
+        let cluster_observed_at_ms = now_ms();
+
+        let service_name = self
+            .spec
+            .service
+            .strip_prefix("svc/")
+            .filter(|name| !name.is_empty())
+            .context("port-forward target is not a named Service")?;
+        let service_started_at_ms = now_ms();
+        let service = self
+            .kubectl
+            .clone()
+            .namespaced(&self.spec.namespace)
+            .command(["get", "service", service_name, "-o", "json"])
+            .run_checked()
+            .with_context(|| {
+                format!(
+                    "capture port-forward Service {}/{}",
+                    self.spec.namespace, service_name
+                )
+            })?;
+        let service_observed_at_ms = now_ms();
+        self.ensure_running()?;
+
+        Ok(PortForwardTargetSnapshot {
+            kubernetes_context: self.kubectl.context().to_string(),
+            spec: self.spec.clone(),
+            command_display: self.command_display.clone(),
+            port_forward_started_at_ms: self.started_at_ms,
+            cluster_started_at_ms,
+            cluster_observed_at_ms,
+            cluster_response_body: cluster.stdout,
+            service_started_at_ms,
+            service_observed_at_ms,
+            service_response_body: service.stdout,
+        })
+    }
+
+    pub(crate) fn capture_namespaced_resource(
+        &mut self,
+        resource: &str,
+        name: &str,
+    ) -> Result<KubernetesRawGetSnapshot> {
+        if resource.trim().is_empty() || name.trim().is_empty() {
+            bail!("port-forward resource capture requires a non-empty resource and name");
+        }
+        self.ensure_running()?;
+        let started_at_ms = now_ms();
+        let output = self
+            .kubectl
+            .clone()
+            .namespaced(&self.spec.namespace)
+            .command(["get", resource, name, "-o", "json"])
+            .run_checked()
+            .with_context(|| {
+                format!(
+                    "capture port-forward owner {resource} {}/{}",
+                    self.spec.namespace, name
+                )
+            })?;
+        let observed_at_ms = now_ms();
+        self.ensure_running()?;
+        Ok(KubernetesRawGetSnapshot {
+            started_at_ms,
+            observed_at_ms,
+            response_body: output.stdout,
+        })
+    }
+
     pub fn log_path(&self) -> &Path {
         &self.log_path
     }
@@ -156,6 +262,57 @@ impl PortForwardGuard {
     pub fn log_contents(&self) -> String {
         fs::read_to_string(&self.log_path).unwrap_or_else(|_| "<unavailable>".to_string())
     }
+}
+
+impl PortForwardTargetSnapshot {
+    pub(crate) fn kubernetes_context(&self) -> &str {
+        &self.kubernetes_context
+    }
+
+    pub(crate) fn spec(&self) -> &PortForwardSpec {
+        &self.spec
+    }
+
+    pub(crate) fn command_display(&self) -> &str {
+        &self.command_display
+    }
+
+    pub(crate) fn port_forward_started_at_ms(&self) -> u64 {
+        self.port_forward_started_at_ms
+    }
+
+    pub(crate) fn cluster_interval_ms(&self) -> (u64, u64) {
+        (self.cluster_started_at_ms, self.cluster_observed_at_ms)
+    }
+
+    pub(crate) fn cluster_response_body(&self) -> &str {
+        &self.cluster_response_body
+    }
+
+    pub(crate) fn service_interval_ms(&self) -> (u64, u64) {
+        (self.service_started_at_ms, self.service_observed_at_ms)
+    }
+
+    pub(crate) fn service_response_body(&self) -> &str {
+        &self.service_response_body
+    }
+}
+
+impl KubernetesRawGetSnapshot {
+    pub(crate) fn interval_ms(&self) -> (u64, u64) {
+        (self.started_at_ms, self.observed_at_ms)
+    }
+
+    pub(crate) fn response_body(&self) -> &str {
+        &self.response_body
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 impl Drop for PortForwardGuard {
