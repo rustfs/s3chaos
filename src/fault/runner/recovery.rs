@@ -392,6 +392,17 @@ impl FaultRun<'_> {
             "fault-evidence.json",
             &serde_json::to_string_pretty(&evidence)?,
         )?;
+        // Artifact validation requires this event to precede the
+        // post-recovery write probe's start, proving the lifecycle evidence
+        // was on disk before the write gate could fail the run.
+        self.context.events.record(
+            "recovery-evidence",
+            RunEventStatus::Succeeded,
+            "fault-evidence.json persisted with the completed fault lifecycle",
+            Some(serde_json::json!({
+                "recovery_ended_at_ms": recovery_ended_at_ms,
+            })),
+        )?;
         Ok(evidence)
     }
 }
@@ -537,7 +548,11 @@ async fn observe_recovery_health(
             };
         let mut readiness = Vec::with_capacity(pods.len());
         for pod in pods {
-            readiness.push(probe_pod_readiness(cluster, &pod.name).await);
+            // Each probe is also capped by the remaining recovery budget so N
+            // Pods cannot push one attempt past the loop's own deadline.
+            let bound =
+                READINESS_PROBE_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
+            readiness.push(probe_pod_readiness(cluster, &pod.name, bound).await);
         }
         report.readiness = readiness;
         if let Some(denied) = report
@@ -593,12 +608,13 @@ async fn observe_recovery_health(
 async fn probe_pod_readiness(
     cluster: &crate::framework::config::ClusterTestConfig,
     pod_name: &str,
+    bound: Duration,
 ) -> PodReadinessProbe {
     let proxy_path = readiness_proxy_path(&cluster.test_namespace, pod_name);
     let observed_at_ms = now_ms();
     let (ready, detail) = match Kubectl::new(cluster)
         .command(["get", "--raw", proxy_path.as_str()])
-        .run_bounded(READINESS_PROBE_TIMEOUT)
+        .run_bounded(bound)
         .await
     {
         Ok(output) if output.code == Some(0) => (true, None),

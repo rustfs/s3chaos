@@ -265,6 +265,28 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn instant_exposes_the_suite_deadline_only_while_budget_remains() {
+        assert!(
+            RunDeadline::default()
+                .instant()
+                .expect("unbounded suite")
+                .is_none()
+        );
+        let deadline = RunDeadline::new(Some(2)).expect("deadline");
+        let at = deadline
+            .instant()
+            .expect("budget remains")
+            .expect("bounded suite has an instant");
+        assert_eq!(
+            at.saturating_duration_since(tokio::time::Instant::now()),
+            std::time::Duration::from_secs(2)
+        );
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        let error = deadline.instant().expect_err("exhausted suite");
+        assert!(error.is::<SuiteDeadlineExceeded>());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn internal_timeout_is_capped_to_remaining_suite_budget() {
         let deadline = RunDeadline::new(Some(3)).expect("deadline");
         tokio::time::advance(std::time::Duration::from_secs(2)).await;

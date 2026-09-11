@@ -205,9 +205,7 @@ async fn run_fault_case(
             deadline
                 .run(run.verify_recovered(&prepared.s3, &mut workload.workload))
                 .await?;
-            deadline
-                .run(run.recommit(&prepared.s3, &mut workload.workload))
-                .await?;
+            run.recommit(&prepared.s3, &mut workload.workload).await?;
             deadline
                 .run(run.verify_final(&prepared.s3, &workload.workload, &mut evidence))
                 .await

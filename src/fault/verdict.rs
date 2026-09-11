@@ -698,9 +698,10 @@ impl FailurePhase {
             | "pod-stability-after-recovery"
             | "s3-access-after-recovery"
             | "recovery-health"
+            | "recovery-evidence"
             | "post-recovery-write"
             | "recommit-unconfirmed" => Self::Recovery,
-            "availability-read-probe" | "availability" => Self::Workload,
+            "availability-endpoint" | "availability-read-probe" | "availability" => Self::Workload,
             "checker-pre-recommit"
             | "checker-pre-recommit-verdict"
             | "checker-final"

@@ -35,7 +35,8 @@ pub const DEFAULT_RUSTFS_VOLUME_PATH: &str = "/data/rustfs0";
 pub const DEFAULT_RUSTFS_POD_STABLE_WINDOW_SECONDS: u64 = 60;
 pub const DEFAULT_FAULT_DURATION_SECONDS: u64 = 7_200;
 pub const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
-pub const DEFAULT_MIN_AVAILABILITY_PERCENT: u8 = 99;
+pub const DEFAULT_MIN_AVAILABILITY_PERCENT: u8 =
+    crate::fault::scenarios::AVAILABILITY_FLOOR_PERCENT;
 pub const DEFAULT_ACK_OPERATION_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_ACK_TO_FAULT_MS: u64 = 1_000;
 pub const DEFAULT_MAX_ACK_TO_FAULT_MS: u64 = MAX_ACK_TO_FAULT_MS;
@@ -337,9 +338,12 @@ impl FaultTestConfig {
                     "RUSTFS_FAULT_TEST_MIN_AVAILABILITY_PERCENT",
                     DEFAULT_MIN_AVAILABILITY_PERCENT,
                 )?;
+                // The env override may tighten the catalog floor for a run but
+                // never relax it: a lower floor would let the availability
+                // report validate against a threshold the catalog never agreed to.
                 ensure!(
-                    percent <= 100,
-                    "RUSTFS_FAULT_TEST_MIN_AVAILABILITY_PERCENT must be between 0 and 100"
+                    (DEFAULT_MIN_AVAILABILITY_PERCENT..=100).contains(&percent),
+                    "RUSTFS_FAULT_TEST_MIN_AVAILABILITY_PERCENT must be between {DEFAULT_MIN_AVAILABILITY_PERCENT} (the catalog availability floor) and 100"
                 );
                 percent
             },
@@ -963,6 +967,42 @@ mod tests {
                 "{variable} must reject zero: {message}"
             );
         }
+    }
+
+    #[test]
+    fn availability_floor_override_may_only_raise_the_catalog_floor() {
+        let with_floor = |value: &str| {
+            let value = value.to_string();
+            FaultTestConfig::from_env_with(
+                move |name| match name {
+                    "RUSTFS_FAULT_TEST_STORAGE_CLASS" => Some("local-storage".to_string()),
+                    "RUSTFS_FAULT_TEST_SERVER_IMAGE" => Some("rustfs/rustfs:test".to_string()),
+                    "RUSTFS_FAULT_TEST_MIN_AVAILABILITY_PERCENT" => Some(value.clone()),
+                    _ => None,
+                },
+                "real-cluster".to_string(),
+            )
+        };
+        assert_eq!(
+            with_floor("100")
+                .expect("tightened floor")
+                .min_availability_percent,
+            100
+        );
+        assert_eq!(
+            with_floor("99")
+                .expect("catalog floor")
+                .min_availability_percent,
+            super::DEFAULT_MIN_AVAILABILITY_PERCENT
+        );
+        for lowered in ["98", "50", "1", "0"] {
+            let message = with_floor(lowered).unwrap_err().to_string();
+            assert!(
+                message.contains("must be between 99 (the catalog availability floor) and 100"),
+                "{lowered}: {message}"
+            );
+        }
+        assert!(with_floor("101").is_err());
     }
 
     #[test]

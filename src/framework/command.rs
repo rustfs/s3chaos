@@ -236,6 +236,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_bounded_treats_output_followed_by_a_hang_as_a_timeout() {
+        // Partial output must never be reported as a completed probe.
+        let error = CommandSpec::new("sh")
+            .args(["-c", "printf ready; sleep 30"])
+            .run_bounded(std::time::Duration::from_millis(200))
+            .await
+            .expect_err("a command that hangs after printing has not finished");
+
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+    }
+
+    #[tokio::test]
     async fn run_bounded_returns_output_of_a_finished_command() {
         let output = CommandSpec::new("sh")
             .args(["-c", "printf out; printf err >&2; exit 3"])

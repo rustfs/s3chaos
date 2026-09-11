@@ -117,7 +117,7 @@ impl RecoveryHealthBaseline {
     /// the drive count the declared erasure geometry implies. A report whose
     /// baseline silently dropped a drive therefore cannot certify recovery
     /// even when its observation agrees with that shrunken baseline.
-    pub(crate) fn validate(&self) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         ensure!(
             self.observed_at_ms > 0,
             "baseline observation timestamp is zero"

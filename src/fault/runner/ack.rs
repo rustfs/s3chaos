@@ -399,6 +399,16 @@ impl FaultRun<'_> {
             "fault-evidence.json",
             &serde_json::to_string_pretty(&evidence)?,
         )?;
+        // Ordered before the post-recovery write probe; see
+        // `write_recovery_evidence`.
+        self.context.events.record(
+            "recovery-evidence",
+            RunEventStatus::Succeeded,
+            "fault-evidence.json persisted with the completed quiet-mutation lifecycle",
+            Some(serde_json::json!({
+                "recovery_ended_at_ms": evidence.recovery_ended_at_ms,
+            })),
+        )?;
         Ok(evidence)
     }
 }

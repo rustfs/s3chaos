@@ -361,7 +361,20 @@ impl FaultImpactPolicy {
     pub fn requires_availability(self) -> bool {
         matches!(self, Self::AvailabilityRequired)
     }
+
+    /// The catalog's minimum per-family success floor for availability
+    /// scenarios. Configuration may raise it for a run, never lower it, and
+    /// artifact validation rejects a report that claims a lower floor.
+    pub fn availability_floor_percent(self) -> Option<u8> {
+        self.requires_availability()
+            .then_some(AVAILABILITY_FLOOR_PERCENT)
+    }
 }
+
+/// Catalog floor for `availability-required` scenarios: a pre-calibration
+/// margin of one percent for port-forward reconnects. Live calibration may
+/// tighten it to 100 through `RUSTFS_FAULT_TEST_MIN_AVAILABILITY_PERCENT`.
+pub const AVAILABILITY_FLOOR_PERCENT: u8 = 99;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct FaultScenarioSpec {

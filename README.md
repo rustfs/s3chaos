@@ -174,9 +174,11 @@ redundancy (`pod-kill-one`, `pod-failure`, `network-partition-one`) carry the
 `availability-required` impact policy: every prefilled object must read back
 with its committed hash while the fault is active and each mixed-workload
 operation family must reach `RUSTFS_FAULT_TEST_MIN_AVAILABILITY_PERCENT`
-(default 99; a floor below 100 always tolerates one disrupted operation per
-family) non-disrupted operations (`availability-report.json`, classification
-`availability_regression`). Because a `kubectl port-forward` stays pinned to
+non-disrupted operations (`availability-report.json`, classification
+`availability_regression`). The catalog floor is 99; the variable may only
+raise it. A floor below 100 tolerates one disrupted operation per family, and
+a family with fewer than 20 operations under the fault is not evidence and
+fails closed. Because a `kubectl port-forward` stays pinned to
 one Pod, the runner re-pins the S3 endpoint to a surviving Pod that the Chaos
 Mesh controller did not target once the fault is active, so the contract
 measures a client attached to a healthy node; ClusterIP endpoints need no

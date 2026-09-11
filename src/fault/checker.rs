@@ -4850,6 +4850,32 @@ mod tests {
             corrupted.failure_classification().as_str(),
             "unexpected_listed_object"
         );
+
+        // A failed write that recorded no payload hash cannot authenticate any
+        // bytes, so a readable listed key is never tolerated on its account.
+        let mut hashless_failed = record(
+            "op-2",
+            OperationKind::Put,
+            "hashless",
+            "ignored",
+            OperationOutcome::Failed,
+        );
+        hashless_failed.value_sha256 = None;
+        let hashless_model = object_model(&[hashless_failed]);
+        assert!(!hashless_model.failed_writes.contains_key("hashless"));
+        let mut hashless = empty_report();
+        evaluate_unexplained_listed_key(
+            &mut hashless,
+            &hashless_model,
+            "hashless".to_string(),
+            &readable,
+        );
+        assert!(hashless.failed_writes_materialized.is_empty());
+        assert_eq!(
+            hashless.unexpected_listed_objects,
+            vec!["hashless".to_string()]
+        );
+        assert!(!hashless.success_predicate());
         assert!(!report.success_predicate());
         assert_eq!(
             report.failure_classification().as_str(),

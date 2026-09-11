@@ -388,7 +388,9 @@ guardrails when implementing the ordered TODO below.
   `availability-required` impact policy (rustfs/backlog#2445): a fault-active
   read probe over the prefilled cohort must verify every object and each
   workload family must meet `RUSTFS_FAULT_TEST_MIN_AVAILABILITY_PERCENT`
-  (floors below 100 tolerate at least one disrupted operation per family).
+  (catalog floor 99, which the variable may only raise; floors below 100
+  tolerate one disrupted operation per family; families under 20 operations
+  fail closed as unexercised).
   The port-forward is re-pinned to a surviving Pod after activation because a
   Service forward stays attached to the Pod it started on. The 99% default is
   a pre-calibration margin; live runs must calibrate it before it gates a

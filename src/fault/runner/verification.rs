@@ -166,6 +166,14 @@ impl FaultRun<'_> {
         let workload_plan = &self.context.workload_plan;
         let events = &self.context.events;
         let history = &self.context.history;
+        // Awaited directly rather than under `RunDeadline::run`: a cancelled
+        // re-PUT could be applied by RustFS without a finished history record,
+        // so each mutation is instead capped to the remaining suite budget and
+        // the recommit collects every attempt before returning.
+        let bounded_s3 = match self.deadline.instant()? {
+            Some(deadline) => s3.with_mutation_deadline(deadline),
+            None => s3.clone(),
+        };
         events.record(
             "recommit-unconfirmed",
             RunEventStatus::Started,
@@ -173,7 +181,7 @@ impl FaultRun<'_> {
             Some(serde_json::json!({ "attempted": workload.unconfirmed_puts.len() })),
         )?;
         let recommit_report = recommit_unconfirmed_objects(
-            s3,
+            &bounded_s3,
             history,
             &workload.unconfirmed_puts,
             workload_plan.concurrency,
