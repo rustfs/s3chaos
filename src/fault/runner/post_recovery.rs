@@ -34,6 +34,12 @@ impl FaultRun<'_> {
     /// into its own history file: the workload history is authenticated as a
     /// strict prechecker/recommit/final-checker phase chain, and the ACK
     /// cases additionally require it to stay quiet after the trigger.
+    ///
+    /// Callers await this directly rather than under `RunDeadline::run`: a
+    /// cancelled PUT, DELETE, or multipart request would leave a mutation
+    /// RustFS may have applied without a finished history record. Instead
+    /// every mutation is capped to the remaining suite budget and the probe
+    /// checks the deadline between objects and phases.
     pub(super) async fn probe_post_recovery_writes(&self, s3: &S3WorkloadClient) -> Result<()> {
         let collector = self.collector;
         let scenario = self.scenario;
@@ -41,6 +47,10 @@ impl FaultRun<'_> {
         let workload_plan = &self.context.workload_plan;
         let events = &self.context.events;
         let object_count = post_recovery_object_count(workload_plan.object_count);
+        let s3 = match self.deadline.instant()? {
+            Some(deadline) => s3.with_mutation_deadline(deadline),
+            None => s3.clone(),
+        };
         events.record(
             "post-recovery-write",
             RunEventStatus::Started,
@@ -54,7 +64,7 @@ impl FaultRun<'_> {
             .context("create post-recovery write probe history")?;
         history.set_durability_cohort(DurabilityCohort::PostRecovery);
         let report = match run_post_recovery_write_probe(&PostRecoveryWriteRequest {
-            s3,
+            s3: &s3,
             history: &history,
             run_id,
             seed: workload_plan.seed ^ POST_RECOVERY_SEED_SALT,

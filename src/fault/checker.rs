@@ -145,8 +145,11 @@ pub struct CheckerReport {
     #[serde(default)]
     pub unexpected_listed_objects: Vec<String>,
     /// Keys whose only writes returned a definite failure yet are listed and
-    /// readable after recovery. Recorded for audit; a failed-but-materialized
-    /// write is a legitimate S3 outcome and does not fail the run.
+    /// readable after recovery with exactly the bytes one of those failed
+    /// attempts sent. Recorded for audit; a failed-but-materialized write is
+    /// a legitimate S3 outcome and does not fail the run. A readable listed
+    /// key whose bytes match no attempt is reported in
+    /// `unexpected_listed_objects` instead.
     #[serde(default)]
     pub failed_writes_materialized: Vec<String>,
     #[serde(default)]
@@ -627,7 +630,7 @@ fn validate_successful_checker_observations(
         tolerated_failed_writes == unexplained_listed
             && tolerated_failed_writes
                 .iter()
-                .all(|key| model.failed_writes.contains(key)),
+                .all(|key| model.failed_writes.contains_key(key)),
         "checker tolerated failed-write keys do not match the unexplained keys its final LIST returned"
     );
     expected_current_keys.extend(unexplained_listed.iter().cloned());
@@ -671,8 +674,15 @@ fn validate_successful_checker_observations(
             }
         } else if unexplained_listed.contains(key) {
             ensure!(
-                record.outcome == OperationOutcome::Ok && record.http_status == Some(200),
-                "checker tolerated failed-write key {key} is not authenticated by a readable GET"
+                record.outcome == OperationOutcome::Ok
+                    && record.http_status == Some(200)
+                    && record.value_sha256.as_deref().is_some_and(|observed| {
+                        model
+                            .failed_writes
+                            .get(key)
+                            .is_some_and(|attempted| attempted.contains(observed))
+                    }),
+                "checker tolerated failed-write key {key} is not authenticated by a readable GET matching a failed attempt's payload"
             );
         } else {
             ensure!(
@@ -1518,11 +1528,13 @@ struct ObjectModel {
     // (timeout/unknown): the object may or may not have been removed, so a
     // post-recovery 404 is a legitimate outcome rather than a lost object.
     ambiguous_delete_pending: BTreeSet<String>,
-    // Keys whose PUT or CompleteMultipartUpload returned a definite failure.
-    // S3 allows a failed response for a write that still materialized, so a
-    // listed, readable key with only failed writes is tolerated rather than
-    // reported as an unexplained object.
-    failed_writes: BTreeSet<String>,
+    // Keys whose PUT or CompleteMultipartUpload returned a definite failure,
+    // mapped to the sha256 of every payload those failed attempts sent. S3
+    // allows a failed response for a write that still materialized, so a
+    // listed, readable key is tolerated only when its bytes match one of
+    // these attempts; a failed write without a recorded hash cannot be
+    // authenticated and is not tolerated.
+    failed_writes: BTreeMap<String, BTreeSet<String>>,
     committed_writes: usize,
 }
 
@@ -2077,11 +2089,20 @@ fn evaluate_unexplained_listed_key(
     get: &GetObjectResult,
 ) {
     match (get.outcome, get.body.as_ref()) {
-        (OperationOutcome::Ok, Some(_)) => {
-            if model.failed_writes.contains(&key) {
-                report.failed_writes_materialized.push(key);
-            } else {
-                report.unexpected_listed_objects.push(key);
+        (OperationOutcome::Ok, Some(body)) => {
+            // A failed write is tolerated only when the bytes RustFS now
+            // serves are the bytes one of the failed attempts sent; anything
+            // else is an object no write in history explains.
+            let observed = sha256_hex(body);
+            match model.failed_writes.get(&key) {
+                Some(attempted) if attempted.contains(&observed) => {
+                    report.failed_writes_materialized.push(key);
+                }
+                Some(attempted) => report.unexpected_listed_objects.push(format!(
+                    "{key}: readable bytes sha256={observed} size={} match no failed write attempt {attempted:?}",
+                    body.len()
+                )),
+                None => report.unexpected_listed_objects.push(key),
             }
         }
         (outcome, _) => report.listed_keys_unreadable.push(format!(
@@ -3140,8 +3161,8 @@ fn apply_record_to_model(model: &mut ObjectModel, record: &OperationRecord) {
         OperationKind::Put | OperationKind::CompleteMultipartUpload
             if record.outcome == OperationOutcome::Failed =>
         {
-            if let Some(key) = record.key.clone() {
-                model.failed_writes.insert(key);
+            if let (Some(key), Some(sha256)) = (record.key.clone(), record.value_sha256.clone()) {
+                model.failed_writes.entry(key).or_default().insert(sha256);
             }
         }
         OperationKind::Delete if record.outcome == OperationOutcome::Ok => {
@@ -4735,7 +4756,10 @@ mod tests {
                 OperationOutcome::Failed,
             ),
         ]);
-        assert!(model.failed_writes.contains("failed"));
+        assert_eq!(
+            model.failed_writes.get("failed"),
+            Some(&BTreeSet::from(["d".to_string()]))
+        );
         let listed = BTreeSet::from([
             "live".to_string(),
             "gone".to_string(),
@@ -4755,7 +4779,7 @@ mod tests {
             "op-1",
             OperationKind::Put,
             "failed",
-            "d",
+            &sha256_hex(b"d"),
             OperationOutcome::Failed,
         )]);
         let readable = GetObjectResult {
@@ -4763,6 +4787,12 @@ mod tests {
             http_status: Some(200),
             error: None,
             body: Some(b"d".to_vec()),
+        };
+        let foreign_bytes = GetObjectResult {
+            outcome: OperationOutcome::Ok,
+            http_status: Some(200),
+            error: None,
+            body: Some(b"x".to_vec()),
         };
         let absent = GetObjectResult {
             outcome: OperationOutcome::NotFound,
@@ -4794,6 +4824,31 @@ mod tests {
                 "ghost: NotFound http_status=404".to_string(),
                 "stalled: Timeout".to_string(),
             ]
+        );
+
+        // A failed write whose key now serves bytes no attempt ever sent is
+        // corruption, not a tolerated late materialization.
+        let mut corrupted = empty_report();
+        evaluate_unexplained_listed_key(
+            &mut corrupted,
+            &model,
+            "failed".to_string(),
+            &foreign_bytes,
+        );
+        assert!(corrupted.failed_writes_materialized.is_empty());
+        assert_eq!(corrupted.unexpected_listed_objects.len(), 1);
+        assert!(
+            corrupted.unexpected_listed_objects[0].starts_with(&format!(
+                "failed: readable bytes sha256={} size=1 match no failed write attempt",
+                sha256_hex(b"x")
+            )),
+            "{:?}",
+            corrupted.unexpected_listed_objects
+        );
+        assert!(!corrupted.success_predicate());
+        assert_eq!(
+            corrupted.failure_classification().as_str(),
+            "unexpected_listed_object"
         );
         assert!(!report.success_predicate());
         assert_eq!(
@@ -7439,6 +7494,19 @@ mod tests {
                 .expect_err("a GET the report does not account for")
                 .to_string()
                 .contains("tolerated failed-write keys")
+        );
+
+        // The tolerated GET must return the bytes the failed attempt sent;
+        // a report that tolerates unrelated bytes is not authenticated.
+        let mut foreign_bytes_history = history.clone();
+        foreign_bytes_history[4].value_sha256 = Some(sha256_hex(b"corrupt"));
+        let mut foreign_bytes = report.clone();
+        foreign_bytes.audit = Some(audit(&foreign_bytes_history[2..]));
+        assert!(
+            validate_checker_audit_against_history(&foreign_bytes, &foreign_bytes_history)
+                .expect_err("tolerated key served bytes no failed attempt sent")
+                .to_string()
+                .contains("matching a failed attempt's payload")
         );
 
         let mut missing_get_history = history.clone();

@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
@@ -114,6 +116,51 @@ impl CommandSpec {
         })
     }
 
+    /// Run to completion under a hard wall-clock bound without blocking the
+    /// async executor. The child is killed when the bound expires or the
+    /// future is dropped, so a peer that accepts the connection but never
+    /// answers cannot pin the calling task forever.
+    pub async fn run_bounded(&self, timeout: Duration) -> Result<CommandOutput> {
+        let mut command = tokio::process::Command::new(&self.program);
+        command.args(&self.args).kill_on_drop(true);
+        if let Some(cwd) = &self.cwd {
+            command.current_dir(cwd);
+        }
+        command
+            .stdin(if self.stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to start command: {}", self.display()))?;
+        if let Some(stdin) = &self.stdin {
+            let mut pipe = child.stdin.take().context("failed to open command stdin")?;
+            pipe.write_all(stdin.as_bytes()).await.with_context(|| {
+                format!("failed to write stdin for command: {}", self.display())
+            })?;
+            drop(pipe);
+        }
+        let output = tokio::time::timeout(timeout, child.wait_with_output())
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "command timed out after {}s: {}",
+                    timeout.as_secs_f64(),
+                    self.display()
+                )
+            })?
+            .with_context(|| format!("failed to wait for command: {}", self.display()))?;
+        Ok(CommandOutput {
+            code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
     pub fn spawn_background_with_log(&self, log_path: impl AsRef<Path>) -> Result<Child> {
         if self.stdin.is_some() {
             bail!(
@@ -170,6 +217,35 @@ mod tests {
         let command = CommandSpec::new("kubectl").args(["get", "pods", "-A"]);
 
         assert_eq!(command.display(), "kubectl get pods -A");
+    }
+
+    #[tokio::test]
+    async fn run_bounded_kills_a_hung_command_at_the_bound() {
+        let started = std::time::Instant::now();
+        let error = CommandSpec::new("sleep")
+            .arg("30")
+            .run_bounded(std::time::Duration::from_millis(200))
+            .await
+            .expect_err("a hung command must not outlive its bound");
+
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the bound must cut the wait short"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_bounded_returns_output_of_a_finished_command() {
+        let output = CommandSpec::new("sh")
+            .args(["-c", "printf out; printf err >&2; exit 3"])
+            .run_bounded(std::time::Duration::from_secs(10))
+            .await
+            .expect("command completes");
+
+        assert_eq!(output.code, Some(3));
+        assert_eq!(output.stdout, "out");
+        assert_eq!(output.stderr, "err");
     }
 
     #[test]

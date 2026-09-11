@@ -26,7 +26,7 @@
 //! The observation is a bounded poll, not continuous monitoring: it proves the
 //! cluster reached a healthy state within the recovery timeout.
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::rustfs::RustfsErasureLayout;
@@ -88,23 +88,7 @@ impl RecoveryHealthBaseline {
             }
         }
         server_endpoints.sort();
-        server_endpoints.dedup();
-        ensure!(
-            server_endpoints.len() == layout.servers.len(),
-            "RustFS baseline reports duplicate server endpoints"
-        );
         drive_uuids.sort();
-        let unique = drive_uuids.len();
-        drive_uuids.dedup();
-        ensure!(
-            drive_uuids.len() == unique,
-            "RustFS baseline reports duplicate drive UUIDs"
-        );
-        ensure!(
-            drive_uuids.len() == expected_drives,
-            "RustFS baseline lists {} drives but the erasure layout declares {expected_drives}",
-            drive_uuids.len()
-        );
         ensure!(
             layout.online_drives == expected_drives
                 && layout.offline_drives == 0
@@ -114,7 +98,7 @@ impl RecoveryHealthBaseline {
             layout.offline_drives,
             layout.unknown_drives
         );
-        Ok(Self {
+        let baseline = Self {
             observed_at_ms,
             deployment_id: layout.deployment_id.clone(),
             standard_parity: layout.standard_parity,
@@ -122,7 +106,57 @@ impl RecoveryHealthBaseline {
             drives_per_set: layout.drives_per_set.clone(),
             server_endpoints,
             drive_uuids,
-        })
+        };
+        baseline.validate()?;
+        Ok(baseline)
+    }
+
+    /// Structural invariants a baseline must satisfy whether it was captured
+    /// live or deserialized from an artifact: identities are sorted and
+    /// unique so membership comparison is exact, and the drive set is exactly
+    /// the drive count the declared erasure geometry implies. A report whose
+    /// baseline silently dropped a drive therefore cannot certify recovery
+    /// even when its observation agrees with that shrunken baseline.
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            self.observed_at_ms > 0,
+            "baseline observation timestamp is zero"
+        );
+        ensure!(
+            !self.deployment_id.trim().is_empty(),
+            "RustFS baseline has no deployment identity"
+        );
+        let expected_drives = expected_drive_count(&self.total_sets, &self.drives_per_set)?;
+        ensure!(
+            !self.server_endpoints.is_empty(),
+            "RustFS baseline lists no servers"
+        );
+        ensure!(
+            self.server_endpoints
+                .iter()
+                .all(|endpoint| !endpoint.trim().is_empty()),
+            "RustFS baseline has a server without an endpoint"
+        );
+        ensure!(
+            self.server_endpoints
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "RustFS baseline server endpoints are not sorted and unique"
+        );
+        ensure!(
+            self.drive_uuids.iter().all(|uuid| !uuid.trim().is_empty()),
+            "RustFS baseline has a drive without a UUID"
+        );
+        ensure!(
+            self.drive_uuids.windows(2).all(|pair| pair[0] < pair[1]),
+            "RustFS baseline drive UUIDs are not sorted and unique"
+        );
+        ensure!(
+            self.drive_uuids.len() == expected_drives,
+            "RustFS baseline lists {} drives but the erasure layout declares {expected_drives}",
+            self.drive_uuids.len()
+        );
+        Ok(())
     }
 }
 
@@ -238,6 +272,12 @@ impl RecoveryHealthObservation {
                 self.online_drives, self.offline_drives, self.unknown_drives
             ));
         }
+        if self.drives.len() != expected_drives {
+            violations.push(format!(
+                "observation lists {} drives but the baseline declares {expected_drives}",
+                self.drives.len()
+            ));
+        }
         let mut observed_uuids = self
             .drives
             .iter()
@@ -341,6 +381,12 @@ pub struct RecoveryHealthReport {
 
 impl RecoveryHealthReport {
     pub fn require_success(&self) -> Result<()> {
+        // A deserialized baseline is re-validated here: the observation is
+        // only compared against it, so an inconsistent baseline could
+        // otherwise certify a cluster that agrees with a shrunken layout.
+        self.baseline
+            .validate()
+            .context("recovery-health.json baseline is not a valid healthy layout")?;
         ensure!(
             self.passed && self.success_predicate(),
             "RustFS did not report a fully recovered cluster within {}s after {} attempt(s): {}",
@@ -525,6 +571,60 @@ mod tests {
         let mut reshaped = healthy_layout();
         reshaped.standard_parity = 1;
         assert!(build_report(baseline, &reshaped).require_success().is_err());
+    }
+
+    #[test]
+    fn a_baseline_that_dropped_a_drive_cannot_certify_recovery() {
+        let mut baseline =
+            RecoveryHealthBaseline::from_layout(&healthy_layout(), 1).expect("baseline");
+        // A report edited so baseline and observation agree on three drives
+        // while the declared four-drive geometry is unchanged.
+        baseline.drive_uuids.pop();
+        baseline.server_endpoints.pop();
+        let mut shrunken = healthy_layout();
+        shrunken.servers.pop();
+        shrunken.online_drives = 3;
+        let report = build_report(baseline.clone(), &shrunken);
+        assert!(
+            report.violations.is_empty() && report.passed,
+            "the observation agrees with the shrunken baseline: {:?}",
+            report.violations
+        );
+        let error = report.require_success().expect_err("dropped drive");
+        assert!(
+            format!("{error:#}").contains("lists 3 drives but the erasure layout declares 4"),
+            "{error:#}"
+        );
+        assert!(
+            RecoveryHealthBaseline::from_layout(&shrunken, 1).is_err(),
+            "the live capture rejects the same layout"
+        );
+
+        let mut unsorted =
+            RecoveryHealthBaseline::from_layout(&healthy_layout(), 1).expect("baseline");
+        unsorted.drive_uuids.swap(0, 1);
+        assert!(unsorted.validate().is_err());
+        let mut duplicated =
+            RecoveryHealthBaseline::from_layout(&healthy_layout(), 1).expect("baseline");
+        duplicated.drive_uuids[1] = duplicated.drive_uuids[0].clone();
+        assert!(duplicated.validate().is_err());
+
+        // An observation that lists one drive twice cannot pad its count.
+        let mut padded = healthy_layout();
+        let duplicate = padded.servers[0].drives[0].clone();
+        padded.servers[0].drives.push(duplicate);
+        let report = build_report(
+            RecoveryHealthBaseline::from_layout(&healthy_layout(), 1).expect("baseline"),
+            &padded,
+        );
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|violation| violation.contains("observation lists 5 drives")),
+            "{:?}",
+            report.violations
+        );
     }
 
     #[test]

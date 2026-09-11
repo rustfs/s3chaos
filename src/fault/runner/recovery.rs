@@ -32,6 +32,10 @@ use tokio::time::sleep as async_sleep;
 
 const RECOVERY_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const READINESS_DETAIL_LIMIT: usize = 300;
+/// Hard bound on one `kubectl get --raw` readiness probe, matching the admin
+/// HTTP client's per-request timeout; an API server that accepts the
+/// connection but never answers the Pod proxy must not stall the poll loop.
+const READINESS_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 use super::access::{ensure_s3_access, wait_for_ready_tenant, wait_for_stable_rustfs_pods};
 use super::{
@@ -531,10 +535,11 @@ async fn observe_recovery_health(
                     vec![format!("RustFS admin info unavailable: {error:#}")]
                 }
             };
-        report.readiness = pods
-            .iter()
-            .map(|pod| probe_pod_readiness(cluster, &pod.name))
-            .collect();
+        let mut readiness = Vec::with_capacity(pods.len());
+        for pod in pods {
+            readiness.push(probe_pod_readiness(cluster, &pod.name).await);
+        }
+        report.readiness = readiness;
         if let Some(denied) = report
             .readiness
             .iter()
@@ -582,8 +587,10 @@ async fn observe_recovery_health(
 }
 
 /// `kubectl get --raw` through the API server Pod proxy returns success only
-/// for a 2xx readiness reply, so the exit status is the probe verdict.
-fn probe_pod_readiness(
+/// for a 2xx readiness reply, so the exit status is the probe verdict. The
+/// subprocess is bounded and killed on expiry so the enclosing recovery and
+/// suite deadlines stay able to cancel the poll.
+async fn probe_pod_readiness(
     cluster: &crate::framework::config::ClusterTestConfig,
     pod_name: &str,
 ) -> PodReadinessProbe {
@@ -591,7 +598,8 @@ fn probe_pod_readiness(
     let observed_at_ms = now_ms();
     let (ready, detail) = match Kubectl::new(cluster)
         .command(["get", "--raw", proxy_path.as_str()])
-        .run()
+        .run_bounded(READINESS_PROBE_TIMEOUT)
+        .await
     {
         Ok(output) if output.code == Some(0) => (true, None),
         Ok(output) => (
@@ -656,6 +664,11 @@ mod tests {
         ));
         assert!(!readiness_probe_denied(
             "exit=Some(1) error: connection refused"
+        ));
+        // A probe cut off by its own bound is a Pod that did not answer, not
+        // an API server refusal: it stays a readiness violation to re-poll.
+        assert!(!readiness_probe_denied(
+            "command timed out after 15s: kubectl --context c get --raw /api/v1/namespaces/ns/pods/p:9000/proxy/health/ready"
         ));
     }
 

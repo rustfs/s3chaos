@@ -844,7 +844,7 @@ impl S3WorkloadClient {
     }
 
     pub(crate) fn for_quiet_mutation(&self, deadline: Instant) -> Self {
-        let mut client = self.clone();
+        let mut client = self.with_mutation_deadline(deadline);
         client.client = Client::from_conf(
             self.client
                 .config()
@@ -852,6 +852,15 @@ impl S3WorkloadClient {
                 .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
                 .build(),
         );
+        client
+    }
+
+    /// A client whose every mutation is additionally capped to `deadline`,
+    /// keeping the shared retry policy. Requests still finish their history
+    /// record on expiry (as `Timeout`), so a caller that must not be
+    /// cancellation-wrapped can await this client to a bounded end instead.
+    pub(crate) fn with_mutation_deadline(&self, deadline: Instant) -> Self {
+        let mut client = self.clone();
         client.mutation_deadline = Some(deadline);
         client
     }
@@ -2107,6 +2116,40 @@ mod tests {
                 .expect("quiet retries")
                 .max_attempts(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_deadline_caps_requests_without_dropping_workload_retries() {
+        let client = super::S3WorkloadClient::new(
+            "http://127.0.0.1:1",
+            "bucket",
+            "test-access",
+            "test-secret",
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("client");
+        let bounded = client.with_mutation_deadline(tokio::time::Instant::now());
+        let polled = std::cell::Cell::new(false);
+        let result = bounded
+            .mutation_request(async {
+                polled.set(true);
+            })
+            .await;
+
+        assert!(result.is_err(), "an expired deadline refuses the mutation");
+        assert!(!polled.get());
+        assert!(client.mutation_deadline.is_none());
+        assert_eq!(
+            bounded
+                .client
+                .config()
+                .retry_config()
+                .expect("bounded retries")
+                .max_attempts(),
+            S3_WORKLOAD_MUTATION_MAX_ATTEMPTS,
+            "the post-recovery probe keeps the workload retry policy"
         );
     }
 

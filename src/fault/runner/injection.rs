@@ -17,7 +17,7 @@ use crate::fault::reporting::PodIdentity;
 use crate::fault::{reporting::FaultStatusSnapshot, workload::StagedMultipartUpload};
 use crate::framework::{
     kubectl::Kubectl,
-    port_forward::{PortForwardGuard, PortForwardSpec},
+    port_forward::{PortForwardGuard, PortForwardSpec, replace_port_forward},
 };
 use crate::{
     fault::{
@@ -35,7 +35,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::access::ensure_s3_access;
+use super::access::{ensure_s3_access, wait_for_tenant_s3};
 use super::targets::{
     FixedVolumeTargets, observe_volume_quorum_health, require_active_fixed_volume_targets,
     require_active_write_quorum_partition, volume_quorum_boundary,
@@ -222,8 +222,9 @@ impl FaultRun<'_> {
             prefilled,
         } = prepared;
         let fault = &active.fault;
-        let served_by_pod =
-            self.pin_availability_endpoint(target, active, endpoint, port_forward)?;
+        let served_by_pod = self
+            .pin_availability_endpoint(target, active, endpoint, port_forward)
+            .await?;
         let volume_quorum_scenario = matches!(
             plan.scenario.as_str(),
             QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
@@ -789,7 +790,7 @@ impl FaultRun<'_> {
     /// attached to a surviving node, so once the fault is active the forward
     /// is re-established to a Pod the controller did not target. A ClusterIP
     /// endpoint balances per connection and needs no pinning.
-    fn pin_availability_endpoint(
+    async fn pin_availability_endpoint(
         &self,
         target: &ProvenTarget,
         active: &ActiveFault,
@@ -801,7 +802,7 @@ impl FaultRun<'_> {
         if !self.context.spec.impact_policy.requires_availability() {
             return Ok(None);
         }
-        let Some(guard) = port_forward else {
+        if port_forward.is_none() {
             events.record(
                 "availability-endpoint",
                 RunEventStatus::Observed,
@@ -809,8 +810,9 @@ impl FaultRun<'_> {
                 Some(serde_json::json!({ "endpoint": endpoint })),
             )?;
             return Ok(None);
-        };
-        let pinned = injected_source_pod_names(&active.active_snapshots).and_then(|targets| {
+        }
+        let pinned = async {
+            let targets = injected_source_pod_names(&active.active_snapshots)?;
             let survivor = surviving_pod_name(&target.pods_before, &targets)?;
             let local_port = endpoint
                 .rsplit_once(':')
@@ -822,11 +824,18 @@ impl FaultRun<'_> {
                 local_port,
                 remote_port: RUSTFS_CONTAINER_PORT,
             };
-            // Replacing the guard drops the Service forward first so the
-            // local port is free for the Pod forward.
-            *guard = spec.start_with_temp_log(&Kubectl::new(cluster))?;
-            Ok((survivor, targets))
-        });
+            // The Service forward is killed before the Pod forward spawns so
+            // they never race for the local port, and the Pod forward must
+            // answer S3 before the verdict measures anything through it.
+            let guard = replace_port_forward(port_forward, || {
+                spec.start_with_temp_log(&Kubectl::new(cluster))
+            })?;
+            self.deadline
+                .run(wait_for_tenant_s3(guard, endpoint, cluster.timeout))
+                .await?;
+            Ok::<_, anyhow::Error>((survivor, targets))
+        }
+        .await;
         match pinned {
             Ok((survivor, targets)) => {
                 events.record(

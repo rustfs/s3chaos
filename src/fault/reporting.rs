@@ -117,6 +117,9 @@ pub(crate) struct RunMetadata {
     prefill_concurrency: usize,
     request_timeout_seconds: u64,
     recovery_stability_reread_seconds: u64,
+    /// Availability floor the run was configured with; artifact validation
+    /// binds `availability-report.json` to this value.
+    min_availability_percent: u8,
     use_cluster_ip: bool,
     require_client_disruption: bool,
     chaos_namespace: String,
@@ -171,6 +174,7 @@ impl RunMetadata {
             prefill_concurrency: config.prefill_concurrency,
             request_timeout_seconds: config.request_timeout.as_secs(),
             recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
+            min_availability_percent: config.min_availability_percent,
             use_cluster_ip: config.use_cluster_ip,
             require_client_disruption,
             chaos_namespace: config.chaos_namespace.clone(),

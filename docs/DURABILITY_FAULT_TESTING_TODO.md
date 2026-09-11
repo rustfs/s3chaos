@@ -380,7 +380,8 @@ guardrails when implementing the ordered TODO below.
   (`post-recovery-write-report.json`, rustfs/backlog#2444). The final checker
   reports listed keys that GET cannot read (`listed_key_unreadable`) and
   readable listed keys no write explains (`unexpected_listed_object`);
-  failed-but-materialized writes are recorded and tolerated.
+  failed-but-materialized writes are tolerated only when GET returns the
+  bytes one of the failed attempts sent.
 
 - [x] DONE: Availability contract for in-redundancy faults.
   Meaning: `pod-kill-one`, `pod-failure`, and `network-partition-one` use the

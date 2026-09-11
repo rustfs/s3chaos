@@ -146,6 +146,21 @@ impl PortForwardSpec {
     }
 }
 
+/// Replace a running port-forward with a freshly started one on the same
+/// local port. The running guard is dropped (its child killed and reaped)
+/// before `start` spawns the replacement: a plain `*slot = start()?` evaluates
+/// the replacement first, so both processes would race for the local port and
+/// the new one could exit with "address already in use". On a failed start
+/// the slot is left empty rather than holding an already-killed forward.
+pub(crate) fn replace_port_forward<G>(
+    slot: &mut Option<G>,
+    start: impl FnOnce() -> Result<G>,
+) -> Result<&mut G> {
+    drop(slot.take());
+    let guard = start()?;
+    Ok(slot.insert(guard))
+}
+
 fn available_local_port() -> Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .context("bind an ephemeral local port for kubectl port-forward")?;
@@ -326,8 +341,45 @@ impl Drop for PortForwardGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::PortForwardSpec;
+    use super::{PortForwardSpec, replace_port_forward};
     use crate::framework::{config::E2eConfig, kubectl::Kubectl};
+    use std::{cell::RefCell, rc::Rc};
+
+    #[test]
+    fn replace_port_forward_drops_the_running_forward_before_starting_its_replacement() {
+        #[derive(Debug)]
+        struct Tracked(&'static str, Rc<RefCell<Vec<String>>>);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.1.borrow_mut().push(format!("drop {}", self.0));
+            }
+        }
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut slot = Some(Tracked("service", Rc::clone(&log)));
+
+        let replaced = replace_port_forward(&mut slot, || {
+            log.borrow_mut().push("start pod".to_string());
+            Ok(Tracked("pod", Rc::clone(&log)))
+        })
+        .expect("replacement forward");
+
+        assert_eq!(replaced.0, "pod");
+        assert_eq!(
+            *log.borrow(),
+            ["drop service".to_string(), "start pod".to_string()],
+            "the old forward must release the local port before the replacement binds it"
+        );
+
+        let error = replace_port_forward(&mut slot, || {
+            Err::<Tracked, _>(anyhow::anyhow!("spawn failed"))
+        })
+        .expect_err("failed start");
+        assert!(error.to_string().contains("spawn failed"));
+        assert!(
+            slot.is_none(),
+            "a failed start must not leave a killed forward behind as if it were running"
+        );
+    }
 
     #[test]
     fn console_port_forward_targets_operator_console_service() {

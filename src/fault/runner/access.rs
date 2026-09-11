@@ -254,7 +254,7 @@ pub(super) async fn ensure_s3_access(
     wait_for_s3_endpoint(endpoint, config.timeout).await
 }
 
-async fn wait_for_tenant_s3(
+pub(super) async fn wait_for_tenant_s3(
     port_forward: &mut PortForwardGuard,
     endpoint: &str,
     timeout: Duration,
