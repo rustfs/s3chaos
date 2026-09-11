@@ -268,7 +268,7 @@ fn validate_contract(
             "case {case_id} cleanup status differs between result and cleanup report"
         );
         ensure!(
-            report.cleanup_failure.is_some() == !case_cleanup.succeeded,
+            report.cleanup_failure.is_some() != case_cleanup.succeeded,
             "case {case_id} cleanup failure diagnostics differ from its cleanup report"
         );
         if let Some(cleanup_failure) = &report.cleanup_failure {
