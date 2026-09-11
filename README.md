@@ -178,7 +178,9 @@ non-disrupted operations (`availability-report.json`, classification
 `availability_regression`). The catalog floor is 99; the variable may only
 raise it. A floor below 100 tolerates one disrupted operation per family, and
 a family with fewer than 20 operations under the fault is not evidence and
-fails closed. Because a `kubectl port-forward` stays pinned to
+fails closed; plans that cannot reach it (240 objects with the default
+operation mix) are rejected at planning and by `fault-suite-validate` rather
+than after the fault window. Because a `kubectl port-forward` stays pinned to
 one Pod, the runner re-pins the S3 endpoint to a surviving Pod that the Chaos
 Mesh controller did not target once the fault is active, so the contract
 measures a client attached to a healthy node; ClusterIP endpoints need no

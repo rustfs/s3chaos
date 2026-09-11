@@ -272,9 +272,81 @@ pub(super) async fn wait_for_tenant_s3(
         })
 }
 
+/// Prove a freshly spawned port-forward is established: its process is still
+/// alive and the local port accepts a TCP connection. `kubectl port-forward`
+/// only spawns; bind conflicts, kubeconfig and API server errors exit
+/// asynchronously, so `alive` is polled before every connect attempt and its
+/// error is returned verbatim. Neither outcome says anything about RustFS:
+/// callers classify a failure here as harness, not product.
+pub(super) async fn wait_for_local_forward(
+    local_port: u16,
+    bound: Duration,
+    mut alive: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    loop {
+        alive()?;
+        let connect = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::net::TcpStream::connect(("127.0.0.1", local_port)),
+        )
+        .await;
+        if matches!(connect, Ok(Ok(_))) {
+            return Ok(());
+        }
+        if started.elapsed() >= bound {
+            bail!(
+                "port-forward process is running but 127.0.0.1:{local_port} did not accept a TCP connection within {}s",
+                bound.as_secs_f64()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_forward_is_established_once_the_port_accepts_connections() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let port = listener.local_addr().expect("addr").port();
+        wait_for_local_forward(port, Duration::from_secs(5), || Ok(()))
+            .await
+            .expect("a listening port is an established forward");
+    }
+
+    #[tokio::test]
+    async fn dead_forward_process_is_reported_before_the_port_is_probed() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let port = listener.local_addr().expect("addr").port();
+        let error = wait_for_local_forward(port, Duration::from_secs(5), || {
+            bail!("port-forward exited early with exit status: 1; unable to listen on any of the requested ports")
+        })
+        .await
+        .expect_err("an exited kubectl is a harness failure even when something listens");
+        assert!(
+            error.to_string().contains("port-forward exited early"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unbound_port_times_out_as_a_harness_failure() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let error = wait_for_local_forward(port, Duration::from_millis(300), || Ok(()))
+            .await
+            .expect_err("nothing listens on the released port");
+        assert!(
+            error
+                .to_string()
+                .contains("did not accept a TCP connection within"),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn stable_pod_fingerprint_requires_four_ready_unchanged_pods() {

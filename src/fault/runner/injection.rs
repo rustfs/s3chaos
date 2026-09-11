@@ -35,7 +35,11 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::access::{ensure_s3_access, wait_for_tenant_s3};
+use super::access::{ensure_s3_access, wait_for_local_forward, wait_for_tenant_s3};
+
+/// How long a re-pinned `kubectl port-forward` gets to bind its local port
+/// and start accepting connections; only the harness side of the endpoint.
+const PORT_FORWARD_ESTABLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 use super::targets::{
     FixedVolumeTargets, observe_volume_quorum_health, require_active_fixed_volume_targets,
     require_active_write_quorum_partition, volume_quorum_boundary,
@@ -834,6 +838,18 @@ impl FaultRun<'_> {
                 spec.start_with_temp_log(&Kubectl::new(cluster))
             })
             .map_err(AvailabilityEndpointFailure::Harness)?;
+            // `kubectl port-forward` only spawns: a bind conflict or API
+            // server error exits asynchronously. Prove the process is alive
+            // and the local port accepts TCP before anything that fails is
+            // attributed to the survivor.
+            self.deadline
+                .run(wait_for_local_forward(
+                    local_port,
+                    PORT_FORWARD_ESTABLISH_TIMEOUT,
+                    || guard.ensure_running(),
+                ))
+                .await
+                .map_err(AvailabilityEndpointFailure::Harness)?;
             self.deadline
                 .run(wait_for_tenant_s3(guard, endpoint, cluster.timeout))
                 .await
@@ -1091,14 +1107,14 @@ impl AvailabilityEndpointFailure {
 
     fn classification(&self) -> &'static str {
         match self {
-            Self::Harness(_) => "environment_or_fault_backend",
             // The suite budget running out while waiting is a harness limit,
-            // not evidence that the survivor stopped serving.
-            Self::SurvivorUnready { error, .. }
+            // not evidence about the forward or the survivor.
+            Self::Harness(error) | Self::SurvivorUnready { error, .. }
                 if error.is::<crate::fault::shutdown::SuiteDeadlineExceeded>() =>
             {
                 "test_or_environment"
             }
+            Self::Harness(_) => "environment_or_fault_backend",
             Self::SurvivorUnready { .. } => "availability_regression",
         }
     }
@@ -1198,6 +1214,16 @@ mod availability_endpoint_tests {
                 .expect_err("expired"),
         );
         assert_eq!(deadline.classification(), "test_or_environment");
+
+        // An asynchronously exiting kubectl (bind conflict, kubeconfig, API
+        // server) surfaces through the establishment check as harness.
+        let bind_conflict = AvailabilityEndpointFailure::Harness(anyhow::anyhow!(
+            "port-forward exited early with exit status: 1; unable to listen on any of the requested ports"
+        ));
+        assert_eq!(
+            bind_conflict.classification(),
+            "environment_or_fault_backend"
+        );
     }
 
     fn pods() -> Vec<PodIdentity> {

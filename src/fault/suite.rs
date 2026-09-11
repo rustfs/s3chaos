@@ -399,6 +399,24 @@ impl FaultSuite {
                 ResolvedFaultSuiteScenario::from_suite_scenario(scenario, &workload_profiles)
             })
             .collect::<Result<Vec<_>>>()?;
+        // Availability scenarios must plan enough operations per family for a
+        // verdict; `fault-suite-validate` catches an undersized suite here
+        // with the suite's own workload dimensions, before any cluster run.
+        for scenario in &scenarios {
+            let spec = scenario_spec(&scenario.name)?;
+            if spec.impact_policy.requires_availability() {
+                let workload = scenario.workload.as_ref();
+                crate::fault::workload::execution::require_availability_family_totals(
+                    &scenario.name,
+                    workload
+                        .and_then(|workload| workload.objects)
+                        .unwrap_or(crate::fault::config::DEFAULT_WORKLOAD_OBJECTS),
+                    workload
+                        .and_then(|workload| workload.operation_weights)
+                        .unwrap_or_default(),
+                )?;
+            }
+        }
 
         Ok(ResolvedFaultSuite {
             api_version: self.api_version.clone(),
@@ -878,6 +896,72 @@ scenarios:
             resolved.budgets.continue_on_severities,
             vec![FailureSeverity::Degraded]
         );
+    }
+
+    #[test]
+    fn undersized_availability_scenarios_are_rejected_at_suite_validation() {
+        let suite_with_objects = |objects: usize| {
+            serde_yaml_ng::from_str::<FaultSuite>(&format!(
+                r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: availability-sizing
+workloadProfiles:
+  small:
+    objects: {objects}
+    concurrency: 8
+scenarios:
+  - name: pod-kill-one
+    workloadProfile: small
+  - name: io-eio
+    workloadProfile: small
+"#
+            ))
+            .expect("suite yaml")
+            .resolve()
+        };
+
+        let error = suite_with_objects(64).expect_err("64 objects cannot yield a verdict");
+        let message = error.to_string();
+        assert!(
+            message.contains("availability scenario pod-kill-one"),
+            "{message}"
+        );
+        assert!(
+            message.contains("set workload objects to at least 240"),
+            "{message}"
+        );
+        suite_with_objects(240).expect("240 objects satisfy every family");
+
+        // Non-availability scenarios keep their small plans.
+        serde_yaml_ng::from_str::<FaultSuite>(
+            r#"
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: durability-only
+workloadProfiles:
+  small:
+    objects: 64
+    concurrency: 8
+scenarios:
+  - name: io-eio
+    workloadProfile: small
+"#,
+        )
+        .expect("suite yaml")
+        .resolve()
+        .expect("durability scenarios have no family minimum");
+
+        for example in [
+            "fault/examples/smoke.yaml",
+            "fault/examples/regression.yaml",
+            "fault/examples/quorum-reliability.yaml",
+        ] {
+            super::resolve_fault_suite_yaml(example)
+                .unwrap_or_else(|error| panic!("{example} must stay valid: {error:#}"));
+        }
     }
 
     #[test]

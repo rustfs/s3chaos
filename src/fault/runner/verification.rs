@@ -185,6 +185,7 @@ impl FaultRun<'_> {
             history,
             &workload.unconfirmed_puts,
             workload_plan.concurrency,
+            self.deadline,
         )
         .await;
         collector.write_text(
@@ -198,6 +199,22 @@ impl FaultRun<'_> {
             "workload-summary.json",
             &serde_json::to_string_pretty(&workload.summary)?,
         )?;
+        // A budget exhausted before or during the recommit leaves capped
+        // Timeout attempts and unreached candidates behind; that is the suite
+        // deadline, not a product recommit failure.
+        if let Err(error) = self.deadline.check() {
+            self.record_failure(
+                "recommit-unconfirmed",
+                "test_or_environment",
+                &error,
+                Some(serde_json::json!({
+                    "attempted": recommit_report.attempted,
+                    "candidates": workload.unconfirmed_puts.len(),
+                })),
+                None,
+            )?;
+            return Err(error);
+        }
         if recommit_report.has_failures() {
             let message = recommit_report.failure_message();
             events

@@ -374,6 +374,13 @@ fn initialize_fault_run(
     run_id: &str,
 ) -> Result<FaultRunContext> {
     let spec = scenarios::scenario_spec(&scenario.name)?;
+    if spec.impact_policy.requires_availability() {
+        crate::fault::workload::execution::require_availability_family_totals(
+            &scenario.name,
+            scenario.object_count,
+            config.workload_operation_mix,
+        )?;
+    }
     let run_id = run_id.to_string();
     let workload_seed = config.workload_seed.unwrap_or_else(generated_seed);
     let workload_plan = WorkloadPlan::seeded_with_profile(

@@ -280,6 +280,19 @@ pub(crate) fn build_fault_suite_plan_expansion(
             )?;
             let fault_scenario = FaultScenario::from_config(&config)?;
             let spec = scenario_spec(&fault_scenario.name)?;
+            if spec.impact_policy.requires_availability() {
+                crate::fault::workload::execution::require_availability_family_totals(
+                    &fault_scenario.name,
+                    fault_scenario.object_count,
+                    config.workload_operation_mix,
+                )
+                .with_context(|| {
+                    format!(
+                        "suite scenario {} repetition {repetition} cannot produce an availability verdict",
+                        scenario.name
+                    )
+                })?;
+            }
             let fault_plan = FaultPlan::from_scenario_with_options(
                 &fault_scenario,
                 spec,
