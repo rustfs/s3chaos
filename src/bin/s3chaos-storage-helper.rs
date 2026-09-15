@@ -60,7 +60,13 @@ fn main() -> Result<()> {
         bail!("storage helper session must begin with a typed begin request")
     };
     let context = *context;
-    let mut session = StorageHelperSession::begin_default(context.clone())?;
+    let mut session = match StorageHelperSession::begin_default(context.clone()) {
+        Ok(session) => session,
+        Err(error) => {
+            write_error(&mut output, &format!("{error:#}"))?;
+            return Err(error);
+        }
+    };
     write_response(
         &mut output,
         &StorageHelperSessionResponse::Ready {

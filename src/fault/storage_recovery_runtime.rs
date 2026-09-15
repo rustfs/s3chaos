@@ -1044,6 +1044,9 @@ impl KubectlStorageRecoveryHostAdapter {
                 context: Box::new(context.clone()),
             })
             .await?;
+        if let StorageHelperSessionResponse::Error { message } = &response {
+            bail!("storage helper rejected session startup: {message}");
+        }
         ensure!(
             matches!(
                 response,
