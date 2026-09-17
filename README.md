@@ -65,6 +65,7 @@ scenario:
 make fault-list                                      # executable scenario list
 make fault-chaos-run                                 # canonical 20-attempt suite
 make fault-dm-run SCENARIO=dm-flakey-versioned-hot  # one supervised DM run
+make fault-dm-run SCENARIO=node-crash-proxy         # DM crash + node held down
 make fault-console-serve                             # browse run artifacts
 
 # Pin the context, namespace, and tenant recorded in the run's target proof.

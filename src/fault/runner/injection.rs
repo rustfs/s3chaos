@@ -938,13 +938,55 @@ impl FaultRun<'_> {
         endpoint: &str,
         port_forward: &mut Option<PortForwardGuard>,
     ) -> Result<Option<String>> {
-        let events = &self.context.events;
-        let cluster = &self.config.cluster;
         if !self.context.spec.impact_policy.requires_availability()
             && !requires_quorum_edge_read_survival(&self.plan.scenario)
         {
             return Ok(None);
         }
+        // A ClusterIP endpoint needs no target set; resolving one from the
+        // controller records is only required when there is a forward to move.
+        let targets = if port_forward.is_none() {
+            Ok(BTreeSet::new())
+        } else {
+            injected_source_pod_names(&active.active_snapshots)
+        };
+        let targets = match targets {
+            Ok(targets) => targets,
+            Err(error) => {
+                let error = error.context("re-pin the S3 port-forward to a surviving Pod");
+                self.record_failure(
+                    "availability-endpoint",
+                    "environment_or_fault_backend",
+                    &error,
+                    None,
+                    Some((&active.fault, "availability-endpoint-failed")),
+                )?;
+                return Err(error);
+            }
+        };
+        self.repin_endpoint_to_survivor(
+            &active.fault,
+            &target.pods_before,
+            targets,
+            endpoint,
+            port_forward,
+        )
+        .await
+    }
+
+    /// Re-establish the workload port-forward to a proven Pod outside
+    /// `targets` and prove it answers S3 before anything is measured through
+    /// it. Records the `availability-endpoint` event either way.
+    pub(super) async fn repin_endpoint_to_survivor(
+        &self,
+        fault: &AppliedFault,
+        pods_before: &[PodIdentity],
+        targets: BTreeSet<String>,
+        endpoint: &str,
+        port_forward: &mut Option<PortForwardGuard>,
+    ) -> Result<Option<String>> {
+        let events = &self.context.events;
+        let cluster = &self.config.cluster;
         if port_forward.is_none() {
             events.record(
                 "availability-endpoint",
@@ -955,9 +997,7 @@ impl FaultRun<'_> {
             return Ok(None);
         }
         let pinned = async {
-            let targets = injected_source_pod_names(&active.active_snapshots)
-                .map_err(AvailabilityEndpointFailure::Harness)?;
-            let survivor = surviving_pod_name(&target.pods_before, &targets)
+            let survivor = surviving_pod_name(pods_before, &targets)
                 .map_err(AvailabilityEndpointFailure::Harness)?;
             let local_port = endpoint
                 .rsplit_once(':')
@@ -1021,7 +1061,7 @@ impl FaultRun<'_> {
                     classification,
                     &error,
                     details,
-                    Some((&active.fault, "availability-endpoint-failed")),
+                    Some((fault, "availability-endpoint-failed")),
                 )?;
                 Err(error)
             }

@@ -75,6 +75,9 @@ use crate::fault::{
         HOST_STORAGE_CLEANUP_ARTIFACT, HOST_STORAGE_PROOF_ARTIFACT, HostStorageMutationProof,
         HostStoragePostCleanupObservation, normalized_dm_table_sha256,
     },
+    node_down::{
+        NODE_DOWN_HOLD_ARTIFACT, NodeDownHoldEvidence, NodeDownTarget, untouched_prefill_keys,
+    },
     on_disk_bitrot::{
         BITROT_CLEANUP_ARTIFACT, BITROT_CORRUPTION_WINDOW_ARTIFACT, BITROT_HEAL_ARTIFACT,
         BITROT_MUTATION_ARTIFACT, BITROT_SELECTION_ARTIFACT, BITROT_WORKFLOW_ARTIFACT,
@@ -120,12 +123,14 @@ use crate::fault::{
     },
     workload::execution::{
         AVAILABILITY_REPORT_ARTIFACT, AvailabilityReport, FamilyAvailability,
-        POST_RECOVERY_WRITE_HISTORY_ARTIFACT, POST_RECOVERY_WRITE_REPORT_ARTIFACT,
-        PostRecoveryWriteReport, QUORUM_EDGE_READ_SURVIVAL_ARTIFACT, QuorumEdgeReadSurvivalReport,
+        NODE_DOWN_READ_HISTORY_ARTIFACT, NODE_DOWN_WRITE_HISTORY_ARTIFACT,
+        NODE_DOWN_WRITE_REPORT_ARTIFACT, POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+        POST_RECOVERY_WRITE_REPORT_ARTIFACT, PostRecoveryWriteReport,
+        QUORUM_EDGE_READ_SURVIVAL_ARTIFACT, QuorumEdgeReadSurvivalReport,
         post_recovery_object_count,
     },
     workload::{
-        ObjectSpec, WorkloadOperation, WorkloadPlan,
+        ObjectSpec, WorkloadOperation, WorkloadPlan, WriteProbeScope,
         execution::{
             TypedQuorumReadCohortSource, TypedQuorumReadExpectation,
             require_typed_quorum_read_survival,
@@ -1603,7 +1608,10 @@ fn validate_fault_artifacts_with_identity(
     } else {
         validate_fault_window_evidence(&evidence)?;
     }
-    if options.scenario == DM_FLAKEY_VERSIONED_HOT_SCENARIO {
+    if matches!(
+        options.scenario.as_str(),
+        DM_FLAKEY_VERSIONED_HOT_SCENARIO | scenarios::NODE_CRASH_PROXY_SCENARIO
+    ) {
         validate_dm_crash_artifacts(
             &options.artifact_root,
             scenario_spec.case_name,
@@ -1612,6 +1620,16 @@ fn validate_fault_artifacts_with_identity(
             &metadata.scenario,
             &metadata.run_id,
             &json_spec.metadata.bucket,
+        )?;
+    }
+    if scenarios::holds_node_down_after_crash(&options.scenario) {
+        validate_node_down_hold_artifacts(
+            &artifacts,
+            &metadata,
+            identity,
+            &events,
+            &json_spec.metadata.bucket,
+            workload_plan.object_count,
         )?;
     }
     validate_recovery_health_artifact(&artifacts, &metadata, identity, &evidence, &events)?;
@@ -2491,7 +2509,12 @@ fn validate_storage_recovery_execution_artifacts(
         }),
         "storage-recovery post-write history escaped its run prefix or report window"
     );
-    validate_post_recovery_probe_history(&post_write_history, &post_write, &metadata.run_id)?;
+    validate_write_probe_history(
+        POST_RECOVERY_WRITE_PROBE,
+        &post_write_history,
+        &post_write,
+        &metadata.run_id,
+    )?;
 
     Ok(ArtifactValidationReport {
         scenario: options.scenario.clone(),
@@ -4726,6 +4749,43 @@ fn validate_post_recovery_write_artifacts(
     )
 }
 
+/// The artifacts and run-event stage one fresh-write probe owns. The same
+/// strict history reconstruction applies wherever the probe runs.
+#[derive(Debug, Clone, Copy)]
+struct WriteProbeEvidence {
+    scope: WriteProbeScope,
+    report_artifact: &'static str,
+    history_artifact: &'static str,
+    event_stage: &'static str,
+    /// Operator-facing probe name and the boundary it must follow.
+    label: &'static str,
+    starts_after: &'static str,
+    boundary_name: &'static str,
+    prefix_name: &'static str,
+}
+
+const POST_RECOVERY_WRITE_PROBE: WriteProbeEvidence = WriteProbeEvidence {
+    scope: WriteProbeScope::PostRecovery,
+    report_artifact: POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+    history_artifact: POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+    event_stage: "post-recovery-write",
+    label: "post-recovery write",
+    starts_after: "recovery ended",
+    boundary_name: "recovery boundary",
+    prefix_name: "post-recovery",
+};
+
+const NODE_DOWN_WRITE_PROBE: WriteProbeEvidence = WriteProbeEvidence {
+    scope: WriteProbeScope::NodeDown,
+    report_artifact: NODE_DOWN_WRITE_REPORT_ARTIFACT,
+    history_artifact: NODE_DOWN_WRITE_HISTORY_ARTIFACT,
+    event_stage: "node-down-write",
+    label: "node-down write",
+    starts_after: "the node-down hold began",
+    boundary_name: "crash boundary",
+    prefix_name: "node-down",
+};
+
 #[allow(clippy::too_many_arguments)]
 fn validate_post_recovery_write_artifacts_after(
     artifacts: &BTreeMap<String, PathBuf>,
@@ -4737,12 +4797,44 @@ fn validate_post_recovery_write_artifacts_after(
     recovery_completed_at_ms: u64,
     recovery_boundary_stage: &str,
 ) -> Result<()> {
-    let report = read_json::<PostRecoveryWriteReport>(required(
+    validate_write_probe_artifacts_after(
+        POST_RECOVERY_WRITE_PROBE,
         artifacts,
-        POST_RECOVERY_WRITE_REPORT_ARTIFACT,
-    )?)?;
+        metadata,
+        identity,
+        events,
+        expected_bucket,
+        expected_objects,
+        recovery_completed_at_ms,
+        recovery_boundary_stage,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_write_probe_artifacts_after(
+    probe: WriteProbeEvidence,
+    artifacts: &BTreeMap<String, PathBuf>,
+    metadata: &RunMetadataArtifact,
+    identity: ArtifactIdentityPolicy<'_>,
+    events: &[RunEvent],
+    expected_bucket: &str,
+    expected_objects: usize,
+    boundary_at_ms: u64,
+    boundary_stage: &str,
+) -> Result<()> {
+    let WriteProbeEvidence {
+        report_artifact,
+        history_artifact,
+        event_stage,
+        label,
+        starts_after,
+        boundary_name,
+        prefix_name,
+        ..
+    } = probe;
+    let report = read_json::<PostRecoveryWriteReport>(required(artifacts, report_artifact)?)?;
     validate_optional_identity_fields(
-        POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+        report_artifact,
         Some(report.scenario.as_str()),
         Some(report.run_id.as_str()),
         metadata,
@@ -4750,69 +4842,64 @@ fn validate_post_recovery_write_artifacts_after(
     )?;
     ensure!(
         report.objects == expected_objects,
-        "{POST_RECOVERY_WRITE_REPORT_ARTIFACT} probed {} objects but the workload plan sizes the probe at {expected_objects}",
+        "{report_artifact} probed {} objects but the workload plan sizes the probe at {expected_objects}",
         report.objects
     );
     report
         .require_success()
-        .with_context(|| format!("{POST_RECOVERY_WRITE_REPORT_ARTIFACT} did not pass"))?;
+        .with_context(|| format!("{report_artifact} did not pass"))?;
     ensure!(
-        report.started_at_ms >= recovery_completed_at_ms,
-        "{POST_RECOVERY_WRITE_REPORT_ARTIFACT} started before recovery ended"
+        report.started_at_ms >= boundary_at_ms,
+        "{report_artifact} started before {starts_after}"
     );
     // The lifecycle evidence must have been persisted before the write gate
     // could fail the run; the runner records both as ordered events.
-    let recovery_boundary = events
+    let boundary = events
         .iter()
         .position(|event| {
-            event.stage == recovery_boundary_stage && event.status == RunEventStatus::Succeeded
+            event.stage == boundary_stage && event.status == RunEventStatus::Succeeded
         })
-        .with_context(|| {
-            format!("run-events.jsonl lacks a successful {recovery_boundary_stage} event")
-        })?;
+        .with_context(|| format!("run-events.jsonl lacks a successful {boundary_stage} event"))?;
     let probe_started = events
         .iter()
-        .position(|event| {
-            event.stage == "post-recovery-write" && event.status == RunEventStatus::Started
-        })
-        .context("run-events.jsonl lacks a post-recovery-write started event")?;
+        .position(|event| event.stage == event_stage && event.status == RunEventStatus::Started)
+        .with_context(|| format!("run-events.jsonl lacks a {event_stage} started event"))?;
     let probe_succeeded = events
         .iter()
         .enumerate()
         .skip(probe_started + 1)
         .find_map(|(index, event)| {
-            (event.stage == "post-recovery-write" && event.status == RunEventStatus::Succeeded)
+            (event.stage == event_stage && event.status == RunEventStatus::Succeeded)
                 .then_some(index)
         })
-        .context("run-events.jsonl lacks a successful post-recovery-write event")?;
+        .with_context(|| format!("run-events.jsonl lacks a successful {event_stage} event"))?;
     ensure!(
-        recovery_boundary < probe_started,
+        boundary < probe_started,
         "{}",
-        if recovery_boundary_stage == "recovery-evidence" {
-            "run-events.jsonl shows the post-recovery write probe started before fault-evidence.json was persisted"
+        if boundary_stage == "recovery-evidence" {
+            "run-events.jsonl shows the post-recovery write probe started before fault-evidence.json was persisted".to_string()
         } else {
-            "run-events.jsonl shows the post-recovery write probe started before the recovery boundary"
+            format!("run-events.jsonl shows the {label} probe started before the {boundary_name}")
         }
     );
     ensure!(
         events[probe_started].at_ms <= report.started_at_ms
             && report.completed_at_ms <= events[probe_succeeded].at_ms
             && events.iter().all(|event| {
-                event.stage != "post-recovery-write" || event.status != RunEventStatus::Failed
+                event.stage != event_stage || event.status != RunEventStatus::Failed
             }),
-        "run-events.jsonl does not prove one successful post-recovery write probe around its report interval"
+        "run-events.jsonl does not prove one successful {label} probe around its report interval"
     );
-    let expected_prefix = format!("fault-test-post-recovery/{}/", metadata.run_id);
+    let expected_prefix = probe.scope.key_prefix(&metadata.run_id);
     ensure!(
         report.key_prefix == expected_prefix,
-        "{POST_RECOVERY_WRITE_REPORT_ARTIFACT} key_prefix {:?} is not the run-scoped post-recovery prefix",
+        "{report_artifact} key_prefix {:?} is not the run-scoped {prefix_name} prefix",
         report.key_prefix
     );
-    let history =
-        read_jsonl::<OperationRecord>(required(artifacts, POST_RECOVERY_WRITE_HISTORY_ARTIFACT)?)?;
+    let history = read_jsonl::<OperationRecord>(required(artifacts, history_artifact)?)?;
     ensure!(
         !history.is_empty(),
-        "{POST_RECOVERY_WRITE_HISTORY_ARTIFACT} must contain operation records"
+        "{history_artifact} must contain operation records"
     );
     validate_history_scope_and_order(
         &history,
@@ -4826,17 +4913,17 @@ fn validate_post_recovery_write_artifacts_after(
                 .key
                 .as_deref()
                 .is_some_and(|key| key.starts_with(&expected_prefix)),
-            "{POST_RECOVERY_WRITE_HISTORY_ARTIFACT} record {} touched a key outside the post-recovery prefix",
+            "{history_artifact} record {} touched a key outside the {prefix_name} prefix",
             record.id
         );
         ensure!(
             record.started_at_ms >= report.started_at_ms
                 && record.ended_at_ms <= report.completed_at_ms,
-            "{POST_RECOVERY_WRITE_HISTORY_ARTIFACT} record {} lies outside the probe window",
+            "{history_artifact} record {} lies outside the probe window",
             record.id
         );
     }
-    validate_post_recovery_probe_history(&history, &report, &metadata.run_id)
+    validate_write_probe_history(probe, &history, &report, &metadata.run_id)
 }
 
 /// Every counter the probe report claims must be evidenced by its dedicated
@@ -4846,20 +4933,20 @@ fn validate_post_recovery_write_artifacts_after(
 /// key its abort; and exactly two prefix LISTs, the first returning every
 /// live probe key after the writes and before any DELETE, the second empty
 /// after the last DELETE. Records outside that shape are not tolerated.
-fn validate_post_recovery_probe_history(
+fn validate_write_probe_history(
+    probe: WriteProbeEvidence,
     history: &[OperationRecord],
     report: &PostRecoveryWriteReport,
     run_id: &str,
 ) -> Result<()> {
-    use crate::fault::workload::ObjectSpec;
-
-    let artifact = POST_RECOVERY_WRITE_HISTORY_ARTIFACT;
-    let prefix = ObjectSpec::post_recovery_key_prefix(run_id);
+    let artifact = probe.history_artifact;
+    let scope = probe.scope;
+    let prefix = scope.key_prefix(run_id);
     let plain_keys = (0..report.objects)
-        .map(|index| ObjectSpec::post_recovery_key(run_id, index))
+        .map(|index| scope.key(run_id, index))
         .collect::<Vec<_>>();
-    let multipart_key = ObjectSpec::post_recovery_key(run_id, report.objects);
-    let abort_key = ObjectSpec::post_recovery_key(run_id, report.objects + 1);
+    let multipart_key = scope.key(run_id, report.objects);
+    let abort_key = scope.key(run_id, report.objects + 1);
 
     for record in history {
         let key = record.key.as_deref().unwrap_or_default();
@@ -6029,6 +6116,150 @@ fn validate_ack_mutation_shape(
             );
         }
     }
+    Ok(())
+}
+
+/// The node-down hold must be bound to the crashed host-storage target, must
+/// have read back exactly the prefilled objects the workload never touched,
+/// and must sit between the crash boundary and fault removal together with
+/// its fresh-write probe.
+fn validate_node_down_hold_artifacts(
+    artifacts: &BTreeMap<String, PathBuf>,
+    metadata: &RunMetadataArtifact,
+    identity: ArtifactIdentityPolicy<'_>,
+    events: &[RunEvent],
+    bucket: &str,
+    workload_object_count: usize,
+) -> Result<()> {
+    let hold = read_json::<NodeDownHoldEvidence>(required(artifacts, NODE_DOWN_HOLD_ARTIFACT)?)?;
+    validate_optional_identity_fields(
+        NODE_DOWN_HOLD_ARTIFACT,
+        Some(hold.scenario.as_str()),
+        Some(hold.run_id.as_str()),
+        metadata,
+        identity,
+    )?;
+    let host =
+        read_json::<HostStorageMutationProof>(required(artifacts, HOST_STORAGE_PROOF_ARTIFACT)?)?;
+    ensure!(
+        hold.target
+            == NodeDownTarget {
+                pod: host.target.pod.clone(),
+                crashed_pod_uid: host.target.pod_uid.clone(),
+                node: host.target.node.clone(),
+            },
+        "{NODE_DOWN_HOLD_ARTIFACT} target is not the host-storage-proof.json target"
+    );
+
+    let history = read_jsonl::<OperationRecord>(required(artifacts, "history.jsonl")?)?;
+    let workload_prefix = crate::fault::workload::ObjectSpec::key_prefix(&metadata.run_id);
+    let prefill_keys = history
+        .iter()
+        .filter(|record| {
+            record.scenario == metadata.scenario
+                && record.run_id.as_deref() == Some(metadata.run_id.as_str())
+                && record.kind == OperationKind::Put
+                && record.outcome == OperationOutcome::Ok
+                && record.durability_cohort == Some(DurabilityCohort::PreFault)
+        })
+        .filter_map(|record| record.key.as_deref())
+        .filter(|key| key.starts_with(&workload_prefix))
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        prefill_keys.len() == workload_object_count / 2,
+        "history.jsonl records {} prefilled keys, but the workload plan prefills {}",
+        prefill_keys.len(),
+        workload_object_count / 2
+    );
+    let untouched = untouched_prefill_keys(
+        prefill_keys.iter().copied(),
+        &history,
+        &metadata.scenario,
+        &metadata.run_id,
+    );
+    ensure!(
+        !untouched.is_empty(),
+        "history.jsonl leaves no untouched prefilled object for the node-down read probe"
+    );
+    hold.validate(untouched.len())?;
+
+    // Survivors are only measured after the node has been down for the
+    // minimum hold, so detection of the loss cannot postdate the probes.
+    let probes_allowed_from_ms = hold.started_at_ms.saturating_add(hold.min_hold_ms);
+    let reads =
+        read_jsonl::<OperationRecord>(required(artifacts, NODE_DOWN_READ_HISTORY_ARTIFACT)?)?;
+    validate_history_scope_and_order(&reads, &metadata.scenario, &metadata.run_id, bucket)?;
+    ensure!(
+        reads.len() == untouched.len(),
+        "{NODE_DOWN_READ_HISTORY_ARTIFACT} holds {} records for {} untouched prefilled objects",
+        reads.len(),
+        untouched.len()
+    );
+    let mut read_keys = BTreeSet::new();
+    for record in &reads {
+        let key = record.key.as_deref().unwrap_or_default();
+        ensure!(
+            record.kind == OperationKind::Get
+                && record.outcome == OperationOutcome::Ok
+                && untouched.get(key) == record.value_sha256.as_ref()
+                && hold.contains(record.started_at_ms, record.ended_at_ms)
+                && record.started_at_ms >= probes_allowed_from_ms
+                && read_keys.insert(key),
+            "{NODE_DOWN_READ_HISTORY_ARTIFACT} record {} is not one successful post-detection read of an untouched prefilled object with its prefill hash",
+            record.id
+        );
+    }
+
+    let position = |stage: &str, status: RunEventStatus| {
+        events
+            .iter()
+            .position(|event| event.stage == stage && event.status == status)
+            .with_context(|| format!("run-events.jsonl lacks a {stage} {status:?} event"))
+    };
+    let crash = position("crash-recovery-boundary", RunEventStatus::Succeeded)?;
+    let hold_started = position("node-down-hold", RunEventStatus::Started)?;
+    let write_started = position("node-down-write", RunEventStatus::Started)?;
+    let write_succeeded = position("node-down-write", RunEventStatus::Succeeded)?;
+    let hold_succeeded = position("node-down-hold", RunEventStatus::Succeeded)?;
+    let removal = position("fault-delete", RunEventStatus::Started)?;
+    ensure!(
+        crash < hold_started
+            && hold_started < write_started
+            && write_started < write_succeeded
+            && write_succeeded < hold_succeeded
+            && hold_succeeded < removal
+            && events[hold_started].at_ms <= hold.started_at_ms
+            && hold.ended_at_ms <= events[hold_succeeded].at_ms,
+        "run-events.jsonl does not place the node-down hold and its write probe between the crash boundary and fault removal"
+    );
+    ensure!(
+        events.iter().all(|event| {
+            !matches!(event.stage.as_str(), "node-down-hold" | "node-down-write")
+                || event.status != RunEventStatus::Failed
+        }),
+        "run-events.jsonl records a failed node-down step"
+    );
+
+    validate_write_probe_artifacts_after(
+        NODE_DOWN_WRITE_PROBE,
+        artifacts,
+        metadata,
+        identity,
+        events,
+        bucket,
+        post_recovery_object_count(workload_object_count),
+        hold.started_at_ms,
+        "crash-recovery-boundary",
+    )?;
+    let report = read_json::<PostRecoveryWriteReport>(required(
+        artifacts,
+        NODE_DOWN_WRITE_REPORT_ARTIFACT,
+    )?)?;
+    ensure!(
+        hold.contains(report.started_at_ms, report.completed_at_ms)
+            && report.started_at_ms >= probes_allowed_from_ms,
+        "{NODE_DOWN_WRITE_REPORT_ARTIFACT} ran outside the post-detection part of the node-down hold"
+    );
     Ok(())
 }
 
@@ -8105,7 +8336,8 @@ mod tests {
     use super::{
         ArtifactIdentityPolicy, POD_LIFECYCLE_EVIDENCE_ARTIFACT, RunMetadataArtifact,
         requires_write_quorum_loss_history, validate_availability_artifact,
-        validate_pod_lifecycle_artifact, validate_quorum_edge_read_survival_artifact,
+        validate_node_down_hold_artifacts, validate_pod_lifecycle_artifact,
+        validate_quorum_edge_read_survival_artifact,
     };
     use super::{
         ArtifactValidationOptions, FailureSummary, FaultEvidenceArtifact, OutcomeCountsArtifact,
@@ -8119,11 +8351,16 @@ mod tests {
         validate_target_proof, validate_volume_quorum_health_evidence,
         validate_write_quorum_runtime_evidence,
     };
+    use crate::fault::events::RunEvent;
     use crate::fault::fixture::AdminFixturePlan;
+    use crate::fault::host_storage::HOST_STORAGE_PROOF_ARTIFACT;
+    use crate::fault::node_down::NODE_DOWN_HOLD_ARTIFACT;
     use crate::fault::recovery_health::RECOVERY_HEALTH_ARTIFACT;
     use crate::fault::workload::execution::{
-        AVAILABILITY_REPORT_ARTIFACT, POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
-        POST_RECOVERY_WRITE_REPORT_ARTIFACT, QUORUM_EDGE_READ_SURVIVAL_ARTIFACT,
+        AVAILABILITY_REPORT_ARTIFACT, NODE_DOWN_READ_HISTORY_ARTIFACT,
+        NODE_DOWN_WRITE_HISTORY_ARTIFACT, NODE_DOWN_WRITE_REPORT_ARTIFACT,
+        POST_RECOVERY_WRITE_HISTORY_ARTIFACT, POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+        QUORUM_EDGE_READ_SURVIVAL_ARTIFACT,
     };
     use crate::fault::{
         acknowledged_mutation::AcknowledgedMutationKind,
@@ -8166,9 +8403,10 @@ mod tests {
         scenarios::ADMIN_DECOMMISSION_SCENARIO,
         scenarios::{
             ADMIN_REBALANCE_SCENARIO, DM_FLAKEY_SCENARIO, FaultScenario, IO_EIO_SCENARIO,
-            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_FAILURE_QUORUM_EDGE_SCENARIO,
-            POD_FAILURE_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
-            QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, apply_catalog_defaults, scenario_spec,
+            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, NODE_CRASH_PROXY_SCENARIO,
+            POD_FAILURE_QUORUM_EDGE_SCENARIO, POD_FAILURE_SCENARIO, POD_KILL_ONE_SCENARIO,
+            QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+            apply_catalog_defaults, scenario_spec,
         },
         spec::{FAULT_RUN_API_VERSION, FAULT_RUN_KIND, FaultRunArtifactSpec, FaultRunSpec},
         workload::{ObjectSpec, WorkloadPlan},
@@ -16584,7 +16822,35 @@ mod tests {
                 "passed": true
             }),
         );
-        let probe_prefix = format!("fault-test-post-recovery/{run_id}/");
+        write_write_probe_fixture(
+            &case_dir,
+            scenario,
+            run_id,
+            &format!("fault-test-post-recovery/{run_id}/"),
+            POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
+            POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+            71,
+            200,
+            "post_recovery",
+            "after_fault",
+        );
+    }
+
+    /// Write one complete, valid fresh-write probe (8 objects, one multipart
+    /// completion, one abort, two LISTs) and its report.
+    #[allow(clippy::too_many_arguments)]
+    fn write_write_probe_fixture(
+        case_dir: &std::path::Path,
+        scenario: &str,
+        run_id: &str,
+        probe_prefix: &str,
+        history_artifact: &str,
+        report_artifact: &str,
+        started_at_ms: u64,
+        completed_at_ms: u64,
+        cohort: &str,
+        relation: &str,
+    ) {
         let probe_key = |index: usize| format!("{probe_prefix}object-{index:06}");
         // The complete probe lifecycle in recorder order: PUT+GET per object,
         // multipart complete+GET, multipart abort, live LIST, DELETE+GET 404
@@ -16606,15 +16872,15 @@ mod tests {
                 "key": key,
                 "value_sha256": sha,
                 "size_bytes": sha.map(|_| 4096),
-                "started_at_ms": 71 + ordinal,
-                "ended_at_ms": 71 + ordinal,
+                "started_at_ms": started_at_ms + ordinal,
+                "ended_at_ms": started_at_ms + ordinal,
                 "started_sequence": ordinal * 2 - 1,
                 "ended_sequence": ordinal * 2,
                 "outcome": outcome,
                 "http_status": status,
                 "error": null,
-                "durability_cohort": "post_recovery",
-                "fault_window_relation": "after_fault"
+                "durability_cohort": cohort,
+                "fault_window_relation": relation
             });
             if let Some(listed) = listed {
                 record["listed_keys"] = json!(listed);
@@ -16669,7 +16935,7 @@ mod tests {
         );
         probe_record(
             "list",
-            probe_prefix.clone(),
+            probe_prefix.to_string(),
             None,
             "ok",
             200,
@@ -16681,14 +16947,14 @@ mod tests {
         }
         probe_record(
             "list",
-            probe_prefix.clone(),
+            probe_prefix.to_string(),
             None,
             "ok",
             200,
             Some(Vec::new()),
         );
         fs::write(
-            case_dir.join(POST_RECOVERY_WRITE_HISTORY_ARTIFACT),
+            case_dir.join(history_artifact),
             format!(
                 "{}\n",
                 probe_history
@@ -16700,14 +16966,14 @@ mod tests {
         )
         .expect("probe history");
         write_json(
-            &case_dir,
-            POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+            case_dir,
+            report_artifact,
             &json!({
                 "scenario": scenario,
                 "run_id": run_id,
                 "key_prefix": probe_prefix,
-                "started_at_ms": 71,
-                "completed_at_ms": 200,
+                "started_at_ms": started_at_ms,
+                "completed_at_ms": completed_at_ms,
                 "objects": 8,
                 "puts_verified": 8,
                 "deletes_verified_absent": 8,
@@ -16718,6 +16984,328 @@ mod tests {
                 "passed": true
             }),
         );
+    }
+
+    #[test]
+    fn node_down_hold_artifacts_bind_the_crashed_target_untouched_reads_and_event_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let case_dir = dir.path().to_path_buf();
+        let run_id = "run-00000000-0000-4000-8000-000000000001";
+        let scenario = NODE_CRASH_PROXY_SCENARIO;
+        let bucket = "bucket";
+        let metadata = RunMetadataArtifact {
+            scenario: scenario.to_string(),
+            run_id: run_id.to_string(),
+            context: "real-cluster".to_string(),
+            namespace: "rustfs-fault-test".to_string(),
+            tenant: "fault-tenant".to_string(),
+            storage_class: "rustfs-fault-dm".to_string(),
+            rustfs_image: "rustfs:test".to_string(),
+            workload_objects: 12,
+            workload_concurrency: 4,
+            require_client_disruption: false,
+            recovery_stability_reread_seconds: 60,
+            min_availability_percent: None,
+        };
+        let host_proof = HostStorageMutationProof::prove_device_mapper(
+            HostStorageMutationIntent {
+                scenario: scenario.to_string(),
+                fault_name: "fault-0".to_string(),
+                fault_kind: FaultKind::RustfsBlockDeviceDropWritesCrash
+                    .as_str()
+                    .to_string(),
+                run_id: run_id.to_string(),
+                context: "real-cluster".to_string(),
+                namespace: "rustfs-fault-test".to_string(),
+                tenant: "fault-tenant".to_string(),
+                observer_namespace: "rustfs-fault-observers".to_string(),
+                observer_pod: "observer-worker-a".to_string(),
+                backend_specific_destructive_opt_in: true,
+                allowlist: HostStorageAllowlist {
+                    nodes: vec!["worker-a".to_string()],
+                    devices: vec!["/dev/mapper/rustfs-fault-dm".to_string()],
+                    persistent_volumes: vec!["pv-a".to_string()],
+                },
+                fault_table: None,
+            },
+            HostStorageTargetObservation {
+                node: "worker-a".to_string(),
+                node_uid: "node-uid-a".to_string(),
+                node_labels: BTreeMap::from([(
+                    "kubernetes.io/hostname".to_string(),
+                    "storage-host-a".to_string(),
+                )]),
+                pod: "rustfs-0".to_string(),
+                pod_uid: "uid-0".to_string(),
+                volume_name: "data".to_string(),
+                persistent_volume_claim: "data-rustfs-0".to_string(),
+                persistent_volume_claim_uid: "pvc-uid-0".to_string(),
+                persistent_volume_claim_phase: "Bound".to_string(),
+                persistent_volume: "pv-a".to_string(),
+                persistent_volume_uid: "pv-uid-a".to_string(),
+                persistent_volume_phase: "Bound".to_string(),
+                persistent_volume_claim_ref: HostStoragePersistentVolumeClaimRef {
+                    namespace: "rustfs-fault-test".to_string(),
+                    name: "data-rustfs-0".to_string(),
+                    uid: "pvc-uid-0".to_string(),
+                },
+                node_selector: HostStorageNodeSelector {
+                    key: "kubernetes.io/hostname".to_string(),
+                    operator: "In".to_string(),
+                    values: vec!["storage-host-a".to_string()],
+                },
+                container_mount_path: "/data/rustfs0".to_string(),
+                persistent_volume_path: "/data/rustfs-fault/dm-volume".to_string(),
+                mapper_name: "rustfs-fault-dm".to_string(),
+                logical_device: "/dev/mapper/rustfs-fault-dm".to_string(),
+                canonical_device: "/dev/dm-0".to_string(),
+                mount_source: "/dev/mapper/rustfs-fault-dm".to_string(),
+                mount_canonical_source: "/dev/dm-0".to_string(),
+                filesystem: "ext4".to_string(),
+                recovery_table: "0 1024 linear /dev/loop0 0".to_string(),
+                observed_at_ms: 151,
+            },
+        )
+        .expect("host proof");
+        write_json(&case_dir, HOST_STORAGE_PROOF_ARTIFACT, &json!(host_proof));
+
+        let jsonl = |records: &[Value]| {
+            format!(
+                "{}\n",
+                records
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+        let record =
+            |ordinal: u64, kind: &str, key: String, sha: &str, cohort: &str, at_ms: u64| {
+                json!({
+                    "id": format!("op-{ordinal:06}"),
+                    "scenario": scenario,
+                    "run_id": run_id,
+                    "kind": kind,
+                    "bucket": bucket,
+                    "key": key,
+                    "value_sha256": sha,
+                    "size_bytes": 4096,
+                    "started_at_ms": at_ms,
+                    "ended_at_ms": at_ms,
+                    "started_sequence": ordinal * 2 - 1,
+                    "ended_sequence": ordinal * 2,
+                    "outcome": "ok",
+                    "http_status": 200,
+                    "error": null,
+                    "durability_cohort": cohort
+                })
+            };
+        let key = |index: usize| ObjectSpec::seeded_key(run_id, index);
+        // Six prefilled keys; the workload overwrites key 0, so keys 1..=5 are
+        // exactly the ones the hold must read.
+        let mut history = (0..6)
+            .map(|index| {
+                record(
+                    index as u64 + 1,
+                    "put",
+                    key(index),
+                    &format!("sha-{index}"),
+                    "pre_fault",
+                    10,
+                )
+            })
+            .collect::<Vec<_>>();
+        history.push(record(
+            7,
+            "put",
+            key(0),
+            "sha-overwrite",
+            "fault_active",
+            30,
+        ));
+        fs::write(case_dir.join("history.jsonl"), jsonl(&history)).expect("history");
+
+        let write_reads_at = |indices: &[usize], sha_override: Option<&str>, first_ms: u64| {
+            let reads = indices
+                .iter()
+                .enumerate()
+                .map(|(position, &index)| {
+                    record(
+                        position as u64 + 1,
+                        "get",
+                        key(index),
+                        &sha_override
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("sha-{index}")),
+                        "fault_active",
+                        first_ms + position as u64,
+                    )
+                })
+                .collect::<Vec<_>>();
+            fs::write(
+                case_dir.join(NODE_DOWN_READ_HISTORY_ARTIFACT),
+                jsonl(&reads),
+            )
+            .expect("read history");
+        };
+        // Probes may only start once the node has been down for the minimum
+        // hold (61_000 here).
+        let write_reads = |indices: &[usize], sha_override: Option<&str>| {
+            write_reads_at(indices, sha_override, 62_000)
+        };
+        write_reads(&[1, 2, 3, 4, 5], None);
+
+        let samples = (0..=14)
+            .map(|step| {
+                json!({
+                    "at_ms": 1_000 + step * 5_000,
+                    "present": true,
+                    "uid": "uid-replacement",
+                    "node_name": null,
+                    "phase": "Pending",
+                    "ready": false
+                })
+            })
+            .collect::<Vec<_>>();
+        let hold = json!({
+            "scenario": scenario,
+            "run_id": run_id,
+            "target": {"pod": "rustfs-0", "crashed_pod_uid": "uid-0", "node": "worker-a"},
+            "served_by_pod": "rustfs-1",
+            "min_hold_ms": 60_000,
+            "max_sample_gap_ms": 30_000,
+            "started_at_ms": 1_000,
+            "ended_at_ms": 71_000,
+            "samples": samples,
+            "read_probe": {"objects": 5, "verified": 5, "failures": []}
+        });
+        write_json(&case_dir, NODE_DOWN_HOLD_ARTIFACT, &hold);
+        let node_down_prefix = format!("fault-test-node-down/{run_id}/");
+        write_write_probe_fixture(
+            &case_dir,
+            scenario,
+            run_id,
+            &node_down_prefix,
+            NODE_DOWN_WRITE_HISTORY_ARTIFACT,
+            NODE_DOWN_WRITE_REPORT_ARTIFACT,
+            63_000,
+            64_000,
+            "fault_active",
+            "during_fault",
+        );
+        let event = |at_ms: u64, stage: &str, status: &str| RunEvent {
+            at_ms,
+            scenario: scenario.to_string(),
+            run_id: run_id.to_string(),
+            stage: stage.to_string(),
+            status: serde_json::from_value(json!(status)).expect("status"),
+            message: String::new(),
+            details: None,
+        };
+        let events = vec![
+            event(900, "crash-recovery-boundary", "succeeded"),
+            event(1_000, "node-down-hold", "started"),
+            event(62_900, "node-down-write", "started"),
+            event(64_500, "node-down-write", "succeeded"),
+            event(71_500, "node-down-hold", "succeeded"),
+            event(72_000, "fault-delete", "started"),
+        ];
+        let artifacts = [
+            HOST_STORAGE_PROOF_ARTIFACT,
+            "history.jsonl",
+            NODE_DOWN_HOLD_ARTIFACT,
+            NODE_DOWN_READ_HISTORY_ARTIFACT,
+            NODE_DOWN_WRITE_REPORT_ARTIFACT,
+            NODE_DOWN_WRITE_HISTORY_ARTIFACT,
+        ]
+        .into_iter()
+        .map(|name| (name.to_string(), case_dir.join(name)))
+        .collect::<BTreeMap<_, _>>();
+        let validate = |events: &[RunEvent]| {
+            validate_node_down_hold_artifacts(
+                &artifacts,
+                &metadata,
+                ArtifactIdentityPolicy::LegacyCompatible,
+                events,
+                bucket,
+                12,
+            )
+        };
+        let expect_err = |events: &[RunEvent], expected: &str| {
+            let error = validate(events).expect_err(expected);
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        };
+
+        validate(&events).expect("valid node-down hold");
+
+        // Reading the overwritten key instead of an untouched one.
+        write_reads(&[0, 1, 2, 3, 4], None);
+        expect_err(&events, "is not one successful post-detection read");
+        // Skipping one untouched key.
+        write_reads(&[1, 2, 3, 4], None);
+        expect_err(&events, "holds 4 records for 5 untouched");
+        // Bytes that are not the prefill payload.
+        write_reads(&[1, 2, 3, 4, 5], Some("sha-other"));
+        expect_err(&events, "is not one successful post-detection read");
+        // Reads taken before RustFS could have noticed the loss.
+        write_reads_at(&[1, 2, 3, 4, 5], None, 1_500);
+        expect_err(&events, "is not one successful post-detection read");
+        write_reads(&[1, 2, 3, 4, 5], None);
+
+        // The hold names a Pod that is not the crashed host-storage target.
+        let mut wrong_target = hold.clone();
+        wrong_target["target"]["crashed_pod_uid"] = json!("uid-9");
+        write_json(&case_dir, NODE_DOWN_HOLD_ARTIFACT, &wrong_target);
+        expect_err(&events, "is not the host-storage-proof.json target");
+        write_json(&case_dir, NODE_DOWN_HOLD_ARTIFACT, &hold);
+
+        // Fault removal began before the hold finished.
+        let mut early_removal = events.clone();
+        early_removal.swap(4, 5);
+        expect_err(
+            &early_removal,
+            "between the crash boundary and fault removal",
+        );
+        // A failed node-down step next to a later success.
+        let mut failed_step = events.clone();
+        failed_step.insert(2, event(1_200, "node-down-hold", "failed"));
+        expect_err(&failed_step, "records a failed node-down step");
+
+        // The write probe ran inside the hold but before detection.
+        write_write_probe_fixture(
+            &case_dir,
+            scenario,
+            run_id,
+            &node_down_prefix,
+            NODE_DOWN_WRITE_HISTORY_ARTIFACT,
+            NODE_DOWN_WRITE_REPORT_ARTIFACT,
+            2_000,
+            3_000,
+            "fault_active",
+            "during_fault",
+        );
+        let mut early_write_events = events.clone();
+        early_write_events[2].at_ms = 1_900;
+        early_write_events[3].at_ms = 3_500;
+        expect_err(
+            &early_write_events,
+            "ran outside the post-detection part of the node-down hold",
+        );
+
+        // The write probe ran before the hold began.
+        write_write_probe_fixture(
+            &case_dir,
+            scenario,
+            run_id,
+            &node_down_prefix,
+            NODE_DOWN_WRITE_HISTORY_ARTIFACT,
+            NODE_DOWN_WRITE_REPORT_ARTIFACT,
+            500,
+            800,
+            "fault_active",
+            "during_fault",
+        );
+        expect_err(&events, "started before the node-down hold began");
     }
 
     #[test]

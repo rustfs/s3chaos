@@ -50,6 +50,7 @@ use uuid::Uuid;
 pub(in crate::fault) mod access;
 mod ack;
 mod injection;
+mod node_down;
 mod post_recovery;
 mod recovery;
 mod setup;
@@ -225,6 +226,8 @@ async fn run_fault_case(
                 .await?;
             deadline.check()?;
             run.prepare_crash_boundary(&mut active.fault, active.fault_active_at_ms)?;
+            run.hold_node_down(&mut prepared, &target, &active.fault)
+                .await?;
             let removal = run.remove_fault(&mut active.fault)?;
             let recovered = run
                 .recover_access(&mut prepared, &target, &mut staged_multipart_uploads)

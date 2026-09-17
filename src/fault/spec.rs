@@ -15,8 +15,10 @@
 use crate::fault::backends::lifecycle::evidence::POD_LIFECYCLE_EVIDENCE_ARTIFACT;
 use crate::fault::recovery_health::RECOVERY_HEALTH_ARTIFACT;
 use crate::fault::workload::execution::{
-    AVAILABILITY_REPORT_ARTIFACT, POST_RECOVERY_WRITE_HISTORY_ARTIFACT,
-    POST_RECOVERY_WRITE_REPORT_ARTIFACT, QUORUM_EDGE_READ_SURVIVAL_ARTIFACT,
+    AVAILABILITY_REPORT_ARTIFACT, NODE_DOWN_READ_HISTORY_ARTIFACT,
+    NODE_DOWN_WRITE_HISTORY_ARTIFACT, NODE_DOWN_WRITE_REPORT_ARTIFACT,
+    POST_RECOVERY_WRITE_HISTORY_ARTIFACT, POST_RECOVERY_WRITE_REPORT_ARTIFACT,
+    QUORUM_EDGE_READ_SURVIVAL_ARTIFACT,
 };
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -573,6 +575,17 @@ impl FaultRunArtifactSpec {
         }
         if crate::fault::scenarios::requires_quorum_edge_read_survival(scenario) {
             names.push(QUORUM_EDGE_READ_SURVIVAL_ARTIFACT.to_string());
+        }
+        if crate::fault::scenarios::holds_node_down_after_crash(scenario) {
+            names.extend(
+                [
+                    crate::fault::node_down::NODE_DOWN_HOLD_ARTIFACT,
+                    NODE_DOWN_READ_HISTORY_ARTIFACT,
+                    NODE_DOWN_WRITE_REPORT_ARTIFACT,
+                    NODE_DOWN_WRITE_HISTORY_ARTIFACT,
+                ]
+                .map(str::to_string),
+            );
         }
         if scenario == crate::fault::scenarios::ADMIN_REBALANCE_SCENARIO {
             names.extend(

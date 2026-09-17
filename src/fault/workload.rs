@@ -243,6 +243,30 @@ struct RecordedDelete {
     is_delete_marker: Option<bool>,
 }
 
+/// Where a fresh-write probe keeps its objects. Each scope has its own
+/// run-scoped prefix outside the workload prefix, so neither the checker's
+/// LIST nor another probe's LIST can see its keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteProbeScope {
+    /// After the fault is removed and the cluster recovered.
+    PostRecovery,
+    /// While a crashed node is still held down.
+    NodeDown,
+}
+
+impl WriteProbeScope {
+    pub(crate) fn key_prefix(self, run_id: &str) -> String {
+        match self {
+            Self::PostRecovery => format!("fault-test-post-recovery/{run_id}/"),
+            Self::NodeDown => format!("fault-test-node-down/{run_id}/"),
+        }
+    }
+
+    pub(crate) fn key(self, run_id: &str, index: usize) -> String {
+        format!("{}object-{index:06}", self.key_prefix(run_id))
+    }
+}
+
 impl ObjectSpec {
     pub fn key_prefix(run_id: &str) -> String {
         format!("fault-test/{run_id}/")
@@ -261,14 +285,7 @@ impl ObjectSpec {
     /// prefix and treats every key there as something history must explain,
     /// so probe objects must never appear in that listing.
     pub fn post_recovery_key_prefix(run_id: &str) -> String {
-        format!("fault-test-post-recovery/{run_id}/")
-    }
-
-    pub(crate) fn post_recovery_key(run_id: &str, index: usize) -> String {
-        format!(
-            "{}object-{index:06}",
-            Self::post_recovery_key_prefix(run_id)
-        )
+        WriteProbeScope::PostRecovery.key_prefix(run_id)
     }
 
     pub(crate) fn prepare_post_recovery(
@@ -277,7 +294,23 @@ impl ObjectSpec {
         size_bytes: usize,
         seed: u64,
     ) -> PreparedObject {
-        let key = Self::post_recovery_key(run_id, index);
+        Self::prepare_write_probe(
+            WriteProbeScope::PostRecovery,
+            run_id,
+            index,
+            size_bytes,
+            seed,
+        )
+    }
+
+    pub(crate) fn prepare_write_probe(
+        scope: WriteProbeScope,
+        run_id: &str,
+        index: usize,
+        size_bytes: usize,
+        seed: u64,
+    ) -> PreparedObject {
+        let key = scope.key(run_id, index);
         let body = seeded_bytes(seed, index, size_bytes);
         let sha256 = sha256_hex(&body);
         PreparedObject {

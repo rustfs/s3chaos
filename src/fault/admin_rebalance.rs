@@ -1698,6 +1698,7 @@ impl LiveAdminRebalanceDriver {
             s3,
             history: &history,
             run_id: &self.run_id,
+            scope: crate::fault::workload::WriteProbeScope::PostRecovery,
             seed: workload_plan.seed ^ POST_RECOVERY_SEED_SALT,
             object_count,
             concurrency: workload_plan.concurrency,

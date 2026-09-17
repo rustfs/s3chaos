@@ -45,6 +45,7 @@ pub const STRESS_CPU_SCENARIO: &str = "stress-cpu";
 pub const STRESS_MEMORY_SCENARIO: &str = "stress-memory";
 pub const DM_FLAKEY_SCENARIO: &str = "dm-flakey";
 pub const DM_FLAKEY_VERSIONED_HOT_SCENARIO: &str = "dm-flakey-versioned-hot";
+pub const NODE_CRASH_PROXY_SCENARIO: &str = "node-crash-proxy";
 pub const DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO: &str = "dm-drop-writes-after-ack-put";
 pub const DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO: &str = "dm-drop-writes-after-ack-overwrite";
 pub const DM_DROP_WRITES_AFTER_ACK_DELETE_MARKER_SCENARIO: &str =
@@ -146,6 +147,14 @@ impl FaultScenarioWorkloadProfile {
 /// regression, not expected disruption.
 pub fn requires_quorum_edge_read_survival(scenario: &str) -> bool {
     scenario == POD_FAILURE_QUORUM_EDGE_SCENARIO
+}
+
+/// Scenarios that keep the crashed node down after the drop_writes crash
+/// boundary and prove the surviving servers keep serving before the device
+/// is restored. The taint that quarantines the node keeps the replacement
+/// Pod unscheduled, so no second injection is needed to hold it offline.
+pub fn holds_node_down_after_crash(scenario: &str) -> bool {
+    scenario == NODE_CRASH_PROXY_SCENARIO
 }
 
 pub fn acknowledged_mutation_kind(scenario: &str) -> Option<AcknowledgedMutationKind> {
@@ -929,6 +938,38 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         validation: "the crash window contains at least one versioned mutation acknowledged while drop_writes is active; after forced Pod loss, unmount, healthy-table restore and remount, all committed object versions are re-read by versionId, delete markers remain latest, and successful reads never return corrupt bytes; because only one EC volume is lost this is a negative-control proxy, not quorum-loss proof",
         observability: "run-spec.json/yaml, host-storage-proof.json, host-storage-post-cleanup.json, dm-filesystem-check.json, workload-plan.json, history.jsonl, crash-window-evidence.json, dm-crash-boundary.json, dm-crash-recovered.json, checker-report.json, dmsetup table/status, mount identity, Pod UID transition, events, RustFS logs",
         conflict_domain: "dedicated Linux runner or lab host with an explicitly assigned block device; never part of shared test storage",
+    },
+    FaultScenarioSpec {
+        scenario: NODE_CRASH_PROXY_SCENARIO,
+        detector: FaultDetectorSpec::diagnostic_only(&[
+            DurabilityBugFamily::CommitMetadataLoss,
+            DurabilityBugFamily::RecoveryAvailabilityRegression,
+            DurabilityBugFamily::HealRegression,
+        ]),
+        case_name: "fault_node_crash_proxy_keeps_serving_and_recovers_the_node",
+        description: "Node-level soft-power-loss proxy: silently drop the node's block writes under versioned load, force-delete its RustFS Pod and unmount to discard cached state, keep the node quarantined so the server stays down while the survivors must keep serving reads and fresh writes, then restore the device and require every drive back ok with the object model intact.",
+        priority: FaultPriority::P0,
+        backend: FaultBackend::DeviceMapper,
+        status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::VersionedHotMutations,
+        isolation: FaultIsolation::DedicatedLinuxBlockDevice,
+        crds: &[],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::None,
+        impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
+        boundary: "rustfs-workload/node-soft-power-loss",
+        ci_phase: "faults",
+        target: "the one RustFS server whose only data volume is the dedicated device-mapper PV: its writes are dropped, its Pod is force-deleted, and its node stays tainted while the other servers serve",
+        target_proof: &[
+            "host-storage proof must bind exact node/device/PV allowlists and rollback/quarantine/post-cleanup contracts before mutation",
+            "dmsetup table/status must prove the drop_writes table stayed active until the owning Pod was force-deleted and the filesystem unmounted",
+            "node-down-hold.json must sample the target Pod unready and off the quarantined node for the whole hold, with no gap longer than the sampling bound",
+            "run-events.jsonl must order the crash boundary, the node-down hold, and fault removal",
+        ],
+        validation: "the crash window contains an acknowledged versioned mutation while drop_writes is active; after the crash boundary the node stays down for at least the minimum hold, and only then must every prefilled object the workload never touched read back with its committed bytes and a fresh PUT/GET/LIST/DELETE/multipart probe succeed through a surviving server, with the node still down; after the healthy table is restored, the filesystem check passes, RustFS reports every drive ok and every Pod ready, fresh post-recovery writes succeed, and every committed version is re-read; because one EC volume is lost this remains a durability negative-control proxy, while the node-down availability contract is a real gate",
+        observability: "node-down-hold.json, node-down-write-report.json, node-down-write-history.jsonl, host-storage-proof.json, host-storage-post-cleanup.json, dm-filesystem-check.json, crash-window-evidence.json, dm-crash-boundary.json, dm-crash-recovered.json, recovery-health.json, history.jsonl, checker-report.json, dmsetup table/status, Pod UID transition, events, RustFS logs",
+        conflict_domain: "dedicated Linux runner or lab host with an explicitly assigned block device; the quarantined node must not host anything else the run depends on",
     },
     FaultScenarioSpec {
         scenario: DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
@@ -1889,8 +1930,8 @@ mod tests {
             );
         }
 
-        assert_eq!(executable_scenario_catalog().count(), 29);
-        assert_eq!(scenario_catalog().len(), 34);
+        assert_eq!(executable_scenario_catalog().count(), 30);
+        assert_eq!(scenario_catalog().len(), 35);
         assert_eq!(
             scenario_catalog()
                 .iter()

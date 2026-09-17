@@ -243,6 +243,29 @@ unset RUSTFS_FAULT_TEST_DM_FAULT_TABLE
 make fault-dm-run SCENARIO=dm-flakey-versioned-hot
 ```
 
+Run the node-level soft-power-loss proxy with the same variables. It performs
+the same drop_writes crash boundary and keeps the node quarantined. Once the
+node has been down for 60 seconds, so RustFS can have noticed the loss, the
+survivors must serve every prefilled object the workload never touched and a
+fresh PUT/GET/LIST/DELETE/multipart probe; the node stays down until both
+probes finish. The harness samples the target Pod every five seconds (each
+`kubectl` call bounded to ten seconds) and fails if it is ever Ready or
+scheduled back onto the quarantined node. The run needs `get` on Pods in the
+test namespace, which the fault harness already uses, and suite budgets
+reserve the 60-second hold per attempt:
+
+```bash
+unset RUSTFS_FAULT_TEST_DM_FAULT_TABLE
+make fault-dm-run SCENARIO=node-crash-proxy
+```
+
+The hold writes `node-down-hold.json`, `node-down-read-history.jsonl`,
+`node-down-write-report.json`, and `node-down-write-history.jsonl`.
+`fault-validate-artifacts` re-derives the untouched read cohort from
+`history.jsonl`, binds the hold to the target in `host-storage-proof.json`, and
+requires run events to order the crash boundary, the hold, its write probe, and
+fault removal; both probes must start after the 60-second minimum.
+
 Run one true ACK-then-activate detector by selecting one typed scenario, for
 example:
 

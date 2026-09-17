@@ -415,7 +415,8 @@ guardrails when implementing the ordered TODO below.
   recovery-health gate, the post-recovery write probe, and (for the first
   two) the availability contract. Live calibration is still pending.
 
-- [ ] PARTIAL: Simultaneous multi-node failure (rustfs/backlog#2447).
+- [x] DONE: Simultaneous multi-node failure and node-level crash proxy
+  (rustfs/backlog#2447).
   Meaning: `pod-failure-quorum-edge` fails two RustFS Pods with one fixed-count
   PodChaos after the live runtime topology proof shows that removing their
   drives leaves read quorum but breaks write quorum; any other geometry fails
@@ -424,9 +425,19 @@ guardrails when implementing the ordered TODO below.
   prefilled cohort through a forward re-pinned to a surviving Pod. The
   actual PodChaos targets are bound to the erasure-set membership at
   activation, after the workload, and again by offline artifact validation.
-  Still open: `node-crash-proxy`, which composes pod-failure with the same
-  node's `drop_writes` crash boundary and needs catalog-declared composite
-  injection in the plan model, plus live calibration of both.
+  `node-crash-proxy` runs the device-mapper `drop_writes` crash boundary under
+  versioned load and then holds the node down: the `NoSchedule` quarantine
+  taint and the node-local PV keep the replacement Pod unscheduled, so no
+  second injection is needed. A composite PodChaos was rejected because it
+  cannot inject into the Pending replacement and, applied before the boundary,
+  would stop the writes `drop_writes` is meant to drop. The target Pod is
+  sampled every five seconds with bounded `kubectl` calls; once the node has
+  been down for 60 seconds the survivors must serve every prefilled object the
+  workload never touched and a fresh write probe while it stays down
+  (`node-down-hold.json`, `node-down-write-report.json`), and suite budgets
+  reserve that hold; recovery then
+  requires every drive `ok` again. Live calibration of both scenarios, including
+  the hold length against RustFS drive-offline detection, is still pending.
 
 - [x] DONE: Add host/storage mutation preflight.
   Meaning: executable device-mapper scenarios now require exact singleton

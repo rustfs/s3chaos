@@ -22,7 +22,7 @@ use crate::fault::{
     quorum::{QuorumCaseClass, QuorumMutationClass},
     workload::{
         GetObjectResult, ObjectSpec, S3WorkloadClient, StagedMultipartUpload, WorkloadOperation,
-        WorkloadOperationMix, WorkloadPlan, sha256_hex,
+        WorkloadOperationMix, WorkloadPlan, WriteProbeScope, sha256_hex,
     },
 };
 use crate::framework::{artifacts::ArtifactCollector, command::CommandSpec};
@@ -3280,6 +3280,10 @@ pub(in crate::fault) const POST_RECOVERY_WRITE_REPORT_ARTIFACT: &str =
     "post-recovery-write-report.json";
 pub(in crate::fault) const POST_RECOVERY_WRITE_HISTORY_ARTIFACT: &str =
     "post-recovery-write-history.jsonl";
+/// The same fresh-write probe, run while a crashed node is still held down.
+pub(in crate::fault) const NODE_DOWN_READ_HISTORY_ARTIFACT: &str = "node-down-read-history.jsonl";
+pub(in crate::fault) const NODE_DOWN_WRITE_REPORT_ARTIFACT: &str = "node-down-write-report.json";
+pub(in crate::fault) const NODE_DOWN_WRITE_HISTORY_ARTIFACT: &str = "node-down-write-history.jsonl";
 const POST_RECOVERY_MIN_OBJECTS: usize = 8;
 const POST_RECOVERY_MAX_OBJECTS: usize = 64;
 const POST_RECOVERY_OBJECT_SIZE_STEP_BYTES: usize = 4 * 1024;
@@ -3304,6 +3308,7 @@ pub(in crate::fault) struct PostRecoveryWriteRequest<'a> {
     /// whose phase chain the checker and artifact validation authenticate.
     pub(in crate::fault) history: &'a Recorder,
     pub(in crate::fault) run_id: &'a str,
+    pub(in crate::fault) scope: WriteProbeScope,
     pub(in crate::fault) seed: u64,
     pub(in crate::fault) object_count: usize,
     pub(in crate::fault) concurrency: usize,
@@ -3410,17 +3415,19 @@ pub(in crate::fault) async fn run_post_recovery_write_probe(
         s3,
         history,
         run_id,
+        scope,
         seed,
         object_count,
         concurrency,
         deadline,
     } = request;
+    let scope = *scope;
     let object_count = *object_count;
     ensure!(
         object_count >= POST_RECOVERY_MIN_OBJECTS,
         "post-recovery write probe needs at least {POST_RECOVERY_MIN_OBJECTS} objects"
     );
-    let prefix = ObjectSpec::post_recovery_key_prefix(run_id);
+    let prefix = scope.key_prefix(run_id);
     let started_at_ms = now_ms();
     let failures = AsyncMutex::new(Vec::<String>::new());
     let record_failure = |message: String| {
@@ -3431,7 +3438,8 @@ pub(in crate::fault) async fn run_post_recovery_write_probe(
     // Phase 1: PUT + GET verify every object.
     let objects = (0..object_count)
         .map(|index| {
-            ObjectSpec::prepare_post_recovery(
+            ObjectSpec::prepare_write_probe(
+                scope,
                 run_id,
                 index,
                 post_recovery_object_size(index),
@@ -3489,7 +3497,8 @@ pub(in crate::fault) async fn run_post_recovery_write_probe(
 
     // Phase 2: one multipart completion and one multipart abort.
     deadline.check()?;
-    let multipart = ObjectSpec::prepare_post_recovery(
+    let multipart = ObjectSpec::prepare_write_probe(
+        scope,
         run_id,
         object_count,
         POST_RECOVERY_MULTIPART_SIZE_BYTES,
@@ -3537,7 +3546,8 @@ pub(in crate::fault) async fn run_post_recovery_write_probe(
             0
         }
     };
-    let abort_target = ObjectSpec::prepare_post_recovery(run_id, object_count + 1, 4096, *seed);
+    let abort_target =
+        ObjectSpec::prepare_write_probe(scope, run_id, object_count + 1, 4096, *seed);
     let multipart_aborts_ok = match s3.abort_multipart_object(&abort_target, history).await? {
         OperationOutcome::Ok => 1,
         outcome => {

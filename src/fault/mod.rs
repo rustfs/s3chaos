@@ -30,6 +30,7 @@ pub mod fixture;
 pub mod fresh_volume;
 pub mod history;
 pub(crate) mod host_storage;
+pub(crate) mod node_down;
 pub mod on_disk_bitrot;
 pub mod plan;
 pub mod pods;

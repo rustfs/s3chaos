@@ -841,11 +841,19 @@ fn attempt_minimum_required_seconds(config: &FaultTestConfig) -> Result<u64> {
 }
 
 pub(crate) fn attempt_minimum_required_duration(config: &FaultTestConfig) -> Result<Duration> {
+    // The node-down hold runs after the workload and before fault removal,
+    // on the same attempt deadline.
+    let node_down_hold = if crate::fault::scenarios::holds_node_down_after_crash(&config.scenario) {
+        crate::fault::node_down::NODE_DOWN_MIN_HOLD
+    } else {
+        Duration::ZERO
+    };
     config
         .duration
         .checked_add(config.cluster.timeout)
         .and_then(|duration| duration.checked_add(config.recovery_stability_reread))
-        .context("suite attempt duration plus recovery timeout plus recovery stability reread overflowed")
+        .and_then(|duration| duration.checked_add(node_down_hold))
+        .context("suite attempt duration plus recovery timeout, recovery stability reread, and node-down hold overflowed")
 }
 
 fn attempt_seed(base_seed: Option<u64>, attempt_index: usize, repetition: usize) -> Option<u64> {
@@ -1722,6 +1730,18 @@ scenarios:
         assert_eq!(selections[2].2, 1);
         assert_ne!(selections[0].3, selections[1].3);
         assert_ne!(selections[2].3, selections[3].3);
+    }
+
+    #[test]
+    fn node_down_hold_is_reserved_in_the_attempt_budget() {
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.scenario = crate::fault::scenarios::DM_FLAKEY_VERSIONED_HOT_SCENARIO.to_string();
+        let without_hold = super::attempt_minimum_required_duration(&base).expect("budget");
+        base.scenario = crate::fault::scenarios::NODE_CRASH_PROXY_SCENARIO.to_string();
+        assert_eq!(
+            super::attempt_minimum_required_duration(&base).expect("budget"),
+            without_hold + crate::fault::node_down::NODE_DOWN_MIN_HOLD
+        );
     }
 
     #[test]

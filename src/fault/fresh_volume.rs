@@ -3978,6 +3978,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
                 s3: &s3,
                 history: &post_write_history,
                 run_id: self.run_id,
+                scope: crate::fault::workload::WriteProbeScope::PostRecovery,
                 seed: workload_plan.seed,
                 object_count: post_recovery_object_count(workload_plan.object_count),
                 concurrency: workload_plan.concurrency,

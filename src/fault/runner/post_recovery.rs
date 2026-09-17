@@ -68,6 +68,7 @@ impl FaultRun<'_> {
             s3: &s3,
             history: &history,
             run_id,
+            scope: crate::fault::workload::WriteProbeScope::PostRecovery,
             seed: workload_plan.seed ^ POST_RECOVERY_SEED_SALT,
             object_count,
             concurrency: workload_plan.concurrency,
@@ -124,7 +125,7 @@ impl FaultRun<'_> {
 /// A probe cut short by the suite budget is the suite deadline, the verdict
 /// the recommit and availability-endpoint paths give it too; anything else
 /// that stops the probe before it can report is a harness execution error.
-fn probe_error_classification(error: &anyhow::Error) -> &'static str {
+pub(super) fn probe_error_classification(error: &anyhow::Error) -> &'static str {
     if error.is::<SuiteDeadlineExceeded>() {
         "test_or_environment"
     } else {
@@ -164,6 +165,7 @@ mod tests {
             s3: &client,
             history: &history,
             run_id: "run-1",
+            scope: crate::fault::workload::WriteProbeScope::PostRecovery,
             seed: 1,
             object_count: 8,
             concurrency: 4,
