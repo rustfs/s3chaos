@@ -1264,7 +1264,7 @@ pub(crate) fn prepare_dm_flakey(
         &helper_pod,
         spec.node,
         spec.helper_image,
-        spec.mount_path,
+        (spec.behavior == DmFaultBehavior::StaleEio).then_some(spec.mount_path),
     );
     collector.write_text(case_name, "dm-helper-manifest.yaml", &manifest)?;
     let mut guard = DmFlakeyGuard {
@@ -3385,8 +3385,17 @@ fn dm_helper_manifest(
     name: &str,
     node: &str,
     image: &str,
-    target_path: &str,
+    target_path: Option<&str>,
 ) -> String {
+    // A private target mount keeps the filesystem alive across host unmounts.
+    // Only stale-return helpers need direct access to the retained filesystem.
+    let target_mount = target_path.map_or(
+        "",
+        |_| "        - name: target-volume\n          mountPath: /target\n",
+    );
+    let target_volume = target_path.map_or_else(String::new, |path| {
+        format!("    - name: target-volume\n      hostPath:\n        path: {path}\n        type: Directory\n")
+    });
     format!(
         r#"apiVersion: v1
 kind: Pod
@@ -3410,9 +3419,7 @@ spec:
         - name: host-root
           mountPath: /host
           mountPropagation: HostToContainer
-        - name: target-volume
-          mountPath: /target
-        - name: helper-journal
+{target_mount}        - name: helper-journal
           mountPath: /journal
         - name: helper-lock
           mountPath: /var/lock/s3chaos
@@ -3421,11 +3428,7 @@ spec:
       hostPath:
         path: /
         type: Directory
-    - name: target-volume
-      hostPath:
-        path: {target_path}
-        type: Directory
-    - name: helper-journal
+{target_volume}    - name: helper-journal
       emptyDir: {{}}
     - name: helper-lock
       emptyDir: {{}}
@@ -3630,7 +3633,7 @@ mod tests {
             "rustfs-fault-dm-helper-run123",
             "worker-a",
             "busybox:test",
-            "/var/lib/rustfs-stale",
+            Some("/var/lib/rustfs-stale"),
         );
 
         assert!(manifest.contains("nodeName: worker-a"));
@@ -3645,6 +3648,35 @@ mod tests {
     }
 
     #[test]
+    fn dm_crash_helper_does_not_pin_the_target_filesystem() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let manifest = dm_helper_manifest(
+            &config.cluster,
+            "rustfs-fault-dm-helper-run123",
+            "worker-a",
+            "busybox:test",
+            None,
+        );
+        let pod: serde_json::Value = serde_yaml_ng::from_str(&manifest).unwrap();
+        let mounts = pod["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .unwrap();
+        assert!(mounts.iter().all(|mount| mount["name"] != "target-volume"));
+        let host = mounts
+            .iter()
+            .find(|mount| mount["name"] == "host-root")
+            .unwrap();
+        assert_eq!(host["mountPropagation"], "HostToContainer");
+        assert!(
+            pod["spec"]["volumes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|volume| volume["name"] != "target-volume")
+        );
+    }
+
+    #[test]
     fn dm_helper_stays_alive_until_explicitly_deleted() {
         let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
         let manifest = dm_helper_manifest(
@@ -3652,7 +3684,7 @@ mod tests {
             "rustfs-fault-dm-helper-run123",
             "worker-a",
             "busybox:test",
-            "/var/lib/rustfs-stale",
+            Some("/var/lib/rustfs-stale"),
         );
 
         // The guard always tears the pod down explicitly (restore/Drop), so it

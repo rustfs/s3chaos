@@ -443,7 +443,10 @@ fn runtime_single_set_membership(
         .context("RustFS server/drive membership does not match the proven erasure-set shape")
 }
 
-fn runtime_server_pod_name(endpoint: &str, candidate_pods: &BTreeSet<&str>) -> Result<String> {
+pub(crate) fn runtime_server_pod_name(
+    endpoint: &str,
+    candidate_pods: &BTreeSet<&str>,
+) -> Result<String> {
     let endpoint_with_scheme = if endpoint.contains("://") {
         endpoint.to_string()
     } else {
@@ -1180,5 +1183,22 @@ mod tests {
                 .expect("pod name"),
             "rustfs-0"
         );
+    }
+    #[test]
+    fn runtime_server_pod_name_requires_one_match_for_authority_and_url() {
+        let candidates = ["rustfs-0", "rustfs-1"].into_iter().collect();
+        for endpoint in [
+            "rustfs-0.rustfs.test.svc:9000",
+            "http://rustfs-0.rustfs.test.svc:9000",
+            "https://rustfs-0.rustfs.test.svc:9000",
+        ] {
+            assert_eq!(
+                runtime_server_pod_name(endpoint, &candidates).unwrap(),
+                "rustfs-0"
+            );
+        }
+        assert!(runtime_server_pod_name("unknown.test.svc:9000", &candidates).is_err());
+        let ambiguous = ["rustfs-0", "rustfs-0.rustfs"].into_iter().collect();
+        assert!(runtime_server_pod_name("rustfs-0.rustfs.test.svc:9000", &ambiguous).is_err());
     }
 }
