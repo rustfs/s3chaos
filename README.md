@@ -146,6 +146,15 @@ format version 1, erasure version 3, and SIPMOD+PARITY checksums, and fails
 closed when an unknown profile is encountered.
 Stale-disk cases require the existing supervised device-mapper environment.
 
+Fresh-volume qualification proves replacement-shard dependence after the owned
+heal completes. With the same sibling volumes unavailable, it requires a
+successful sealed-version GET, a server failure while only the replacement's
+receipt-mapped data part receives read EIO, then the original bytes after that
+denial is removed. Bucket metadata is never the denial target. The read proof
+uses schema 2 and binds all three reads to the same controller resource and
+target cohort; schema 1 evidence cannot satisfy this control. Automatic healing
+may complete before the ordinary post-replacement read.
+
 Every invocation gets a case-qualified run root under
 `target/fault-tests/qualifications/` unless `RUSTFS_FAULT_TEST_RUN_ROOT` is
 explicitly set. The run root contains `qualification-plan.json`,

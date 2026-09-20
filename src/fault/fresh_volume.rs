@@ -43,6 +43,7 @@ use crate::fault::{
     checker,
     config::FaultTestConfig,
     events::{RunEventRecorder, RunEventStatus},
+    fault_lifecycle::FaultLifecyclePort,
     fixture,
     history::{OperationKind, OperationOutcome, Recorder},
     plan::{FaultInjection, FaultKind, FaultSelection, FaultTarget, StorageRecoveryExecutionPlan},
@@ -69,7 +70,9 @@ use crate::fault::{
         ShardMappingSource, StorageRecoveryArtifactIdentity, StorageRecoveryCase,
         StorageVolumeIdentity, VERSION_SHARD_MAPPING_ARTIFACT, VersionShardMappingObservation,
     },
-    storage_recovery_helper::{STORAGE_HELPER_JOURNAL_ROOT, STORAGE_HELPER_VOLUME_ROOT},
+    storage_recovery_helper::{
+        OfflineXl2InspectResponse, STORAGE_HELPER_JOURNAL_ROOT, STORAGE_HELPER_VOLUME_ROOT,
+    },
     storage_recovery_lease::{
         KubernetesStorageLeaseAdapter, StorageRecoveryCleanupProof, release_owned_lease,
     },
@@ -114,7 +117,7 @@ pub(crate) const FRESH_VOLUME_ABORT_PROOF_ARTIFACT: &str =
 pub(crate) const FRESH_VOLUME_HEAL_START_ARTIFACT: &str = "fresh-volume-heal-start.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct QuorumReadTrialEvidence {
     phase: String,
     target_proof_sha256: String,
@@ -134,7 +137,21 @@ struct QuorumReadTrialEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReplacementShardControl {
+    before: QuorumReadTrialEvidence,
+    denied: QuorumReadTrialEvidence,
+    restored: QuorumReadTrialEvidence,
+    relative_part_path: String,
+    denial_snapshot_body: String,
+    denial_snapshot_sha256: String,
+    denial_active_at_ms: u64,
+    denial_after_read_at_ms: u64,
+    denial_removed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct FreshVolumeReadMatrixEvidence {
     schema_version: u8,
     identity: StorageRecoveryArtifactIdentity,
@@ -145,8 +162,7 @@ pub(crate) struct FreshVolumeReadMatrixEvidence {
     version_id: String,
     expected_sha256: String,
     ordinary_get_operation_id: String,
-    missing: QuorumReadTrialEvidence,
-    repaired: QuorumReadTrialEvidence,
+    control: ReplacementShardControl,
 }
 
 impl FreshVolumeReadMatrixEvidence {
@@ -155,7 +171,7 @@ impl FreshVolumeReadMatrixEvidence {
         records: &[crate::fault::history::OperationRecord],
     ) -> Result<()> {
         ensure!(
-            self.schema_version == 1,
+            self.schema_version == 2,
             "unsupported fresh-volume read proof schema"
         );
         self.shape.validate()?;
@@ -181,7 +197,15 @@ impl FreshVolumeReadMatrixEvidence {
             "repaired drive is outside runtime membership"
         );
         let tolerance = usize::try_from(self.shape.payload_quorum()?.read_tolerance)?;
-        for (trial, expect_success) in [(&self.missing, false), (&self.repaired, true)] {
+        for (trial, phase, expect_success) in [
+            (&self.control.before, "before-denial", true),
+            (&self.control.denied, "shard-denied", false),
+            (&self.control.restored, "shard-restored", true),
+        ] {
+            ensure!(
+                trial.phase == phase,
+                "fresh-volume trial phase does not match its control role"
+            );
             ensure!(
                 trial.target_proof_sha256 == sha256_text(&trial.target_proof_body)
                     && trial.fault_snapshot_sha256 == sha256_text(&trial.fault_snapshot_body)
@@ -326,6 +350,10 @@ impl FreshVolumeReadMatrixEvidence {
             };
             ensure!(
                 record.kind == OperationKind::Get
+                    && record.scenario == self.identity.scenario
+                    && record.run_id.as_deref() == Some(self.identity.run_id.as_str())
+                    && record.bucket == self.identity.bucket
+                    && record.range.is_none()
                     && record.key.as_deref() == Some(self.object_key.as_str())
                     && record.version_id.as_deref() == Some(self.version_id.as_str())
                     && record.started_at_ms == trial.read_started_at_ms
@@ -337,15 +365,19 @@ impl FreshVolumeReadMatrixEvidence {
             );
             if expect_success {
                 ensure!(
-                    trial.phase == "repaired"
-                        && trial.outcome == OperationOutcome::Ok
+                    trial.outcome == OperationOutcome::Ok
+                        && trial.http_status == Some(200)
                         && trial.observed_sha256.as_deref() == Some(self.expected_sha256.as_str()),
                     "post-heal exact-quorum GET did not return the sealed bytes"
                 );
             } else {
                 ensure!(
-                    trial.phase == "missing" && trial.outcome != OperationOutcome::Ok,
-                    "pre-heal exact-quorum GET did not prove the replacement shard was missing"
+                    trial.outcome == OperationOutcome::Failed
+                        && trial
+                            .http_status
+                            .is_some_and(|status| (500..600).contains(&status))
+                        && trial.observed_sha256.is_none(),
+                    "replacement-shard denial did not produce a definitive server failure"
                 );
             }
         }
@@ -358,13 +390,130 @@ impl FreshVolumeReadMatrixEvidence {
         };
         ensure!(
             ordinary.kind == OperationKind::Get
+                && ordinary.scenario == self.identity.scenario
+                && ordinary.run_id.as_deref() == Some(self.identity.run_id.as_str())
+                && ordinary.bucket == self.identity.bucket
+                && ordinary.range.is_none()
                 && ordinary.key.as_deref() == Some(self.object_key.as_str())
                 && ordinary.version_id.as_deref() == Some(self.version_id.as_str())
                 && ordinary.outcome == OperationOutcome::Ok
+                && ordinary.http_status == Some(200)
                 && ordinary.value_sha256.as_deref() == Some(self.expected_sha256.as_str())
-                && ordinary.ended_at_ms <= self.missing.fault_active_at_ms,
+                && ordinary.ended_at_ms <= self.control.before.fault_active_at_ms,
             "ordinary post-replacement GET does not prove the sealed version was available before exact-quorum isolation"
         );
+        self.validate_shard_control()?;
+        Ok(())
+    }
+
+    fn validate_shard_control(&self) -> Result<()> {
+        let control = &self.control;
+        validate_sealed_part_path(
+            &self.identity.bucket,
+            &self.object_key,
+            &control.relative_part_path,
+        )?;
+        ensure!(
+            control.before.read_ended_at_ms <= control.denial_active_at_ms
+                && control.denial_active_at_ms <= control.denied.read_started_at_ms
+                && control.denied.read_ended_at_ms <= control.denial_after_read_at_ms
+                && control.denial_after_read_at_ms <= control.denial_removed_at_ms
+                && control.denial_removed_at_ms <= control.restored.read_started_at_ms
+                && control.denial_snapshot_sha256 == sha256_text(&control.denial_snapshot_body),
+            "replacement-shard control is not an ordered, receipt-bound A/B/A sequence"
+        );
+        let mut fault_uid = None;
+        for trial in [&control.before, &control.denied, &control.restored] {
+            ensure!(
+                trial.target_proof_sha256 == control.before.target_proof_sha256
+                    && trial.selected_targets == control.before.selected_targets
+                    && trial.unavailable_drive_uuids == control.before.unavailable_drive_uuids
+                    && trial.fault_active_at_ms == control.before.fault_active_at_ms
+                    && trial.fault_delete_started_at_ms
+                        == control.before.fault_delete_started_at_ms,
+                "replacement-shard control changed its exact-quorum sibling cohort"
+            );
+            let snapshots: Value = serde_json::from_str(&trial.fault_snapshot_body)?;
+            for pointer in [
+                "/active/chaos_status/metadata/uid",
+                "/afterRead/chaos_status/metadata/uid",
+            ] {
+                let uid = snapshots
+                    .pointer(pointer)
+                    .and_then(Value::as_str)
+                    .filter(|uid| !uid.is_empty())
+                    .context("exact-quorum control lacks a controller resource UID")?;
+                ensure!(
+                    fault_uid.as_deref().is_none_or(|expected| expected == uid),
+                    "exact-quorum fault was replaced during the shard control"
+                );
+                fault_uid = Some(uid.to_string());
+            }
+        }
+        let proof: TargetProof = serde_json::from_str(&control.before.target_proof_body)?;
+        let volume = proof
+            .faults
+            .first()
+            .and_then(|fault| fault.volume_path.as_deref())
+            .context("shard control lacks its volume path")?;
+        let target = self
+            .membership
+            .members
+            .iter()
+            .find(|member| member.shard_ids.as_slice() == [self.repaired_drive_uuid.as_str()])
+            .context("replacement is not a sole-shard runtime member")?;
+        let candidates = BTreeSet::from([format!("{}/{}", proof.namespace, target.pod_name)]);
+        let snapshots: Value = serde_json::from_str(&control.denial_snapshot_body)?;
+        let duration = snapshots
+            .pointer("/active/spec/duration")
+            .and_then(Value::as_str)
+            .and_then(|value| value.strip_suffix('s'))
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .context("shard denial lacks a bounded duration")?;
+        let runtime = chaos_mesh::IoChaosRuntimeContract {
+            action: chaos_mesh::IoChaosAction::Fault { errno: 5 },
+            methods: vec!["READ".to_string()],
+            io_sampling_percent: 100,
+            duration_seconds: duration,
+        };
+        let mut denial_uid = None;
+        for phase in ["active", "afterRead"] {
+            let resource = snapshots
+                .get(phase)
+                .context("shard denial lacks a boundary snapshot")?;
+            let namespace = resource
+                .pointer("/metadata/namespace")
+                .and_then(Value::as_str)
+                .context("shard denial lacks its namespace")?;
+            let contract = chaos_mesh::VolumeTargetEvidenceContract {
+                chaos_namespace: namespace,
+                target_namespace: &proof.namespace,
+                tenant: &proof.tenant,
+                run_id: &self.identity.run_id,
+                scenario: &self.identity.scenario,
+                volume_path: volume,
+                expected_targets: 1,
+                candidate_pod_ids: &candidates,
+                runtime: &runtime,
+            };
+            chaos_mesh::validate_fixed_file_snapshot(
+                resource,
+                &contract,
+                &format!("{volume}/{}", control.relative_part_path),
+            )?;
+            let uid = resource
+                .pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .filter(|uid| !uid.is_empty())
+                .context("shard denial lacks a controller resource UID")?;
+            ensure!(
+                denial_uid.as_deref().is_none_or(|expected| expected == uid)
+                    && fault_uid.as_deref() != Some(uid),
+                "shard denial controller identity changed or reused the sibling fault"
+            );
+            denial_uid = Some(uid.to_string());
+        }
         Ok(())
     }
 
@@ -387,6 +536,16 @@ impl FreshVolumeReadMatrixEvidence {
         );
         let mapping = mappings[0].validated_mapping(&self.membership, &self.shape)?;
         ensure!(
+            mappings[0].source == ShardMappingSource::OfflineXl2Inspector,
+            "fresh-volume shard control requires an offline XL2 mapping"
+        );
+        let inspection: OfflineXl2InspectResponse =
+            serde_json::from_str(&mappings[0].response_body)?;
+        ensure!(
+            self.control.relative_part_path == inspection.selected_part.relative_part_path,
+            "replacement-shard denial does not target the receipt-bound sealed data part"
+        );
+        ensure!(
             mapping.bucket == self.identity.bucket
                 && mapping.object_key == self.object_key
                 && mapping.version_id == self.version_id
@@ -403,8 +562,41 @@ impl FreshVolumeReadMatrixEvidence {
                 replacement.replacement.pool_index,
                 replacement.replacement.set_index,
             )),
-        )
+        )?;
+        ensure!(
+            summary.completed_at_ms <= self.control.before.fault_active_at_ms,
+            "replacement-shard control began before the owned heal completed"
+        );
+        Ok(())
     }
+}
+
+fn validate_sealed_part_path(bucket: &str, key: &str, path: &str) -> Result<()> {
+    ensure!(
+        !bucket.starts_with('.'),
+        "shard control cannot select an internal bucket"
+    );
+    let relative = path
+        .strip_prefix(&format!("{bucket}/{key}/"))
+        .context("shard control path is outside the sealed object")?;
+    let parts = relative.split('/').collect::<Vec<_>>();
+    let [data_dir, part] = parts.as_slice() else {
+        bail!("shard control must select one data-directory part file")
+    };
+    let data_dir_id =
+        uuid::Uuid::parse_str(data_dir).context("sealed shard data directory is not a UUID")?;
+    let part_number = part
+        .strip_prefix("part.")
+        .and_then(|number| number.parse::<u32>().ok())
+        .filter(|number| *number > 0)
+        .context("sealed shard path does not identify a data part")?;
+    ensure!(
+        data_dir_id.to_string() == *data_dir
+            && !data_dir_id.is_nil()
+            && *part == format!("part.{part_number}"),
+        "sealed shard path is not canonical"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1847,8 +2039,8 @@ struct FreshVolumeDriverState {
     heal_started_at_ms: Option<u64>,
     heal_progress: Vec<HealProgressSample>,
     heal_summary: Option<HealSummary>,
-    missing_trial: Option<QuorumReadTrialEvidence>,
-    repaired_trial: Option<QuorumReadTrialEvidence>,
+    read_control: Option<ReplacementShardControl>,
+    sealed_part_path: Option<String>,
     ordinary_after_replacement_operation_id: Option<String>,
     replacement_proof: Option<FreshVolumeReplacementProof>,
     cleanup_evidence: Option<Value>,
@@ -1919,6 +2111,17 @@ struct SealedVersion {
     version_id: String,
     sha256: String,
     ordinary_get_operation_id: String,
+}
+
+struct QuorumTrialContext<'a> {
+    s3: &'a S3WorkloadClient,
+    history: &'a Recorder,
+    sealed: &'a SealedVersion,
+    target_proof_body: &'a str,
+    contract: chaos_mesh::VolumeTargetEvidenceContract<'a>,
+    selected: &'a BTreeSet<String>,
+    unavailable_drive_uuids: &'a [String],
+    fault_active_at_ms: u64,
 }
 
 fn single_set_runtime_topology(
@@ -2048,8 +2251,8 @@ impl<'a> FreshVolumeDriver<'a> {
                 heal_started_at_ms: None,
                 heal_progress: Vec::new(),
                 heal_summary: None,
-                missing_trial: None,
-                repaired_trial: None,
+                read_control: None,
+                sealed_part_path: None,
                 ordinary_after_replacement_operation_id: None,
                 replacement_proof: None,
                 cleanup_evidence: None,
@@ -2390,12 +2593,102 @@ impl<'a> FreshVolumeDriver<'a> {
         Ok(proof)
     }
 
-    async fn run_quorum_trial(
+    async fn record_quorum_read(
         &self,
+        fault: &dyn FaultLifecyclePort,
+        context: &QuorumTrialContext<'_>,
         phase: &str,
         expect_success: bool,
     ) -> Result<QuorumReadTrialEvidence> {
-        let (s3, history, sealed, target_pod, repaired_drive) = {
+        let active = fault.snapshot("active")?;
+        let resource = active
+            .chaos_status
+            .as_ref()
+            .context("quorum read lacks an active controller snapshot")?;
+        ensure!(
+            chaos_mesh::validate_fixed_volume_snapshot(resource, &context.contract)?
+                == *context.selected,
+            "exact-quorum targets changed before GET"
+        );
+        let before = context.history.records().len();
+        let result = context
+            .s3
+            .get_object_version_result(
+                &context.sealed.key,
+                &context.sealed.version_id,
+                context.history,
+            )
+            .await?;
+        let after = fault.snapshot("after-read")?;
+        let resource = after
+            .chaos_status
+            .as_ref()
+            .context("quorum read lacks its final controller snapshot")?;
+        ensure!(
+            chaos_mesh::validate_fixed_volume_snapshot(resource, &context.contract)?
+                == *context.selected,
+            "exact-quorum targets changed during GET"
+        );
+        let records = context.history.records();
+        let matching = records[before..]
+            .iter()
+            .filter(|record| {
+                record.kind == OperationKind::Get
+                    && record.key.as_deref() == Some(context.sealed.key.as_str())
+                    && record.version_id.as_deref() == Some(context.sealed.version_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        let [record] = matching.as_slice() else {
+            bail!("exact-quorum versionId GET was not recorded exactly once")
+        };
+        let body = serde_json::to_string_pretty(&json!({"active":active,"afterRead":after}))?;
+        let trial = QuorumReadTrialEvidence {
+            phase: phase.to_string(),
+            target_proof_sha256: sha256_text(context.target_proof_body),
+            target_proof_body: context.target_proof_body.to_string(),
+            fault_snapshot_sha256: sha256_text(&body),
+            fault_snapshot_body: body,
+            selected_targets: context.selected.iter().cloned().collect(),
+            unavailable_drive_uuids: context.unavailable_drive_uuids.to_vec(),
+            fault_active_at_ms: context.fault_active_at_ms,
+            read_started_at_ms: record.started_at_ms,
+            read_ended_at_ms: record.ended_at_ms,
+            fault_delete_started_at_ms: 0,
+            operation_id: record.id.clone(),
+            outcome: record.outcome,
+            http_status: record.http_status,
+            observed_sha256: result
+                .body
+                .as_deref()
+                .map(crate::fault::workload::sha256_hex),
+        };
+        self.collector.write_text(
+            self.scenario.case_name,
+            &format!("quorum-{phase}-read.json"),
+            &serde_json::to_string_pretty(&trial)?,
+        )?;
+        if expect_success {
+            ensure!(
+                trial.outcome == OperationOutcome::Ok
+                    && trial.http_status == Some(200)
+                    && trial.observed_sha256.as_deref() == Some(context.sealed.sha256.as_str()),
+                "exact-quorum versionId GET did not return the sealed bytes at {phase}"
+            );
+        } else {
+            ensure!(
+                trial.outcome == OperationOutcome::Failed
+                    && trial
+                        .http_status
+                        .is_some_and(|status| (500..600).contains(&status))
+                    && trial.observed_sha256.is_none(),
+                "harness_unqualified: sealed-shard denial did not produce a definitive server failure"
+            );
+        }
+        Ok(trial)
+    }
+
+    async fn run_quorum_control(&self) -> Result<ReplacementShardControl> {
+        let (s3, history, sealed, target_pod, repaired_drive, relative_part_path, bucket) = {
             let state = self
                 .state
                 .lock()
@@ -2417,14 +2710,28 @@ impl<'a> FreshVolumeDriver<'a> {
                     .clone()
                     .context("fresh-volume target Pod is absent")?,
                 replacement.rustfs_drive_uuid.clone(),
+                state
+                    .sealed_part_path
+                    .clone()
+                    .context("sealed offline shard path is absent")?,
+                state
+                    .owned_context
+                    .as_ref()
+                    .context("fresh-volume ownership is absent")?
+                    .identity
+                    .bucket
+                    .clone(),
             )
         };
+        validate_sealed_part_path(&bucket, &sealed.key, &relative_part_path)?;
+        let file_path = format!("{}/{}", self.config.rustfs_volume_path, relative_part_path);
         let (inventory, layout, shape, membership) = self.current_runtime_topology().await?;
         ensure!(
-            membership.members.iter().any(|member| {
-                member.pod_name == target_pod
-                    && member.shard_ids.as_slice() == [repaired_drive.as_str()]
-            }),
+            membership
+                .members
+                .iter()
+                .any(|member| member.pod_name == target_pod
+                    && member.shard_ids.as_slice() == [repaired_drive.as_str()]),
             "replacement drive is not the target Pod's sole runtime shard"
         );
         let target_count = shape.payload_quorum()?.read_tolerance;
@@ -2444,27 +2751,25 @@ impl<'a> FreshVolumeDriver<'a> {
             .collect::<BTreeSet<_>>();
         let target_pod_id = format!("{}/{}", self.config.cluster.test_namespace, target_pod);
         let runtime_contract = chaos_mesh::volume_fault_runtime_contract(&injection)?;
-
         for attempt in 0..12 {
             let target_proof = self.trial_target_proof(&inventory, &layout, &shape, &membership)?;
             let target_proof_body = serde_json::to_string_pretty(&target_proof)?;
-            let suffix = format!("-{phase}-{attempt}");
             let mut fault = fault_runtime::apply_fault_named(
                 self.config,
                 self.collector,
                 self.scenario,
                 self.run_id,
                 &injection,
-                &format!("quorum-{phase}-{attempt}-manifest.yaml"),
-                &suffix,
+                &format!("quorum-control-{attempt}-manifest.yaml"),
+                &format!("-control-{attempt}"),
             )?;
-            let attempt_result: Result<Option<QuorumReadTrialEvidence>> = async {
+            let attempt_result: Result<Option<ReplacementShardControl>> = async {
                 fault.wait_active(self.config.cluster.timeout)?;
                 let active = fault.snapshot("active")?;
                 let resource = active
                     .chaos_status
                     .as_ref()
-                    .context("exact-quorum IOChaos snapshot lacks the controller object")?;
+                    .context("exact-quorum IOChaos lacks its controller object")?;
                 let contract = chaos_mesh::VolumeTargetEvidenceContract {
                     chaos_namespace: &self.config.chaos_namespace,
                     target_namespace: &self.config.cluster.test_namespace,
@@ -2489,12 +2794,12 @@ impl<'a> FreshVolumeDriver<'a> {
                     .map(|pod_id| {
                         let pod = pod_id
                             .strip_prefix(&format!("{}/", self.config.cluster.test_namespace))
-                            .context("IOChaos selected a Pod outside the test namespace")?;
+                            .context("IOChaos selected another namespace")?;
                         let member = membership
                             .members
                             .iter()
                             .find(|member| member.pod_name == pod)
-                            .context("IOChaos selected a Pod outside runtime membership")?;
+                            .context("IOChaos selected outside runtime membership")?;
                         let [drive] = member.shard_ids.as_slice() else {
                             bail!("selected Pod does not own exactly one target-set drive")
                         };
@@ -2506,91 +2811,128 @@ impl<'a> FreshVolumeDriver<'a> {
                         && !unavailable_drive_uuids.contains(&repaired_drive),
                     "exact-quorum fault did not leave the replacement drive online"
                 );
-                let fault_active_at_ms = history.mark_fault_active_now();
-                let before = history.records().len();
-                let result = s3
-                    .get_object_version_result(&sealed.key, &sealed.version_id, &history)
-                    .await?;
-                let after_snapshot = fault.snapshot("after-read")?;
-                let after_resource = after_snapshot
-                    .chaos_status
-                    .as_ref()
-                    .context("post-read IOChaos snapshot lacks the controller object")?;
-                let selected_after =
-                    chaos_mesh::validate_fixed_volume_snapshot(after_resource, &contract)?;
-                ensure!(
-                    selected_after == selected,
-                    "exact-quorum target set changed during GET"
-                );
-                let fault_delete_started_at_ms = history.mark_fault_ended_now();
-                let records = history.records();
-                let matching = records[before..]
-                    .iter()
-                    .filter(|record| {
-                        record.kind == OperationKind::Get
-                            && record.key.as_deref() == Some(sealed.key.as_str())
-                            && record.version_id.as_deref() == Some(sealed.version_id.as_str())
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let [record] = matching.as_slice() else {
-                    bail!("exact-quorum versionId GET was not recorded exactly once")
+                let context = QuorumTrialContext {
+                    s3: &s3,
+                    history: &history,
+                    sealed: &sealed,
+                    target_proof_body: &target_proof_body,
+                    contract,
+                    selected: &selected,
+                    unavailable_drive_uuids: &unavailable_drive_uuids,
+                    fault_active_at_ms: history.mark_fault_active_now(),
                 };
-                let observed_sha256 = result
-                    .body
-                    .as_deref()
-                    .map(crate::fault::workload::sha256_hex);
-                if expect_success {
-                    ensure!(
-                        result.outcome == OperationOutcome::Ok
-                            && observed_sha256.as_deref() == Some(sealed.sha256.as_str()),
-                        "post-heal exact-quorum versionId GET did not return the sealed bytes"
-                    );
-                } else if result.outcome == OperationOutcome::Ok {
-                    bail!(
-                        "harness_unqualified: replacement shard was already readable before the missing-shard proof"
-                    );
-                } else {
-                    ensure!(
-                        result.outcome == OperationOutcome::Failed
-                            && result.http_status.is_some_and(|status| status >= 500),
-                        "harness_unqualified: pre-heal exact-quorum GET did not return a definitive server failure"
-                    );
+                let before = self
+                    .record_quorum_read(fault.as_ref(), &context, "before-denial", true)
+                    .await?;
+                let denial_spec = chaos_mesh::IoChaosSpec::eio_on_rustfs_volume(
+                    &self.config.cluster,
+                    &self.config.chaos_namespace,
+                    self.run_id,
+                    &self.scenario.name,
+                    &self.config.rustfs_volume_path,
+                    100,
+                    self.config.duration,
+                )?
+                .with_exact_pods(vec![target_pod.clone()])?
+                .with_exact_read_file(file_path.clone())?
+                .with_name_suffix("-sealed-part");
+                self.collector.write_text(
+                    self.scenario.case_name,
+                    "quorum-sealed-part-manifest.yaml",
+                    &denial_spec.manifest(),
+                )?;
+                let mut denial = chaos_mesh::apply_iochaos(&self.config.cluster, &denial_spec)?;
+                let denied_result = async {
+                    denial.wait_active(self.config.cluster.timeout)?;
+                    let active: Value = serde_json::from_str(&denial.json()?)?;
+                    let candidates = BTreeSet::from([target_pod_id.clone()]);
+                    let runtime = chaos_mesh::IoChaosRuntimeContract {
+                        action: chaos_mesh::IoChaosAction::Fault { errno: 5 },
+                        methods: vec!["READ".to_string()],
+                        io_sampling_percent: 100,
+                        duration_seconds: self.config.duration.as_secs(),
+                    };
+                    let contract = chaos_mesh::VolumeTargetEvidenceContract {
+                        candidate_pod_ids: &candidates,
+                        expected_targets: 1,
+                        runtime: &runtime,
+                        ..context.contract
+                    };
+                    chaos_mesh::validate_fixed_file_snapshot(&active, &contract, &file_path)?;
+                    self.collector.write_text(
+                        self.scenario.case_name,
+                        "quorum-sealed-part-active.json",
+                        &serde_json::to_string_pretty(&active)?,
+                    )?;
+                    let active_at = now_ms();
+                    let denied = self
+                        .record_quorum_read(fault.as_ref(), &context, "shard-denied", false)
+                        .await?;
+                    let after: Value = serde_json::from_str(&denial.json()?)?;
+                    chaos_mesh::validate_fixed_file_snapshot(&after, &contract, &file_path)?;
+                    let after_at = now_ms();
+                    let body = serde_json::to_string_pretty(
+                        &json!({"active": active, "afterRead": after}),
+                    )?;
+                    self.collector.write_text(
+                        self.scenario.case_name,
+                        "quorum-sealed-part-snapshots.json",
+                        &body,
+                    )?;
+                    Ok::<_, anyhow::Error>((denied, body, active_at, after_at))
                 }
-                let fault_snapshot_body = serde_json::to_string_pretty(&json!({
-                    "active": active,
-                    "afterRead": after_snapshot,
-                }))?;
-                Ok(Some(QuorumReadTrialEvidence {
-                    phase: phase.to_string(),
-                    target_proof_sha256: sha256_text(&target_proof_body),
-                    target_proof_body,
-                    fault_snapshot_sha256: sha256_text(&fault_snapshot_body),
-                    fault_snapshot_body,
-                    selected_targets: selected.into_iter().collect(),
-                    unavailable_drive_uuids,
-                    fault_active_at_ms,
-                    read_started_at_ms: record.started_at_ms,
-                    read_ended_at_ms: record.ended_at_ms,
-                    fault_delete_started_at_ms,
-                    operation_id: record.id.clone(),
-                    outcome: record.outcome,
-                    http_status: record.http_status,
-                    observed_sha256,
+                .await;
+                let delete_result = denial
+                    .delete(self.config.cluster.timeout)
+                    .context("remove sealed-part read denial");
+                let (denied, body, denial_active_at_ms, denial_after_read_at_ms) =
+                    match (denied_result, delete_result) {
+                        (Ok(proof), Ok(())) => proof,
+                        (Err(primary), Ok(())) => return Err(primary),
+                        (Err(primary), Err(cleanup)) => {
+                            return Err(primary
+                                .context(format!("sealed-part cleanup also failed: {cleanup:#}")));
+                        }
+                        (Ok(_), Err(cleanup)) => return Err(cleanup),
+                    };
+                let denial_removed_at_ms = now_ms();
+                let restored = self
+                    .record_quorum_read(fault.as_ref(), &context, "shard-restored", true)
+                    .await?;
+                Ok(Some(ReplacementShardControl {
+                    before,
+                    denied,
+                    restored,
+                    relative_part_path: relative_part_path.clone(),
+                    denial_snapshot_sha256: sha256_text(&body),
+                    denial_snapshot_body: body,
+                    denial_active_at_ms,
+                    denial_after_read_at_ms,
+                    denial_removed_at_ms,
                 }))
             }
             .await;
+            let delete_started_at = history.mark_fault_ended_now();
             let delete_result = fault
                 .delete(self.config.cluster.timeout)
-                .context("remove exact-quorum IOChaos after read attempt");
+                .context("remove exact-quorum sibling IOChaos");
             match (attempt_result, delete_result) {
-                (Ok(Some(trial)), Ok(())) => return Ok(trial),
+                (Ok(Some(mut control)), Ok(())) => {
+                    for trial in [
+                        &mut control.before,
+                        &mut control.denied,
+                        &mut control.restored,
+                    ] {
+                        trial.fault_delete_started_at_ms = delete_started_at;
+                    }
+                    return Ok(control);
+                }
                 (Ok(None), Ok(())) => continue,
                 (Err(primary), Ok(())) => return Err(primary),
                 (Err(primary), Err(cleanup)) => {
-                    return Err(primary.context(format!(
-                        "exact-quorum IOChaos cleanup also failed: {cleanup:#}"
-                    )));
+                    return Err(
+                        primary.context(format!("exact-quorum cleanup also failed: {cleanup:#}"))
+                    );
                 }
                 (Ok(_), Err(cleanup)) => return Err(cleanup),
             }
@@ -3230,6 +3572,12 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             observed_at_ms: completed_at_ms,
         };
         observation.validated_mapping(&membership, &shape)?;
+        let inspection: OfflineXl2InspectResponse =
+            serde_json::from_str(&observation.response_body)?;
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+            .sealed_part_path = Some(inspection.selected_part.relative_part_path);
         self.collector.write_text(
             self.scenario.case_name,
             VERSION_SHARD_MAPPING_ARTIFACT,
@@ -3719,7 +4067,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
         Ok(())
     }
 
-    async fn prove_missing_shard_under_exact_quorum(&self) -> Result<()> {
+    async fn verify_ordinary_read_after_replacement(&self) -> Result<()> {
         let (s3, history, sealed) = {
             let state = self
                 .state
@@ -3761,13 +4109,11 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             bail!("post-replacement ordinary versionId GET was not recorded exactly once")
         };
         let ordinary_operation_id = ordinary_record.id.clone();
-        let trial = self.run_quorum_trial("missing", false).await?;
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
         state.ordinary_after_replacement_operation_id = Some(ordinary_operation_id);
-        state.missing_trial = Some(trial);
         Ok(())
     }
 
@@ -3903,11 +4249,11 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
     }
     async fn verify_recovery_and_post_write(&self) -> Result<()> {
         self.renew_owned_context().await?;
-        let repaired_trial = self.run_quorum_trial("repaired", true).await?;
+        let read_control = self.run_quorum_control().await?;
         self.state
             .lock()
             .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
-            .repaired_trial = Some(repaired_trial);
+            .read_control = Some(read_control);
         wait_for_stable_rustfs_pods(
             &self.config.cluster,
             self.config.expected_rustfs_pod_count,
@@ -4075,8 +4421,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             prepare_receipt,
             old_device_absence_sha256,
             replacement_proof,
-            missing,
-            repaired,
+            read_control,
             ordinary_after_replacement_operation_id,
             sealed,
             proof_history,
@@ -4098,8 +4443,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
                 state.prepare_receipt.clone(),
                 state.old_device_absence_sha256.clone(),
                 state.replacement_proof.clone(),
-                state.missing_trial.clone(),
-                state.repaired_trial.clone(),
+                state.read_control.clone(),
                 state.ordinary_after_replacement_operation_id.clone(),
                 session.map(|session| session.sealed.clone()),
                 session.map(|session| session.proof_history.clone()),
@@ -4163,8 +4507,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             Some(context),
             Some(replacement),
             Some(replacement_proof),
-            Some(missing),
-            Some(repaired),
+            Some(control),
             Some(ordinary_get_operation_id),
             Some(sealed),
             Some(proof_history),
@@ -4172,8 +4515,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             context.as_ref(),
             replacement.as_ref(),
             replacement_proof.as_ref(),
-            missing,
-            repaired,
+            read_control,
             ordinary_after_replacement_operation_id,
             sealed.as_ref(),
             proof_history.as_ref(),
@@ -4195,7 +4537,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
                 )
             };
             let proof = FreshVolumeReadMatrixEvidence {
-                schema_version: 1,
+                schema_version: 2,
                 identity: context.identity.clone(),
                 shape,
                 membership,
@@ -4204,8 +4546,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
                 version_id: sealed.version_id.clone(),
                 expected_sha256: sealed.sha256.clone(),
                 ordinary_get_operation_id,
-                missing,
-                repaired,
+                control,
             };
             proof.validate(&proof_history.records())?;
             self.collector.write_text(
@@ -4505,6 +4846,328 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shard_control_fixture() -> (
+        FreshVolumeReadMatrixEvidence,
+        Vec<crate::fault::history::OperationRecord>,
+    ) {
+        let config = FaultTestConfig::for_test("cluster", "local-static");
+        let scenario = FaultScenario {
+            name: "fresh-volume-replacement".to_string(),
+            case_name: "case",
+            duration: Duration::from_secs(60),
+            percent: 100,
+            object_count: 4,
+        };
+        let shape = ErasureSetShape::from_runtime_single_set(4, 1, &[1], &[4], 2).unwrap();
+        let membership = ErasureSetMembership::from_runtime(
+            &shape,
+            (0..4)
+                .map(|index| ErasureSetMember {
+                    pod_name: format!("rustfs-{index}"),
+                    server_endpoint: format!("http://rustfs-{index}:9000"),
+                    shard_ids: vec![format!("00000000-0000-4000-8000-{index:012}")],
+                })
+                .collect(),
+        )
+        .unwrap();
+        let bindings = membership
+            .members
+            .iter()
+            .enumerate()
+            .map(|(index, member)| QuorumVolumeBinding {
+                pod_name: member.pod_name.clone(),
+                pod_uid: format!("pod-{index}"),
+                container_id: format!("containerd://{index}"),
+                mount_path: config.rustfs_volume_path.clone(),
+                persistent_volume_claim: format!("pvc-{index}"),
+                persistent_volume: format!("pv-{index}"),
+                drive_uuid: member.shard_ids[0].clone(),
+                pool_index: 0,
+                set_index: 0,
+            })
+            .collect();
+        let quorum = QuorumVolumeTargetProof::from_runtime(
+            &shape,
+            &membership,
+            QuorumVolumeBoundary {
+                class: QuorumCaseClass::Payload,
+                beyond_read_tolerance: false,
+            },
+            bindings,
+        )
+        .unwrap();
+        let mut proof = TargetProof::for_storage_recovery(
+            &config,
+            &scenario,
+            "run-1",
+            vec![],
+            TargetErasureSetProof {
+                required: true,
+                resolved: true,
+                source: Some("rustfs-admin-info".to_string()),
+                deployment_id: Some("deployment".to_string()),
+                shape: Some(shape.clone()),
+                health: Some(ErasureSetHealth {
+                    online_shards: 4,
+                    offline_shards: 0,
+                    unknown_shards: 0,
+                }),
+                membership: Some(membership.clone()),
+                volume_quorum: Some(quorum),
+                observed_at_ms: 1,
+                note: "fixture".to_string(),
+            },
+        );
+        proof.faults[0].kind = FaultKind::RustfsVolumeIoError.as_str().to_string();
+        let proof_body = serde_json::to_string(&proof).unwrap();
+        let mut spec = chaos_mesh::IoChaosSpec::eio_on_rustfs_volume(
+            &config.cluster,
+            "chaos-mesh",
+            "run-1",
+            &scenario.name,
+            &config.rustfs_volume_path,
+            100,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        spec.targets = Some(2);
+        let resource = |spec: &chaos_mesh::IoChaosSpec, uid: &str, pods: &[&str]| {
+            let mut value: Value = serde_yaml_ng::from_str(&spec.manifest()).unwrap();
+            value["metadata"]["uid"] = json!(uid);
+            value["status"] = json!({"conditions":[{"type":"Selected","status":"True"},{"type":"AllInjected","status":"True"},{"type":"AllRecovered","status":"False"}],
+                "experiment":{"desiredPhase":"Run","containerRecords":pods.iter().map(|pod| json!({"id":format!("{}/{pod}/rustfs", config.cluster.test_namespace),"selectorKey":".","phase":"Injected","injectedCount":1})).collect::<Vec<_>>()}});
+            value
+        };
+        let sibling = resource(&spec, "siblings-uid", &["rustfs-1", "rustfs-2"]);
+        let snapshot_body = serde_json::to_string(&json!({"active":{"resource_kind":"iochaos","chaos_status":sibling},"afterRead":{"resource_kind":"iochaos","chaos_status":sibling}})).unwrap();
+        let relative_part_path =
+            "bucket-1/sealed-key/11111111-1111-4111-8111-111111111111/part.1".to_string();
+        let spec = spec
+            .with_exact_pods(vec!["rustfs-3".to_string()])
+            .unwrap()
+            .with_exact_read_file(format!(
+                "{}/{}",
+                config.rustfs_volume_path, relative_part_path
+            ))
+            .unwrap();
+        let denial = resource(&spec, "denial-uid", &["rustfs-3"]);
+        let denial_body =
+            serde_json::to_string(&json!({"active":denial,"afterRead":denial})).unwrap();
+        let sha = "ab".repeat(32);
+        let trial = |phase: &str, at: u64, ok: bool| QuorumReadTrialEvidence {
+            phase: phase.to_string(),
+            target_proof_sha256: sha256_text(&proof_body),
+            target_proof_body: proof_body.clone(),
+            fault_snapshot_sha256: sha256_text(&snapshot_body),
+            fault_snapshot_body: snapshot_body.clone(),
+            selected_targets: ["rustfs-1", "rustfs-2"]
+                .map(|pod| format!("{}/{pod}/rustfs", config.cluster.test_namespace))
+                .to_vec(),
+            unavailable_drive_uuids: vec![
+                membership.members[1].shard_ids[0].clone(),
+                membership.members[2].shard_ids[0].clone(),
+            ],
+            fault_active_at_ms: 20,
+            read_started_at_ms: at,
+            read_ended_at_ms: at + 1,
+            fault_delete_started_at_ms: 50,
+            operation_id: phase.to_string(),
+            outcome: if ok {
+                OperationOutcome::Ok
+            } else {
+                OperationOutcome::Failed
+            },
+            http_status: Some(if ok { 200 } else { 503 }),
+            observed_sha256: ok.then(|| sha.clone()),
+        };
+        let control = ReplacementShardControl {
+            before: trial("before-denial", 21, true),
+            denied: trial("shard-denied", 31, false),
+            restored: trial("shard-restored", 41, true),
+            relative_part_path,
+            denial_snapshot_sha256: sha256_text(&denial_body),
+            denial_snapshot_body: denial_body,
+            denial_active_at_ms: 30,
+            denial_after_read_at_ms: 33,
+            denial_removed_at_ms: 40,
+        };
+        let matrix = FreshVolumeReadMatrixEvidence {
+            schema_version: 2,
+            identity: StorageRecoveryArtifactIdentity {
+                run_id: "run-1".to_string(),
+                scenario: scenario.name,
+                case_name: "case".to_string(),
+                bucket: "bucket-1".to_string(),
+            },
+            shape,
+            repaired_drive_uuid: membership.members[3].shard_ids[0].clone(),
+            membership,
+            object_key: "sealed-key".to_string(),
+            version_id: "version-1".to_string(),
+            expected_sha256: sha.clone(),
+            ordinary_get_operation_id: "ordinary".to_string(),
+            control,
+        };
+        let record = |id: &str, at: u64, ok: bool| {
+            serde_json::from_value(json!({
+            "id":id,"scenario":"fresh-volume-replacement","run_id":"run-1","kind":"get","bucket":"bucket-1","key":"sealed-key",
+            "value_sha256":ok.then(||sha.clone()),"size_bytes":ok.then_some(65536),"version_id":"version-1",
+            "started_at_ms":at,"ended_at_ms":at+1,"outcome":if ok {"ok"} else {"failed"},"http_status":if ok {200} else {503},"error":null
+        })).unwrap()
+        };
+        let records = vec![
+            record("ordinary", 10, true),
+            record("before-denial", 21, true),
+            record("shard-denied", 31, false),
+            record("shard-restored", 41, true),
+        ];
+        (matrix, records)
+    }
+
+    #[test]
+    fn shard_control_requires_success_denial_success_on_the_same_cohort() {
+        let (matrix, records) = shard_control_fixture();
+        matrix.validate(&records).expect("causal A/B/A control");
+        for status in [200, 404, 429] {
+            let mut changed = matrix.clone();
+            let mut history = records.clone();
+            changed.control.denied.http_status = Some(status);
+            history[2].http_status = Some(status);
+            assert!(
+                changed.validate(&history).is_err(),
+                "status {status} is not definitive shard denial"
+            );
+        }
+        let mut legacy = matrix.clone();
+        legacy.schema_version = 1;
+        assert!(legacy.validate(&records).is_err());
+        let mut reordered = matrix.clone();
+        reordered.control.denial_removed_at_ms = reordered.control.restored.read_started_at_ms + 1;
+        assert!(reordered.validate(&records).is_err());
+        let mut missing_before = matrix.clone();
+        let mut history = records.clone();
+        missing_before.control.before.outcome = OperationOutcome::Failed;
+        missing_before.control.before.http_status = Some(503);
+        missing_before.control.before.observed_sha256 = None;
+        history[1].outcome = OperationOutcome::Failed;
+        history[1].http_status = Some(503);
+        history[1].value_sha256 = None;
+        assert!(
+            missing_before.validate(&history).is_err(),
+            "bucket-metadata failure cannot stand in for a shard control"
+        );
+        let mut failed_restoration = matrix.clone();
+        let mut history = records.clone();
+        failed_restoration.control.restored.outcome = OperationOutcome::Failed;
+        failed_restoration.control.restored.http_status = Some(503);
+        failed_restoration.control.restored.observed_sha256 = None;
+        history[3].outcome = OperationOutcome::Failed;
+        history[3].http_status = Some(503);
+        history[3].value_sha256 = None;
+        assert!(failed_restoration.validate(&history).is_err());
+    }
+
+    #[test]
+    fn shard_control_binds_every_read_to_the_same_run_bucket_and_version() {
+        let (matrix, records) = shard_control_fixture();
+        for index in 0..records.len() {
+            for field in ["scenario", "run_id", "bucket", "version_id"] {
+                let mut history = records.clone();
+                let mut record = serde_json::to_value(&history[index]).unwrap();
+                record[field] = json!("another-value");
+                history[index] = serde_json::from_value(record).unwrap();
+                assert!(
+                    matrix.validate(&history).is_err(),
+                    "read {index} must not substitute another {field}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shard_control_rejects_a_different_but_individually_valid_sibling_cohort() {
+        let (mut matrix, records) = shard_control_fixture();
+        let trial = &mut matrix.control.restored;
+        let proof: TargetProof = serde_json::from_str(&trial.target_proof_body).unwrap();
+        let new_record = format!("{}/rustfs-0/rustfs", proof.namespace);
+        trial.selected_targets[0] = new_record.clone();
+        trial.unavailable_drive_uuids[0] = matrix.membership.members[0].shard_ids[0].clone();
+        let mut snapshots: Value = serde_json::from_str(&trial.fault_snapshot_body).unwrap();
+        for phase in ["active", "afterRead"] {
+            snapshots[phase]["chaos_status"]["status"]["experiment"]["containerRecords"][0]["id"] =
+                json!(new_record);
+        }
+        trial.fault_snapshot_body = serde_json::to_string(&snapshots).unwrap();
+        trial.fault_snapshot_sha256 = sha256_text(&trial.fault_snapshot_body);
+        let error = matrix.validate(&records).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("changed its exact-quorum sibling cohort")
+        );
+    }
+
+    #[test]
+    fn shard_control_rejects_rehashed_path_selector_and_controller_tampering() {
+        let (matrix, records) = shard_control_fixture();
+        for (pointer, value) in [
+            (
+                "/active/spec/path",
+                json!("/data/rustfs0/.rustfs.sys/buckets/bucket-1/.metadata.bin"),
+            ),
+            ("/active/spec/path", json!("/data/rustfs0/**/*")),
+            ("/active/spec/methods", json!(["WRITE"])),
+            (
+                "/active/spec/selector",
+                json!({"pods":{"rustfs-fault-test":["rustfs-0"]}}),
+            ),
+            ("/afterRead/metadata/uid", json!("different-denial-uid")),
+            ("/active/status/conditions/1/status", json!("False")),
+        ] {
+            let mut changed = matrix.clone();
+            let mut snapshots: Value =
+                serde_json::from_str(&changed.control.denial_snapshot_body).unwrap();
+            *snapshots.pointer_mut(pointer).unwrap() = value;
+            changed.control.denial_snapshot_body = serde_json::to_string(&snapshots).unwrap();
+            changed.control.denial_snapshot_sha256 =
+                sha256_text(&changed.control.denial_snapshot_body);
+            assert!(
+                changed.validate(&records).is_err(),
+                "reject tampered {pointer} despite a recomputed hash"
+            );
+        }
+        let mut changed = matrix.clone();
+        let mut snapshot: Value =
+            serde_json::from_str(&changed.control.restored.fault_snapshot_body).unwrap();
+        for phase in ["active", "afterRead"] {
+            snapshot[phase]["chaos_status"]["metadata"]["uid"] = json!("replacement-sibling-fault");
+        }
+        changed.control.restored.fault_snapshot_body = serde_json::to_string(&snapshot).unwrap();
+        changed.control.restored.fault_snapshot_sha256 =
+            sha256_text(&changed.control.restored.fault_snapshot_body);
+        assert!(
+            changed.validate(&records).is_err(),
+            "the same selected Pods do not prove one continuous controller fault"
+        );
+    }
+
+    #[test]
+    fn shard_control_never_selects_bucket_metadata_or_path_aliases() {
+        for path in [
+            ".rustfs.sys/buckets/bucket-1/.metadata.bin",
+            "bucket-1/other-key/11111111-1111-4111-8111-111111111111/part.1",
+            "bucket-1/sealed-key/../part.1",
+            "bucket-1/sealed-key/11111111-1111-4111-8111-111111111111/xl.meta",
+            "bucket-1/sealed-key/11111111-1111-4111-8111-111111111111/part.01",
+            "bucket-1/sealed-key/00000000-0000-0000-0000-000000000000/part.1",
+        ] {
+            assert!(
+                validate_sealed_part_path("bucket-1", "sealed-key", path).is_err(),
+                "reject {path}"
+            );
+        }
+    }
 
     #[test]
     fn fresh_helper_mounts_match_session_roots() {

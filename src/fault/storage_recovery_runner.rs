@@ -158,7 +158,7 @@ pub(crate) trait StorageRecoveryCaseDriver: Send + Sync {
     async fn capture_offline_mapping(&self) -> Result<()>;
     async fn replace_volume(&self) -> Result<()>;
     async fn start_heal(&self) -> Result<()>;
-    async fn prove_missing_shard_under_exact_quorum(&self) -> Result<()>;
+    async fn verify_ordinary_read_after_replacement(&self) -> Result<()>;
     async fn wait_for_owned_heal(&self) -> Result<()>;
     async fn verify_recovery_and_post_write(&self) -> Result<()>;
     async fn persist_raw_evidence(&self) -> Result<()>;
@@ -221,13 +221,11 @@ async fn execute_storage_recovery_workflow<D: StorageRecoveryCaseDriver + ?Sized
     );
     phase!("capture-offline-mapping", driver.capture_offline_mapping());
     phase!("replace-volume", driver.replace_volume());
-    // The negative half of the A/B proof must precede an explicit admin heal.
-    // Automatic replacement may race this phase; a driver that observes an
-    // already repaired shard must fail qualification instead of counting the
-    // ordinary read as evidence.
+    // Automatic healing may finish before this observation. Causal shard
+    // dependence is proved after healing by the controlled read-denial matrix.
     phase!(
-        "prove-missing-shard-exact-quorum",
-        driver.prove_missing_shard_under_exact_quorum()
+        "verify-ordinary-read-after-replacement",
+        driver.verify_ordinary_read_after_replacement()
     );
     let owns_heal = if primary.is_none() {
         phase!("start-heal", driver.start_heal());
@@ -488,8 +486,8 @@ mod tests {
         async fn start_heal(&self) -> Result<()> {
             self.step("start")
         }
-        async fn prove_missing_shard_under_exact_quorum(&self) -> Result<()> {
-            self.step("missing")
+        async fn verify_ordinary_read_after_replacement(&self) -> Result<()> {
+            self.step("ordinary")
         }
         async fn wait_for_owned_heal(&self) -> Result<()> {
             self.step("wait")
@@ -529,7 +527,7 @@ mod tests {
     async fn persists_before_cleanup_and_preserves_primary_error() {
         let driver = FakeDriver {
             calls: Mutex::new(Vec::new()),
-            fail: Some("missing"),
+            fail: Some("ordinary"),
             cleanup_fails: false,
         };
         let result = execute_storage_recovery_workflow(
@@ -544,12 +542,12 @@ mod tests {
             result
                 .error
                 .as_ref()
-                .is_some_and(|error| error.to_string().contains("primary missing"))
+                .is_some_and(|error| error.to_string().contains("primary ordinary"))
         );
         assert_eq!(
             *driver.calls.lock().expect("calls"),
             [
-                "prepare", "mapping", "replace", "missing", "persist", "workflow", "cleanup"
+                "prepare", "mapping", "replace", "ordinary", "persist", "workflow", "cleanup"
             ]
         );
         assert!(result.evidence.evidence_persisted_before_cleanup);
@@ -575,7 +573,7 @@ mod tests {
         assert_eq!(
             *driver.calls.lock().expect("calls"),
             [
-                "prepare", "mapping", "replace", "missing", "start", "persist", "workflow",
+                "prepare", "mapping", "replace", "ordinary", "start", "persist", "workflow",
                 "cleanup"
             ]
         );
@@ -586,7 +584,7 @@ mod tests {
     async fn cleanup_failure_is_secondary_to_the_primary_workflow_error() {
         let driver = FakeDriver {
             calls: Mutex::new(Vec::new()),
-            fail: Some("missing"),
+            fail: Some("ordinary"),
             cleanup_fails: true,
         };
         let result = execute_storage_recovery_workflow(
@@ -598,7 +596,7 @@ mod tests {
         )
         .await;
         let error = format!("{:#}", result.error.expect("workflow failure"));
-        assert!(error.contains("primary missing"));
+        assert!(error.contains("primary ordinary"));
         assert!(error.contains("primary cleanup"));
         assert!(result.evidence.evidence_persisted_before_cleanup);
         assert!(!result.evidence.cleanup_succeeded);
