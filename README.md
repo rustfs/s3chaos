@@ -112,6 +112,9 @@ The ordered durability work queue and its safety prerequisites remain in
 Volume-quorum runs require matching RustFS non-target drive-health observations
 before and after the workload. These endpoint guards are not continuous health
 monitoring; live qualification is still required before release gating.
+The [independent calibration guide](docs/QUORUM_CALIBRATION.md) describes the
+required native helper image, multi-operation IOChaos probes, and dedicated
+`quorum-p-dm-eio` block-layer reference.
 
 ### Planned reliability qualification
 

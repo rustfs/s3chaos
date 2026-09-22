@@ -27,8 +27,9 @@ use crate::{
         quorum::require_fresh_runtime_observation,
         scenarios::{
             NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_FAILURE_QUORUM_EDGE_SCENARIO,
-            QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
-            requires_prefault_multipart_staging, requires_quorum_edge_read_survival,
+            QUORUM_P_DM_EIO_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
+            QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, requires_prefault_multipart_staging,
+            requires_quorum_edge_read_survival,
         },
     },
     framework::resources,
@@ -67,7 +68,11 @@ use crate::fault::workload::execution::{
 };
 
 impl FaultRun<'_> {
-    pub(super) async fn activate_fault(&self, target: &ProvenTarget) -> Result<ActiveFault> {
+    pub(super) async fn activate_fault(
+        &self,
+        target: &ProvenTarget,
+        dm_prepared: Option<crate::fault::backends::quorum_dm::PreparedGroup>,
+    ) -> Result<ActiveFault> {
         let config = self.config;
         let collector = self.collector;
         let scenario = self.scenario;
@@ -81,6 +86,7 @@ impl FaultRun<'_> {
             host_storage_proof,
             execution_injection,
             health_baseline: _,
+            quorum_probe_fixtures: _,
         } = target;
         events.record(
             "fault-apply",
@@ -105,14 +111,21 @@ impl FaultRun<'_> {
             self.record_failure("fault-apply", "preflight_failed", &error, None, None)?;
             return Err(error);
         }
-        let fault = match apply_fault(
-            config,
-            collector,
-            scenario,
-            run_id,
-            host_storage_proof.as_ref(),
-            execution_injection,
-        ) {
+        let applied = if plan.scenario == QUORUM_P_DM_EIO_SCENARIO {
+            dm_prepared
+                .context("dm quorum preparation missing")?
+                .activate(&target.target_proof)
+        } else {
+            apply_fault(
+                config,
+                collector,
+                scenario,
+                run_id,
+                host_storage_proof.as_ref(),
+                execution_injection,
+            )
+        };
+        let fault = match applied {
             Ok(fault) => fault,
             Err(error) => {
                 self.record_failure(
@@ -191,6 +204,7 @@ impl FaultRun<'_> {
                 target.execution_injection.selection(),
                 crate::fault::plan::FaultSelection::FixedTargets(_)
             ) && target.execution_injection.rustfs_volume_path().is_ok()
+                && plan.scenario != QUORUM_P_DM_EIO_SCENARIO
             {
                 Some(require_active_fixed_volume_targets(
                     config,
@@ -258,6 +272,15 @@ impl FaultRun<'_> {
                 Some((activation_plan, canary_timeout)),
             )
         } else {
+            let fixed_volume_runtime_proof = if plan.scenario == QUORUM_P_DM_EIO_SCENARIO {
+                Some(dm_volume_targets(
+                    &active_snapshots,
+                    &target.target_proof,
+                    run_id,
+                ))
+            } else {
+                fixed_volume_runtime_proof
+            };
             let evidence = match fixed_volume_runtime_proof {
                 Some(Ok(evidence)) => evidence,
                 Some(Err(error)) => {
@@ -284,6 +307,26 @@ impl FaultRun<'_> {
         } else {
             fixed_volume_pods_at_fault_activation
         };
+        let dm_failure = if plan.scenario == QUORUM_P_DM_EIO_SCENARIO {
+            active_snapshots
+                .first()
+                .and_then(|snapshot| snapshot.quorum_dm_status.as_ref())
+                .map(crate::fault::backends::quorum_dm::require_qualified)
+                .transpose()
+                .err()
+                .map(|error| format!("fault_activation_unproven: {error:#}"))
+        } else {
+            None
+        };
+        if let Some(reason) = &dm_failure {
+            self.record_failure(
+                "fault-evidence",
+                "fault_not_active",
+                &anyhow::anyhow!(reason.clone()),
+                None,
+                None,
+            )?;
+        }
         let mut active = ActiveFault {
             fault,
             fault_prepare_started_at_ms,
@@ -295,7 +338,7 @@ impl FaultRun<'_> {
             active_fixed_volume_targets,
             active_fixed_volume_containers,
             quorum_activation,
-            deferred_failure: None,
+            deferred_failure: dm_failure,
         };
         if let Some((activation_plan, canary_timeout)) = activation_plan {
             let activation = active
@@ -308,6 +351,7 @@ impl FaultRun<'_> {
                 activation,
                 activation_plan,
                 canary_timeout,
+                &target.quorum_probe_fixtures,
             )
             .await;
             active.deferred_failure = activation.evidence().failure_reason();
@@ -384,7 +428,9 @@ impl FaultRun<'_> {
             .await?;
         let volume_quorum_scenario = matches!(
             plan.scenario.as_str(),
-            QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+            QUORUM_P_IO_FAULT_SCENARIO
+                | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+                | QUORUM_P_DM_EIO_SCENARIO
         );
         let quorum_health_before_workload = if volume_quorum_scenario {
             events.record(
@@ -482,7 +528,10 @@ impl FaultRun<'_> {
             let recorder = history.clone();
             LoadTrigger::arm(move || recorder.next_event_sequence(), gate)
         });
-        if plan.scenario == QUORUM_P_IO_FAULT_SCENARIO {
+        if matches!(
+            plan.scenario.as_str(),
+            QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_DM_EIO_SCENARIO
+        ) {
             let class = plan.fault().parameters().quorum_case()?;
             events.record(
                 "quorum-read-probe",
@@ -1053,15 +1102,19 @@ impl FaultRun<'_> {
             crate::fault::plan::FaultSelection::FixedTargets(_)
         ) && target.execution_injection.rustfs_volume_path().is_ok()
         {
-            let validation = require_active_fixed_volume_targets(
-                config,
-                run_id,
-                &target.execution_injection,
-                &plan.scenario,
-                pods_before,
-                target_proof,
-                workload_snapshots,
-            )
+            let validation = (if plan.scenario == QUORUM_P_DM_EIO_SCENARIO {
+                dm_volume_targets(workload_snapshots, target_proof, run_id)
+            } else {
+                require_active_fixed_volume_targets(
+                    config,
+                    run_id,
+                    &target.execution_injection,
+                    &plan.scenario,
+                    pods_before,
+                    target_proof,
+                    workload_snapshots,
+                )
+            })
             .and_then(|evidence| {
                 ensure!(
                     &evidence.records == active_fixed_volume_targets,
@@ -1403,7 +1456,9 @@ impl FaultRun<'_> {
                     workload.summary.require_write_quorum_loss_effect()
                 } else if matches!(
                     plan.scenario.as_str(),
-                    QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+                    QUORUM_P_IO_FAULT_SCENARIO
+                        | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+                        | QUORUM_P_DM_EIO_SCENARIO
                 ) {
                     let shape = target
                         .target_proof
@@ -1418,7 +1473,10 @@ impl FaultRun<'_> {
                     workload
                         .summary
                         .require_typed_write_quorum_loss_effect(&unavailable)?;
-                    if plan.scenario == QUORUM_P_IO_FAULT_SCENARIO {
+                    if matches!(
+                        plan.scenario.as_str(),
+                        QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_DM_EIO_SCENARIO
+                    ) {
                         require_typed_quorum_read_survival(
                             &self.context.history.records(),
                             &TypedQuorumReadExpectation {
@@ -1795,6 +1853,7 @@ mod availability_endpoint_tests {
                 "status": {"experiment": {"containerRecords": records}}
             })),
             dm_status: None,
+            quorum_dm_status: None,
             lifecycle_status: None,
         }
     }
@@ -1810,6 +1869,7 @@ mod availability_endpoint_tests {
             resource_name: Some("tenant-primary".to_string()),
             chaos_status: None,
             dm_status: None,
+            quorum_dm_status: None,
             lifecycle_status: Some(LifecycleStatusSnapshot {
                 operation: LifecycleOperation::Rolling,
                 statefulset_name: "tenant-primary".to_string(),
@@ -1863,8 +1923,50 @@ mod availability_endpoint_tests {
             resource_name: None,
             chaos_status: None,
             dm_status: None,
+            quorum_dm_status: None,
             lifecycle_status: None,
         };
         assert!(injected_source_pod_names(&[dm_only]).is_err());
     }
+}
+
+pub(super) fn requires_independent_quorum_probe(scenario: &str) -> bool {
+    matches!(
+        scenario,
+        QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+    )
+}
+
+fn dm_volume_targets(
+    snapshots: &[FaultStatusSnapshot],
+    proof: &crate::fault::preflight::TargetProof,
+    run_id: &str,
+) -> Result<FixedVolumeTargets> {
+    ensure!(
+        snapshots.len() == 1,
+        "dm quorum requires one grouped snapshot"
+    );
+    let snapshot = snapshots[0]
+        .quorum_dm_status
+        .as_ref()
+        .context("missing grouped dm quorum snapshot")?;
+    crate::fault::backends::quorum_dm::validate_evidence(snapshot, proof, run_id)?;
+    let bindings = crate::fault::backends::quorum_dm::selected_bindings(snapshot, proof)?;
+    Ok(FixedVolumeTargets {
+        pods: bindings
+            .iter()
+            .map(|binding| PodIdentity {
+                name: binding.pod_name.clone(),
+                uid: binding.pod_uid.clone(),
+            })
+            .collect(),
+        records: bindings
+            .iter()
+            .map(|binding| format!("{}/{}/rustfs", proof.namespace, binding.pod_name))
+            .collect(),
+        containers: bindings
+            .iter()
+            .map(|binding| (binding.pod_name.clone(), binding.container_id.clone()))
+            .collect(),
+    })
 }

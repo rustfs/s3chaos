@@ -17,7 +17,7 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub(crate) const ACTIVATION_SCHEMA_VERSION: u8 = 2;
+pub(crate) const ACTIVATION_SCHEMA_VERSION: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,6 +74,12 @@ pub(crate) struct QuorumFaultActivationTargetEvidence {
     pub(crate) stderr: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cleanup: Option<QuorumCanaryCleanupEvidence>,
+    #[serde(default)]
+    pub(crate) probe: Option<super::probe::ProbeReceipt>,
+    #[serde(default)]
+    pub(crate) probe_cleanup: Option<QuorumCanaryCleanupEvidence>,
+    #[serde(default)]
+    pub(crate) continuity: Option<super::probe::ProbeReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +205,34 @@ impl QuorumFaultActivationEvidence {
             "quorum activation cleanup failure reason is empty"
         );
         for target in &self.targets {
+            if let Some(probe) = &target.probe {
+                probe.fixture.validate()?;
+                ensure!(
+                    probe.fixture.path == format!("{}.operations", target.canary_path)
+                        && probe.fixture.nonce
+                            == probe_nonce(&self.run_id, &target.pod_uid, &target.container_id)
+                        && probe
+                            .samples
+                            .iter()
+                            .all(|sample| sample.started_at_ms >= target.started_at_ms
+                                && sample.completed_at_ms <= target.completed_at_ms),
+                    "quorum probe receipt belongs to another target or time window"
+                );
+            }
+            if let Some(continuity) = &target.continuity {
+                ensure!(
+                    target
+                        .probe
+                        .as_ref()
+                        .is_some_and(|probe| probe.fixture == continuity.fixture
+                            && probe.active_device == continuity.active_device)
+                        && continuity
+                            .samples
+                            .iter()
+                            .all(|sample| sample.started_at_ms >= self.completed_at_ms),
+                    "quorum continuity probe differs from activation fixture or precedes the workload gate"
+                );
+            }
             match target.outcome {
                 QuorumCanaryOutcome::NotRun | QuorumCanaryOutcome::TimedOut => ensure!(
                     target.exit_code.is_none() && target.stdout.is_empty(),
@@ -228,10 +262,13 @@ impl QuorumFaultActivationEvidence {
         self.failure_reasons.is_empty()
             && usize::try_from(self.expected_targets).ok() == Some(self.targets.len())
             && usize::try_from(self.expected_targets).ok() == Some(self.controller_records)
-            && self
-                .targets
-                .iter()
-                .all(|target| target.outcome == QuorumCanaryOutcome::IoErrorObserved)
+            && self.targets.iter().all(|target| {
+                target.outcome == QuorumCanaryOutcome::IoErrorObserved
+                    && target
+                        .probe
+                        .as_ref()
+                        .is_some_and(super::probe::ProbeReceipt::qualifies)
+            })
     }
 
     pub(crate) fn failure_reason(&self) -> Option<String> {
@@ -294,6 +331,87 @@ pub(crate) fn quorum_canary_path(mount_path: &str, pod_name: &str, run_id: &str)
         sha256_hex(run_id.as_bytes()),
         pod_name
     )
+}
+
+pub(crate) fn probe_nonce(run_id: &str, pod_uid: &str, container_id: &str) -> String {
+    sha256_hex(format!("{run_id}\0{pod_uid}\0{container_id}").as_bytes())
+}
+
+pub(crate) fn validate_runtime_provenance(
+    value: &serde_json::Value,
+    run_id: &str,
+    context: &str,
+    candidates: &[super::QuorumVolumeBinding],
+) -> Result<()> {
+    use anyhow::Context;
+    ensure!(
+        value["schemaVersion"] == 1 && value["runId"] == run_id && value["context"] == context,
+        "quorum runtime provenance belongs to another run"
+    );
+    let observations = &value["observations"];
+    let versions = observations["crd"]["spec"]["versions"]
+        .as_array()
+        .context("IOChaos CRD versions missing")?;
+    let methods = versions
+        .iter()
+        .find(|v| v["name"] == "v1alpha1" && v["served"] == true)
+        .and_then(|v| v.pointer("/schema/openAPIV3Schema/properties/spec/properties/methods"))
+        .context("IOChaos served methods schema missing")?;
+    ensure!(
+        methods["type"] == "array" && methods["items"]["type"] == "string",
+        "unsupported IOChaos methods schema"
+    );
+    // Upstream 2.8 uses an unrestricted string array, not an enum. Actual
+    // syscall EIO receipts remain the deployed implementation compatibility gate.
+    if let Some(allowed) = methods["items"].get("enum") {
+        let allowed = allowed.as_array().context("invalid IOChaos method enum")?;
+        ensure!(
+            ["READ", "WRITE", "FSYNC", "RENAME", "UNLINK"]
+                .iter()
+                .all(|method| allowed.iter().any(|value| value
+                    .as_str()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(method)))),
+            "installed IOChaos schema does not support all quorum probe methods"
+        );
+    }
+    let backend = observations["backend"]["items"]
+        .as_array()
+        .context("Chaos Mesh Pod identities missing")?;
+    for component in ["chaos-controller-manager", "chaos-daemon"] {
+        ensure!(
+            backend.iter().any(|pod| pod["metadata"]["name"]
+                .as_str()
+                .is_some_and(|name| name.contains(component))
+                && pod["status"]["containerStatuses"]
+                    .as_array()
+                    .is_some_and(|statuses| !statuses.is_empty()
+                        && statuses.iter().all(|status| status["ready"] == true
+                            && status["imageID"]
+                                .as_str()
+                                .is_some_and(|id| id.contains("sha256:"))))),
+            "ready {component} resolved image digest missing"
+        );
+    }
+    let pods = observations["rustfs"]["items"]
+        .as_array()
+        .context("RustFS Pod identities missing")?;
+    for target in candidates {
+        ensure!(
+            pods.iter()
+                .any(|pod| pod["metadata"]["name"] == target.pod_name
+                    && pod["metadata"]["uid"] == target.pod_uid
+                    && pod["status"]["containerStatuses"]
+                        .as_array()
+                        .is_some_and(|statuses| statuses.iter().any(|status| status["name"]
+                            == "rustfs"
+                            && status["containerID"] == target.container_id
+                            && status["imageID"]
+                                .as_str()
+                                .is_some_and(|id| id.contains("sha256:"))))),
+            "quorum derived RustFS image digest or container generation missing"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

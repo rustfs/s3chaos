@@ -19,6 +19,7 @@ use aws_sdk_s3::{
     Client,
     config::Region,
     error::SdkError,
+    operation::{RequestId, RequestIdExt},
     primitives::ByteStream,
     types::{
         BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration,
@@ -1568,12 +1569,22 @@ impl S3WorkloadClient {
                 let mut record = record;
                 record.version_id = output.version_id().map(str::to_string);
                 record.is_delete_marker = output.delete_marker();
+                record.request_id = output.request_id().map(str::to_string);
+                record.extended_request_id = output.extended_request_id().map(str::to_string);
                 Ok(RecordedDelete {
                     record: recorder.finish(record, OperationOutcome::Ok, Some(204), None)?,
                 })
             }
             Ok(Err(error)) => {
                 let outcome = classify_sdk_error(&error);
+                if let Some(response) = error.raw_response() {
+                    record.request_id = response
+                        .headers()
+                        .get("x-amz-request-id")
+                        .map(str::to_string);
+                    record.extended_request_id =
+                        response.headers().get("x-amz-id-2").map(str::to_string);
+                }
                 Ok(RecordedDelete {
                     record: recorder.finish(
                         record,

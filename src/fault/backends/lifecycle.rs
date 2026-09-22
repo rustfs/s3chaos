@@ -1737,6 +1737,7 @@ impl LifecycleFaultHandle {
             resource_name: Some(self.statefulset.name.clone()),
             chaos_status: None,
             dm_status: None,
+            quorum_dm_status: None,
             lifecycle_status: Some(LifecycleStatusSnapshot {
                 operation: self.operation,
                 statefulset_name: statefulset.identity.name,

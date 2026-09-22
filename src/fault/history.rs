@@ -136,6 +136,10 @@ pub struct OperationRecord {
     /// artifacts omit this field and retain their previous interpretation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_delete_marker: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extended_request_id: Option<String>,
     /// Maximum HTTP attempts configured for this mutation request. New
     /// records set this at the client boundary; legacy records omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -458,6 +462,8 @@ impl Recorder {
             version_id: None,
             request_version_id: None,
             is_delete_marker: None,
+            request_id: None,
+            extended_request_id: None,
             mutation_max_attempts: None,
             mutation_attempts: None,
             read_purpose: None,

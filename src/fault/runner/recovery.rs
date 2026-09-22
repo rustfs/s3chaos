@@ -337,6 +337,7 @@ impl FaultRun<'_> {
             host_storage_proof: _,
             execution_injection: _,
             health_baseline: _,
+            quorum_probe_fixtures: _,
         } = target;
         let ActiveFault {
             fault,

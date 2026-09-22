@@ -18,3 +18,5 @@ mod host_command;
 pub(in crate::fault) mod lifecycle;
 
 pub(in crate::fault) mod runtime;
+
+pub(in crate::fault) mod quorum_dm;

@@ -188,6 +188,7 @@ mod tests {
                 resource_name: Some(self.name.to_string()),
                 chaos_status: None,
                 dm_status: None,
+                quorum_dm_status: None,
                 lifecycle_status: None,
             })
         }

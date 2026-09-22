@@ -609,7 +609,7 @@ pub(super) fn require_active_fixed_volume_targets(
         candidate_pod_ids.len() == proof_identities.len(),
         "fixed volume target proof must cover every selector Pod"
     );
-    let runtime_contract = chaos_mesh::volume_fault_runtime_contract(injection)?;
+    let runtime_contract = chaos_mesh::volume_fault_runtime_contract(injection, scenario)?;
     let snapshot = &snapshots[0];
     ensure!(
         snapshot.resource_kind.as_deref() == Some("iochaos"),

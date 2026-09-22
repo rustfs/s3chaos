@@ -141,6 +141,7 @@ pub struct FaultTestConfig {
     /// Substring a container image of that Deployment must contain before
     /// it is paused, so a mistyped name can never scale a foreign workload.
     pub operator_image_match: String,
+    pub quorum_dm_targets: Option<PathBuf>,
     pub dm_name: Option<String>,
     pub dm_node: Option<String>,
     pub dm_mount_path: Option<String>,
@@ -411,6 +412,8 @@ impl FaultTestConfig {
                 );
                 percent
             },
+            quorum_dm_targets: env_optional(&get_env, "RUSTFS_FAULT_TEST_QUORUM_DM_TARGETS")
+                .map(PathBuf::from),
             dm_name: env_optional(&get_env, "RUSTFS_FAULT_TEST_DM_NAME"),
             dm_node: env_optional(&get_env, "RUSTFS_FAULT_TEST_DM_NODE"),
             dm_mount_path: env_optional(&get_env, "RUSTFS_FAULT_TEST_DM_MOUNT_PATH"),

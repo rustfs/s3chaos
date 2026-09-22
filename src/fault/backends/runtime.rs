@@ -47,6 +47,9 @@ pub(in crate::fault) fn require_fault_backends(
     config: &FaultTestConfig,
     plan: &FaultPlan,
 ) -> Result<()> {
+    if plan.scenario == crate::fault::scenarios::QUORUM_P_DM_EIO_SCENARIO {
+        return super::quorum_dm::validate_config(config);
+    }
     require_fault_backend(config, plan.fault().backend(), plan.fault().kind())?;
     for fault in plan
         .faults()
@@ -67,7 +70,9 @@ pub(in crate::fault) fn preflight_host_storage_mutation(
     run_id: &str,
 ) -> Result<Option<HostStorageMutationProof>> {
     let injection = plan.fault();
-    if injection.backend() != FaultBackend::DeviceMapper {
+    if injection.backend() != FaultBackend::DeviceMapper
+        || scenario.name == crate::fault::scenarios::QUORUM_P_DM_EIO_SCENARIO
+    {
         return Ok(None);
     }
     let fault_name = format!("{}-00-{}", scenario.name, injection.kind().as_str());
@@ -439,6 +444,7 @@ impl FaultLifecyclePort for DmFlakeyFaultHandle {
                 "active" | "after-workload" => self.guard.ensure_active(stage)?,
                 _ => self.guard.snapshot(stage)?,
             }),
+            quorum_dm_status: None,
             lifecycle_status: None,
         })
     }
@@ -455,6 +461,7 @@ fn chaos_fault_snapshot(guard: &ChaosGuard, stage: &str) -> Result<FaultStatusSn
         resource_name: Some(guard.name().to_string()),
         chaos_status: Some(serde_json::from_str(&guard.json()?)?),
         dm_status: None,
+        quorum_dm_status: None,
         lifecycle_status: None,
     })
 }
@@ -1177,6 +1184,7 @@ mod tests {
                 resource_name: Some(self.name.to_string()),
                 chaos_status: None,
                 dm_status: None,
+                quorum_dm_status: None,
                 lifecycle_status: None,
             })
         }

@@ -316,6 +316,7 @@ async fn run_canary(
     binding: QuorumVolumeBinding,
     controller_record_id: String,
     timeout: Duration,
+    fixture: Option<crate::fault::quorum::probe::ProbeFixture>,
 ) -> QuorumFaultActivationTargetEvidence {
     let path = canary_path(&binding, run_id);
     let started_at_ms = now_ms();
@@ -335,6 +336,22 @@ async fn run_canary(
         ])
         .run_bounded(timeout)
         .await;
+    let probe = if let Some(fixture) = fixture {
+        probe_command(
+            cluster,
+            &binding.pod_name,
+            &crate::fault::quorum::probe::ProbeRequest::Probe { fixture },
+            timeout,
+        )
+        .await
+        .ok()
+        .and_then(|response| match response {
+            crate::fault::quorum::probe::ProbeResponse::Probed { receipt } => Some(receipt),
+            _ => None,
+        })
+    } else {
+        None
+    };
     let completed_at_ms = now_ms();
     let (outcome, exit_code, stdout, stderr) = match result {
         Ok(output) => (
@@ -373,6 +390,9 @@ async fn run_canary(
         stdout,
         stderr,
         cleanup: None,
+        probe,
+        probe_cleanup: None,
+        continuity: None,
     }
 }
 
@@ -486,6 +506,9 @@ pub(super) fn prepare_quorum_fault_activation(
                 stdout: String::new(),
                 stderr: "canary execution did not complete".to_string(),
                 cleanup: None,
+                probe: None,
+                probe_cleanup: None,
+                continuity: None,
             },
         )
         .collect::<Vec<_>>();
@@ -524,18 +547,30 @@ pub(super) async fn qualify_prepared_quorum_fault_activation(
     activation: &mut QuorumCanaryCleanupGuard,
     plan: QuorumFaultActivationPlan,
     timeout: Duration,
+    fixtures: &BTreeMap<String, crate::fault::quorum::probe::ProbeFixture>,
 ) {
-    let futures = plan
-        .attempts
-        .into_iter()
-        .map(|(binding, record_id)| run_canary(cluster, run_id, binding, record_id, timeout));
+    let futures = plan.attempts.into_iter().map(|(binding, record_id)| {
+        run_canary(
+            cluster,
+            run_id,
+            binding.clone(),
+            record_id,
+            timeout,
+            fixtures.get(&binding.pod_name).cloned(),
+        )
+    });
     let mut targets = join_all(futures).await;
     targets.sort_by(|left, right| left.pod_name.cmp(&right.pod_name));
     let mut failure_reasons = plan.failure_reasons;
     for target in &targets {
-        if target.outcome != QuorumCanaryOutcome::IoErrorObserved {
+        if target.outcome != QuorumCanaryOutcome::IoErrorObserved
+            || !target
+                .probe
+                .as_ref()
+                .is_some_and(crate::fault::quorum::probe::ProbeReceipt::qualifies)
+        {
             failure_reasons.push(format!(
-                "canary for Pod {:?} did not observe EIO: {:?}",
+                "fault_activation_unproven: Pod {:?} lacks sustained read/write/fsync/rename/unlink EIO: {:?}",
                 target.pod_name, target.outcome
             ));
         }
@@ -575,7 +610,13 @@ pub(super) async fn cleanup_quorum_canaries(
             let started_at_ms = now_ms();
             let result = command.run_bounded(timeout).await;
             let completed_at_ms = now_ms();
-            match result {
+            let probe_cleanup = if let Some(probe) = &target.probe {
+                let started_at_ms = now_ms();
+                let result = probe_command(cluster, &target.pod_name, &crate::fault::quorum::probe::ProbeRequest::Cleanup { fixture: probe.fixture.clone() }, timeout).await;
+                let success = matches!(&result, Ok(crate::fault::quorum::probe::ProbeResponse::Cleaned { fixture }) if fixture == &probe.fixture);
+                Some(QuorumCanaryCleanupEvidence { started_at_ms, completed_at_ms: now_ms(), outcome: if success { QuorumCanaryCleanupOutcome::Removed } else { QuorumCanaryCleanupOutcome::Failed }, exit_code: success.then_some(0), stderr: if success { String::new() } else { format!("{result:?}") } })
+            } else { None };
+            let cleanup = match result {
                 Ok(output) => QuorumCanaryCleanupEvidence {
                     started_at_ms,
                     completed_at_ms,
@@ -598,12 +639,14 @@ pub(super) async fn cleanup_quorum_canaries(
                     exit_code: None,
                     stderr: error.to_string(),
                 },
-            }
+            };
+            (cleanup, probe_cleanup)
         }
     });
     let cleanups = join_all(futures).await;
-    for (target, cleanup) in evidence.targets.iter_mut().zip(cleanups) {
+    for (target, (cleanup, probe_cleanup)) in evidence.targets.iter_mut().zip(cleanups) {
         target.cleanup = Some(cleanup);
+        target.probe_cleanup = probe_cleanup;
     }
     let failures = evidence
         .targets
@@ -613,6 +656,10 @@ pub(super) async fn cleanup_quorum_canaries(
                 .cleanup
                 .as_ref()
                 .is_none_or(|cleanup| cleanup.outcome != QuorumCanaryCleanupOutcome::Removed)
+                || (target.probe.is_some()
+                    && target.probe_cleanup.as_ref().is_none_or(|cleanup| {
+                        cleanup.outcome != QuorumCanaryCleanupOutcome::Removed
+                    }))
         })
         .map(|target| target.pod_name.clone())
         .collect::<Vec<_>>();
@@ -622,6 +669,328 @@ pub(super) async fn cleanup_quorum_canaries(
         failures.join(", ")
     );
     Ok(())
+}
+
+async fn probe_command(
+    cluster: &ClusterTestConfig,
+    pod: &str,
+    request: &crate::fault::quorum::probe::ProbeRequest,
+    timeout: Duration,
+) -> Result<crate::fault::quorum::probe::ProbeResponse> {
+    let output = Kubectl::new(cluster)
+        .namespaced(&cluster.test_namespace)
+        .command([
+            "exec",
+            "-i",
+            pod,
+            "-c",
+            RUSTFS_CONTAINER,
+            "--",
+            crate::fault::quorum::probe::PROBE_BINARY,
+        ])
+        .stdin(serde_json::to_string(request)?)
+        .run_bounded(timeout)
+        .await?;
+    ensure!(
+        output.code == Some(0),
+        "native quorum probe failed in {pod}: {}",
+        output.stderr
+    );
+    serde_json::from_str(&output.stdout).context("decode native quorum probe response")
+}
+
+pub(super) struct QuorumProbeFixtures {
+    cluster: ClusterTestConfig,
+    collector: ArtifactCollector,
+    case_name: String,
+    pending: BTreeMap<String, (String, String)>,
+    pub(super) fixtures: BTreeMap<String, crate::fault::quorum::probe::ProbeFixture>,
+}
+impl QuorumProbeFixtures {
+    pub(super) async fn stage(
+        cluster: &ClusterTestConfig,
+        chaos_namespace: &str,
+        run_id: &str,
+        proof: &TargetProof,
+        collector: &ArtifactCollector,
+        case_name: &str,
+    ) -> Result<Self> {
+        use crate::fault::quorum::{
+            activation::probe_nonce,
+            probe::{ProbeRequest, ProbeResponse},
+        };
+        capture_runtime_provenance(
+            cluster,
+            chaos_namespace,
+            run_id,
+            proof,
+            collector,
+            case_name,
+        )
+        .await?;
+        let mut guard = Self {
+            cluster: cluster.clone(),
+            collector: collector.clone(),
+            case_name: case_name.to_string(),
+            pending: BTreeMap::new(),
+            fixtures: BTreeMap::new(),
+        };
+        let bindings = &volume_quorum_proof(proof)?.candidates;
+        // Stage before the final fresh topology observation and before injection.
+        // The guard is declared before AppliedFault so unwind restores I/O first.
+        for binding in bindings {
+            let path = format!("{}.operations", canary_path(binding, run_id));
+            let nonce = probe_nonce(run_id, &binding.pod_uid, &binding.container_id);
+            guard
+                .pending
+                .insert(binding.pod_name.clone(), (path.clone(), nonce.clone()));
+            guard.persist()?;
+            let request = ProbeRequest::Stage { path, nonce };
+            let ProbeResponse::Staged { fixture } = probe_command(
+                cluster,
+                &binding.pod_name,
+                &request,
+                Duration::from_secs(10),
+            )
+            .await?
+            else {
+                return Err(anyhow!(
+                    "quorum probe returned an unexpected staging response"
+                ));
+            };
+            fixture.validate()?;
+            guard.fixtures.insert(binding.pod_name.clone(), fixture);
+            guard.pending.remove(&binding.pod_name);
+            guard.persist()?;
+        }
+        Ok(guard)
+    }
+    fn persist(&self) -> Result<()> {
+        self.collector.write_text(
+            &self.case_name,
+            "quorum-probe-fixtures.json",
+            &serde_json::to_string_pretty(
+                &serde_json::json!({"pending": self.pending, "fixtures": self.fixtures}),
+            )?,
+        )?;
+        Ok(())
+    }
+    pub(super) fn require_matches(&self, run_id: &str, proof: &TargetProof) -> Result<()> {
+        let candidates = &volume_quorum_proof(proof)?.candidates;
+        ensure!(
+            candidates.len() == self.fixtures.len(),
+            "quorum probe candidate count changed"
+        );
+        for binding in candidates {
+            let fixture = self
+                .fixtures
+                .get(&binding.pod_name)
+                .context("quorum probe candidate changed")?;
+            ensure!(
+                fixture.path == format!("{}.operations", canary_path(binding, run_id))
+                    && fixture.nonce
+                        == crate::fault::quorum::activation::probe_nonce(
+                            run_id,
+                            &binding.pod_uid,
+                            &binding.container_id
+                        ),
+                "quorum probe candidate generation changed"
+            );
+        }
+        Ok(())
+    }
+    pub(super) async fn cleanup(&mut self) -> Result<()> {
+        let mut failures = Vec::new();
+        for (pod, fixture) in self.fixtures.clone() {
+            let result = probe_command(
+                &self.cluster,
+                &pod,
+                &crate::fault::quorum::probe::ProbeRequest::Cleanup { fixture },
+                Duration::from_secs(10),
+            )
+            .await;
+            match result {
+                Ok(crate::fault::quorum::probe::ProbeResponse::Cleaned { .. }) => {
+                    self.fixtures.remove(&pod);
+                }
+                other => failures.push(format!("{pod}: {other:?}")),
+            }
+        }
+        for (pod, (path, nonce)) in self.pending.clone() {
+            let result = probe_command(
+                &self.cluster,
+                &pod,
+                &crate::fault::quorum::probe::ProbeRequest::CleanupPending {
+                    path: path.clone(),
+                    nonce: nonce.clone(),
+                },
+                Duration::from_secs(10),
+            )
+            .await;
+            match result {
+                Ok(crate::fault::quorum::probe::ProbeResponse::CleanedPending {
+                    path: actual,
+                    nonce: owner,
+                }) if actual == path && owner == nonce => {
+                    self.pending.remove(&pod);
+                }
+                other => failures.push(format!("pending {pod}: {other:?}")),
+            }
+        }
+        self.persist()?;
+        if !failures.is_empty() {
+            self.collector.write_text(
+                &self.case_name,
+                "quorum-probe-cleanup-error.txt",
+                &failures.join("; "),
+            )?;
+        }
+        ensure!(
+            failures.is_empty(),
+            "quorum probe fixture cleanup failed: {}",
+            failures.join("; ")
+        );
+        Ok(())
+    }
+}
+impl Drop for QuorumProbeFixtures {
+    fn drop(&mut self) {
+        if self.fixtures.is_empty() && self.pending.is_empty() {
+            return;
+        }
+        let mut cleanup = Self {
+            cluster: self.cluster.clone(),
+            collector: self.collector.clone(),
+            case_name: self.case_name.clone(),
+            pending: std::mem::take(&mut self.pending),
+            fixtures: std::mem::take(&mut self.fixtures),
+        };
+        let worker = std::thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(anyhow::Error::from)
+                .and_then(|runtime| runtime.block_on(cleanup.cleanup()));
+            // An unrecoverable cleanup is reported once; never recursively retry Drop.
+            cleanup.fixtures.clear();
+            cleanup.pending.clear();
+            if let Err(error) = result {
+                eprintln!("quorum probe cleanup failed: {error:#}");
+            }
+        });
+        let _ = worker.join();
+    }
+}
+
+pub(super) async fn verify_quorum_continuity(
+    cluster: &ClusterTestConfig,
+    activation: &mut QuorumCanaryCleanupGuard,
+) -> Result<()> {
+    let mut evidence = activation.evidence().clone();
+    let results = join_all(evidence.targets.iter().map(|target| async move {
+        let fixture = target
+            .probe
+            .as_ref()
+            .context("missing initial syscall probe")?
+            .fixture
+            .clone();
+        match probe_command(
+            cluster,
+            &target.pod_name,
+            &crate::fault::quorum::probe::ProbeRequest::Probe { fixture },
+            Duration::from_secs(10),
+        )
+        .await?
+        {
+            crate::fault::quorum::probe::ProbeResponse::Probed { receipt } => Ok(receipt),
+            _ => Err(anyhow!("unexpected continuity probe response")),
+        }
+    }))
+    .await;
+    let mut failures = Vec::new();
+    for (target, result) in evidence.targets.iter_mut().zip(results) {
+        match result {
+            Ok(receipt) => {
+                if !receipt.qualifies() {
+                    failures.push(format!(
+                        "{}: sustained syscall EIO was not maintained",
+                        target.pod_name
+                    ));
+                }
+                target.continuity = Some(receipt);
+            }
+            Err(error) => failures.push(format!("{}: {error:#}", target.pod_name)),
+        }
+    }
+    activation.replace_evidence(evidence);
+    ensure!(
+        failures.is_empty(),
+        "fault_activation_unproven: {}",
+        failures.join("; ")
+    );
+    Ok(())
+}
+
+async fn capture_runtime_provenance(
+    cluster: &ClusterTestConfig,
+    chaos_namespace: &str,
+    run_id: &str,
+    proof: &TargetProof,
+    collector: &ArtifactCollector,
+    case_name: &str,
+) -> Result<()> {
+    let kubectl = Kubectl::new(cluster);
+    let mut observations = BTreeMap::new();
+    for (name, command) in [
+        (
+            "crd",
+            kubectl.command(["get", "crd", "iochaos.chaos-mesh.org", "-o", "json"]),
+        ),
+        (
+            "backend",
+            kubectl
+                .clone()
+                .namespaced(chaos_namespace)
+                .command(["get", "pods", "-o", "json"]),
+        ),
+        (
+            "rustfs",
+            kubectl
+                .namespaced(&cluster.test_namespace)
+                .command(["get", "pods", "-o", "json"]),
+        ),
+    ] {
+        let output = command.run_bounded(Duration::from_secs(20)).await?;
+        ensure!(
+            output.code == Some(0),
+            "cannot capture quorum {name} provenance: {}",
+            output.stderr
+        );
+        let mut observation: serde_json::Value = serde_json::from_str(&output.stdout)?;
+        if name != "crd" {
+            let items = observation["items"]
+                .as_array()
+                .context("Pod list missing")?;
+            observation = serde_json::json!({"items": items.iter().map(|pod| serde_json::json!({
+                "metadata": {"name":pod["metadata"]["name"], "uid":pod["metadata"]["uid"], "labels":pod["metadata"]["labels"]},
+                "status": {"containerStatuses":pod["status"]["containerStatuses"]}
+            })).collect::<Vec<_>>()});
+        }
+        observations.insert(name, observation);
+    }
+    let value = serde_json::json!({"schemaVersion":1,"runId":run_id,"context":cluster.context,
+        "observedAtMs":now_ms(),"observations":observations});
+    collector.write_text(
+        case_name,
+        "quorum-runtime-provenance.json",
+        &serde_json::to_string_pretty(&value)?,
+    )?;
+    crate::fault::quorum::activation::validate_runtime_provenance(
+        &value,
+        run_id,
+        &cluster.context,
+        &volume_quorum_proof(proof)?.candidates,
+    )
 }
 
 #[cfg(test)]
@@ -646,7 +1015,7 @@ mod tests {
             controller_record_id: format!("faults/rustfs-{index}/rustfs"),
             canary_path: quorum_canary_path("/data/rustfs0", &format!("rustfs-{index}"), "run-1"),
             started_at_ms: 110 + index as u64,
-            completed_at_ms: 120 + index as u64,
+            completed_at_ms: 2120 + index as u64,
             outcome,
             exit_code: Some(1),
             stdout: format!(
@@ -655,6 +1024,20 @@ mod tests {
             ),
             stderr: "sh: write error: Input/output error".to_string(),
             cleanup: None,
+            probe: Some(crate::fault::quorum::probe::test_receipt(
+                format!(
+                    "{}.operations",
+                    quorum_canary_path("/data/rustfs0", &format!("rustfs-{index}"), "run-1")
+                ),
+                crate::fault::quorum::activation::probe_nonce(
+                    "run-1",
+                    &format!("pod-uid-{index}"),
+                    &format!("containerd://container-{index}"),
+                ),
+                110 + index as u64,
+            )),
+            probe_cleanup: None,
+            continuity: None,
         }
     }
 
@@ -679,7 +1062,7 @@ mod tests {
             expected_targets,
             controller_records: targets.len(),
             started_at_ms: 100,
-            completed_at_ms: 200,
+            completed_at_ms: 3000,
             qualified,
             failure_reasons,
             cleanup_failure_reason: None,

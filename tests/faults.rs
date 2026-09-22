@@ -700,3 +700,64 @@ analyze_qualification "$2"
 async fn fault_selected_scenario() -> Result<()> {
     s3chaos::fault::runner::run_selected_scenario_from_env().await
 }
+
+#[cfg(unix)]
+#[test]
+fn quorum_dm_wrapper_validates_exact_targets_and_protects_both_markers() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let targets = root.join("targets.json");
+    let values: Vec<_> = ["a", "b"].iter().map(|id| serde_json::json!({
+        "node": format!("node-{id}"), "mapperName": format!("dm-{id}"), "mountPath": format!("/data/{id}"),
+        "persistentVolume": format!("pv-{id}"), "observerNamespace": "observers", "observerPod": format!("observer-{id}"),
+        "stateFile": root.join(format!(".host-mutation-{id}.json")), "stateToken": id,
+    })).collect();
+    std::fs::write(
+        &targets,
+        serde_json::to_vec(&serde_json::json!({"targets":values})).unwrap(),
+    )
+    .unwrap();
+    let output = Command::new("bash").args(["-c", r#"
+source "$1"
+export RUSTFS_FAULT_TEST_QUORUM_DM_TARGETS="$2/targets.json"
+export RUSTFS_FAULT_TEST_RUN_ROOT="$2"
+export RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE=1
+export RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST=node-a,node-b
+export RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST=/dev/mapper/dm-a,/dev/mapper/dm-b
+export RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST=pv-a,pv-b
+validate_dm_env_contract quorum-p-dm-eio
+[[ "${#ACTIVE_QUORUM_DM_STATE_FILES[@]}" == 2 ]]
+for index in 0 1; do
+  file="${ACTIVE_QUORUM_DM_STATE_FILES[$index]}"
+  token="${ACTIVE_QUORUM_DM_STATE_TOKENS[$index]}"
+  jq -n --arg token "$token" '{schemaVersion:1,token:$token,ownerPid:222,phase:"active"}' >"$file"
+  host_storage_mutation_active 111 "" "" || exit 21
+  probes=0 signals=""
+  process_group_alive() { probes=$((probes + 1)); (( probes <= 2 )); }
+  capture_process_group() { :; }
+  signal_process_group() { signals="$signals $3"; }
+  sleep() { :; }
+  terminate_process_group 111 111 "" "" "$2" 0
+  [[ "$signals" == " TERM" ]] || exit 27
+  printf '{' >"$file"
+  host_storage_mutation_active 111 "" "" || exit 22
+  jq -n '{schemaVersion:1,token:"foreign",ownerPid:222,phase:"rollback"}' >"$file"
+  host_storage_mutation_active 111 "" "" || exit 23
+  rm "$file"
+done
+host_storage_mutation_active 111 "" "" && exit 24
+( RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST=node-a,node-b,node-c; validate_dm_env_contract quorum-p-dm-eio ) && exit 25
+jq '.targets[1].stateToken="a"' "$2/targets.json" >"$2/duplicate.json"
+( RUSTFS_FAULT_TEST_QUORUM_DM_TARGETS="$2/duplicate.json"; validate_dm_env_contract quorum-p-dm-eio ) && exit 26
+printf 'validated-and-protected\n'
+"#, "qdm-wrapper-test", concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh"), root.to_str().unwrap()]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "validated-and-protected\n"
+    );
+}

@@ -48,6 +48,9 @@ ACTIVE_SCOPE=""
 ACTIVE_NAME=""
 ACTIVE_HOST_MUTATION_STATE_FILE=""
 ACTIVE_HOST_MUTATION_STATE_TOKEN=""
+ACTIVE_QUORUM_DM_STATE_FILES=()
+ACTIVE_QUORUM_DM_STATE_TOKENS=()
+QUORUM_DM_TARGETS_JSON=""
 ACTIVE_QUALIFICATION_ROOT=""
 ACTIVE_QUALIFICATION_CASE=""
 FAULT_TEST_BINARY=""
@@ -428,9 +431,67 @@ validate_qualification_env_contract() {
   esac
 }
 
+validate_quorum_dm_env_contract() {
+  require_nonempty_env RUSTFS_FAULT_TEST_QUORUM_DM_TARGETS
+  require_nonempty_env RUSTFS_FAULT_TEST_RUN_ROOT
+  require_nonempty_env RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE
+  require_nonempty_env RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST
+  require_nonempty_env RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST
+  require_nonempty_env RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST
+  local opt_in root index node mapper mount pv observer_ns observer_pod state_file token parent
+  opt_in="$(printf '%s' "$RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE" | tr '[:upper:]' '[:lower:]')"
+  [[ "$opt_in" == 1 || "$opt_in" == true || "$opt_in" == yes ]] || die "quorum dm requires explicit destructive opt-in"
+  root="$(cd "$RUSTFS_FAULT_TEST_RUN_ROOT" && pwd -P)" || die "quorum dm run root must exist"
+  QUORUM_DM_TARGETS_JSON="$(cat "$RUSTFS_FAULT_TEST_QUORUM_DM_TARGETS")" || die "cannot read quorum dm target file"
+  jq -e --arg nodes "$RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST" --arg devices "$RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST" --arg pvs "$RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST" '
+    def allowlist: split(",") | map(gsub("^\\s+|\\s+$"; "")) | sort;
+    type == "object" and (keys == ["targets"]) and (.targets | type == "array" and length == 2)
+    and all(.targets[]; (keys | sort) == (["node","mapperName","mountPath","persistentVolume","observerNamespace","observerPod","stateFile","stateToken"] | sort)
+      and all(.[]; type == "string" and length > 0))
+    and ([.targets[].node] | unique | length == 2)
+    and ([.targets[].persistentVolume] | unique | length == 2)
+    and ([.targets[].stateFile] | unique | length == 2)
+    and ([.targets[].stateToken] | unique | length == 2)
+    and ([.targets[].node] | sort) == ($nodes | allowlist)
+    and ([.targets[] | "/dev/mapper/" + .mapperName] | sort) == ($devices | allowlist)
+    and ([.targets[].persistentVolume] | sort) == ($pvs | allowlist)
+  ' <<<"$QUORUM_DM_TARGETS_JSON" >/dev/null || die "quorum dm requires exactly two closed targets matching node/device/PV allowlists"
+  ACTIVE_QUORUM_DM_STATE_FILES=()
+  ACTIVE_QUORUM_DM_STATE_TOKENS=()
+  for index in 0 1; do
+    node="$(jq -r ".targets[$index].node" <<<"$QUORUM_DM_TARGETS_JSON")"
+    mapper="$(jq -r ".targets[$index].mapperName" <<<"$QUORUM_DM_TARGETS_JSON")"
+    mount="$(jq -r ".targets[$index].mountPath" <<<"$QUORUM_DM_TARGETS_JSON")"
+    pv="$(jq -r ".targets[$index].persistentVolume" <<<"$QUORUM_DM_TARGETS_JSON")"
+    observer_ns="$(jq -r ".targets[$index].observerNamespace" <<<"$QUORUM_DM_TARGETS_JSON")"
+    observer_pod="$(jq -r ".targets[$index].observerPod" <<<"$QUORUM_DM_TARGETS_JSON")"
+    state_file="$(jq -r ".targets[$index].stateFile" <<<"$QUORUM_DM_TARGETS_JSON")"
+    token="$(jq -r ".targets[$index].stateToken" <<<"$QUORUM_DM_TARGETS_JSON")"
+    require_safe_node_name node "$node"
+    require_safe_dm_name mapper "$mapper"
+    require_absolute_non_root_path mount "$mount"
+    require_safe_node_name pv "$pv"
+    require_safe_node_name observerNamespace "$observer_ns"
+    require_safe_node_name observerPod "$observer_pod"
+    [[ "$observer_ns" != "$FAULT_NAMESPACE" ]] || die "quorum dm observers must be outside the disposable namespace"
+    [[ "$token" =~ ^[a-zA-Z0-9._-]{1,128}$ ]] || die "invalid quorum dm state token"
+    parent="$(dirname "$state_file")"
+    [[ "$parent" == "$root" || "$parent" == "$root/quorum-p-dm-eio" ]] || die "quorum dm state file must be inside this run artifact root"
+    [[ "$state_file" == "$parent/.host-mutation-$token.json" ]] || die "quorum dm state filename must match its token"
+    [[ ! -e "$state_file" && ! -L "$state_file" ]] || die "unresolved quorum dm state exists: $state_file"
+    [[ ! -L "$parent" ]] || die "quorum dm state directory must not be a symlink"
+    ACTIVE_QUORUM_DM_STATE_FILES+=("$state_file")
+    ACTIVE_QUORUM_DM_STATE_TOKENS+=("$token")
+  done
+}
+
 validate_dm_env_contract() {
   local scenario="$1"
   local dm_opt_in
+  if [[ "$scenario" == "quorum-p-dm-eio" ]]; then
+    validate_quorum_dm_env_contract
+    return
+  fi
   require_nonempty_env RUSTFS_FAULT_TEST_DM_NAME
   require_nonempty_env RUSTFS_FAULT_TEST_DM_NODE
   require_nonempty_env RUSTFS_FAULT_TEST_DM_MOUNT_PATH
@@ -705,9 +766,20 @@ preflight() {
       || die "on-disk-bitrot requires pod-security.kubernetes.io/enforce=privileged on $FAULT_NAMESPACE"
   elif scenario_requires_static_storage "$scenario"; then
     validate_dm_env_contract "$scenario"
-    kubectl_cluster -n "$RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE" \
-      get pod "$RUSTFS_FAULT_TEST_DM_OBSERVER_POD" >/dev/null \
-      || die "$scenario requires the configured pre-provisioned host observer Pod"
+    if [[ "$scenario" == "quorum-p-dm-eio" ]]; then
+      local index observer_ns observer_pod observer_node expected_node
+      for index in 0 1; do
+        observer_ns="$(jq -r ".targets[$index].observerNamespace" <<<"$QUORUM_DM_TARGETS_JSON")"
+        observer_pod="$(jq -r ".targets[$index].observerPod" <<<"$QUORUM_DM_TARGETS_JSON")"
+        expected_node="$(jq -r ".targets[$index].node" <<<"$QUORUM_DM_TARGETS_JSON")"
+        observer_node="$(kubectl_cluster -n "$observer_ns" get pod "$observer_pod" -o jsonpath='{.spec.nodeName}')" || die "quorum dm observer missing"
+        [[ "$observer_node" == "$expected_node" ]] || die "quorum dm observer is bound to another node"
+      done
+    else
+      kubectl_cluster -n "$RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE" \
+        get pod "$RUSTFS_FAULT_TEST_DM_OBSERVER_POD" >/dev/null \
+        || die "$scenario requires the configured pre-provisioned host observer Pod"
+    fi
     kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1 || die "$scenario requires a pre-created owned fault namespace with privileged Pod Security"
     [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] || die "$scenario requires pod-security.kubernetes.io/enforce=privileged on $FAULT_NAMESPACE"
   elif [[ "$qualification_case" == fresh-volume-replacement-* ]]; then
@@ -804,6 +876,25 @@ process_descends_from() {
 }
 
 host_storage_mutation_active() {
+  local parent="$1" state_file="$2" state_token="$3" index marker
+  for ((index=0; index<${#ACTIVE_QUORUM_DM_STATE_FILES[@]}; index++)); do
+    marker="${ACTIVE_QUORUM_DM_STATE_FILES[$index]}"
+    if [[ -e "$marker" || -L "$marker" ]]; then
+      # A malformed, foreign, or prepared marker is unresolved, not proof that
+      # either device is safe. Only removal after proven rollback releases KILL.
+      if ! jq -e --arg token "${ACTIVE_QUORUM_DM_STATE_TOKENS[$index]}" '
+        .schemaVersion == 1 and .token == $token and (.ownerPid | type == "number" and . > 0)
+        and (.phase == "prepared" or .phase == "activating" or .phase == "active" or .phase == "rollback")
+      ' "$marker" >/dev/null 2>&1; then
+        echo "warning: retaining process group for unresolved quorum dm marker: $marker" >&2
+      fi
+      return 0
+    fi
+  done
+  host_storage_single_mutation_active "$parent" "$state_file" "$state_token"
+}
+
+host_storage_single_mutation_active() {
   local parent="$1" state_file="$2" state_token="$3" owner phase token schema
   [[ -n "$state_file" && -n "$state_token" && -f "$state_file" ]] || return 1
   schema="$(jq -r '.schemaVersion // empty' "$state_file" 2>/dev/null)" || return 1
@@ -827,6 +918,15 @@ cleanup_host_mutation_state() {
   if [[ -n "$ACTIVE_HOST_MUTATION_STATE_FILE" && -e "$ACTIVE_HOST_MUTATION_STATE_FILE" ]]; then
     echo "warning: preserving unresolved host mutation state at $ACTIVE_HOST_MUTATION_STATE_FILE; verify device recovery before removing it" >&2
   fi
+  local marker index
+  for ((index=0; index<${#ACTIVE_QUORUM_DM_STATE_FILES[@]}; index++)); do
+    marker="${ACTIVE_QUORUM_DM_STATE_FILES[$index]}"
+    if [[ -e "$marker" || -L "$marker" ]]; then
+      echo "warning: preserving unresolved quorum dm state at $marker" >&2
+    fi
+  done
+  ACTIVE_QUORUM_DM_STATE_FILES=()
+  ACTIVE_QUORUM_DM_STATE_TOKENS=()
   ACTIVE_HOST_MUTATION_STATE_FILE=""
   ACTIVE_HOST_MUTATION_STATE_TOKEN=""
 }
@@ -1222,6 +1322,11 @@ run_scenario() {
   fi
   capture_cluster_snapshot "$artifacts" before
   prepare_host_mutation_state "$artifacts"
+  if [[ "$scenario" == "quorum-p-dm-eio" ]]; then
+    [[ -n "$QUORUM_DM_TARGETS_JSON" && "${#ACTIVE_QUORUM_DM_STATE_FILES[@]}" == 2 ]] || die "quorum dm targets were not validated"
+    printf '%s\n' "$QUORUM_DM_TARGETS_JSON" >"$artifacts/quorum-dm-targets.json"
+    export RUSTFS_FAULT_TEST_QUORUM_DM_TARGETS="$artifacts/quorum-dm-targets.json"
+  fi
 
   echo "starting scenario=$scenario artifacts=$artifacts"
   ACTIVE_ARTIFACTS="$artifacts"

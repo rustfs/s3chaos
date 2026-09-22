@@ -39,6 +39,8 @@ pub(crate) struct FaultStatusSnapshot {
     pub(crate) dm_status: Option<DmStatusSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) lifecycle_status: Option<LifecycleStatusSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) quorum_dm_status: Option<crate::fault::backends::quorum_dm::QuorumDmStatusSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

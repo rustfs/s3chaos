@@ -34,9 +34,10 @@ use crate::fault::{
         NETWORK_PARTITION_ONE_SCENARIO, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
         NODE_CRASH_PROXY_SCENARIO, ON_DISK_BITROT_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO,
         POD_FAILURE_QUORUM_EDGE_SCENARIO, POD_FAILURE_SCENARIO, POD_GRACEFUL_RESTART_ONE_SCENARIO,
-        POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
-        ROLLING_RESTART_ALL_SCENARIO, STALE_DISK_RETURN_DETECT_SCENARIO, STRESS_CPU_SCENARIO,
-        STRESS_MEMORY_SCENARIO, WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
+        POD_KILL_ONE_SCENARIO, QUORUM_P_DM_EIO_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
+        QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, ROLLING_RESTART_ALL_SCENARIO,
+        STALE_DISK_RETURN_DETECT_SCENARIO, STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO,
+        WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
     },
     storage_recovery::StorageRecoveryCase,
 };
@@ -976,7 +977,9 @@ fn fault_kind_accepts_backend(kind: FaultKind, backend: FaultBackend) -> bool {
         (kind, backend),
         (
             FaultKind::RustfsVolumeIoError,
-            FaultBackend::ChaosMeshIoChaos | FaultBackend::MinioWarpWithChaos
+            FaultBackend::ChaosMeshIoChaos
+                | FaultBackend::MinioWarpWithChaos
+                | FaultBackend::DeviceMapper
         ) | (
             FaultKind::RustfsVolumeLatency
                 | FaultKind::RustfsVolumeReadMistake
@@ -1315,7 +1318,9 @@ impl FaultPlan {
                 &options.rustfs_volume_path,
                 &options.scenario_parameters,
             )?,
-            QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO => {
+            QUORUM_P_IO_FAULT_SCENARIO
+            | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+            | QUORUM_P_DM_EIO_SCENARIO => {
                 let parameters = match options.scenario_parameters {
                     FaultInjectionParameters::Default => FaultInjectionParameters::QuorumIo {
                         class: QuorumCaseClass::Payload,
@@ -1323,6 +1328,10 @@ impl FaultPlan {
                     ref parameters => parameters.clone(),
                 };
                 let class = parameters.quorum_case()?;
+                ensure!(
+                    scenario.name != QUORUM_P_DM_EIO_SCENARIO || class == QuorumCaseClass::Payload,
+                    "continuous dm EIO reference supports only the payload P boundary"
+                );
                 FaultInjection::new_with_parameters(
                     FaultKind::RustfsVolumeIoError,
                     spec.backend,
@@ -1830,6 +1839,28 @@ mod tests {
             fault.target_summary(),
             "3 RustFS volume target(s) at /data/rustfs0"
         );
+    }
+
+    #[test]
+    fn dm_quorum_reference_requires_static_storage_and_payload_class() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "dedicated-static");
+        config.scenario = super::QUORUM_P_DM_EIO_SCENARIO.into();
+        let scenario = FaultScenario::from_config(&config).unwrap();
+        let spec = scenario_spec(&scenario.name).unwrap();
+        let plan = FaultPlan::from_scenario(&scenario, spec).unwrap();
+        assert!(plan.requires_static_storage());
+        assert_eq!(plan.faults()[0].backend(), FaultBackend::DeviceMapper);
+        config.scenario_parameters = FaultInjectionParameters::QuorumIo {
+            class: QuorumCaseClass::Metadata,
+        };
+        let result = FaultScenario::from_config(&config).and_then(|scenario| {
+            FaultPlan::from_scenario_with_options(
+                &scenario,
+                spec,
+                FaultPlanOptions::from_config(&config),
+            )
+        });
+        assert!(result.is_err());
     }
 
     #[test]

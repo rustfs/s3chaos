@@ -113,6 +113,7 @@ enum DmFaultBehavior {
     ErrorInjection,
     DropWritesCrash,
     StaleEio,
+    QuorumEio,
 }
 
 impl DmFaultBehavior {
@@ -312,6 +313,8 @@ impl HostMutationLease {
             return Err(error).context("publish host mutation state atomically");
         }
         self.persisted = true;
+        // The rename must survive a host crash before disk mutation starts.
+        fs::File::open(parent)?.sync_all()?;
         Ok(())
     }
 
@@ -452,6 +455,62 @@ pub(crate) fn preflight_stale_disk_mutation(
             scenario: scenario.name.clone(),
             fault_name: "stale-disk-eio".to_string(),
             fault_kind: DM_STALE_RETURN_KIND.to_string(),
+            run_id: run_id.to_string(),
+            context: config.cluster.context.clone(),
+            namespace: config.cluster.test_namespace.clone(),
+            tenant: config.cluster.tenant_name.clone(),
+            observer_namespace: observer_namespace.to_string(),
+            observer_pod: observer_pod.to_string(),
+            backend_specific_destructive_opt_in: config.device_mapper_destructive_enabled,
+            allowlist: HostStorageAllowlist {
+                nodes: config.host_mutation_allowed_nodes.clone(),
+                devices: config.host_mutation_allowed_devices.clone(),
+                persistent_volumes: config.host_mutation_allowed_persistent_volumes.clone(),
+            },
+            fault_table: None,
+        },
+        observation,
+    )
+}
+
+pub(crate) fn validate_quorum_dm_config(config: &FaultTestConfig) -> Result<()> {
+    let spec = dm_flakey_spec(config, "quorum-preflight", DmFaultBehavior::QuorumEio)?;
+    validate_dm_spec(&spec)?;
+    validate_stale_config(config, &spec)
+}
+
+pub(crate) fn preflight_quorum_dm_mutation(
+    config: &FaultTestConfig,
+    scenario: &FaultScenario,
+    run_id: &str,
+) -> Result<HostStorageMutationProof> {
+    ensure!(
+        scenario.name == "quorum-p-dm-eio",
+        "stale device-mapper preflight is bound to another scenario"
+    );
+    let spec = dm_flakey_spec(config, run_id, DmFaultBehavior::QuorumEio)?;
+    validate_dm_spec(&spec)?;
+    validate_stale_config(config, &spec)?;
+    let observer_pod = config
+        .dm_observer_pod
+        .as_deref()
+        .context("RUSTFS_FAULT_TEST_DM_OBSERVER_POD is required")?;
+    let observer_namespace = config
+        .dm_observer_namespace
+        .as_deref()
+        .context("RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE is required")?;
+    let observation = observe_dm_target_read_only(
+        &config.cluster,
+        &spec,
+        &config.rustfs_volume_path,
+        observer_namespace,
+        observer_pod,
+    )?;
+    HostStorageMutationProof::prove_device_mapper(
+        HostStorageMutationIntent {
+            scenario: scenario.name.clone(),
+            fault_name: "quorum-dm-eio".to_string(),
+            fault_kind: crate::fault::host_storage::DM_QUORUM_EIO_KIND.to_string(),
             run_id: run_id.to_string(),
             context: config.cluster.context.clone(),
             namespace: config.cluster.test_namespace.clone(),
@@ -1175,7 +1234,9 @@ fn dm_flakey_spec<'a>(
                 .as_deref()
                 .context("RUSTFS_FAULT_TEST_DM_FAULT_TABLE is required for dm-flakey")?,
         ),
-        DmFaultBehavior::DropWritesCrash | DmFaultBehavior::StaleEio => None,
+        DmFaultBehavior::DropWritesCrash
+        | DmFaultBehavior::StaleEio
+        | DmFaultBehavior::QuorumEio => None,
     };
     let node = config
         .dm_node
@@ -1371,6 +1432,24 @@ pub(crate) fn prepare_stale_disk(
     )
 }
 
+pub(crate) fn prepare_quorum_dm(
+    config: &FaultTestConfig,
+    collector: &ArtifactCollector,
+    scenario: &FaultScenario,
+    run_id: &str,
+    proof: &HostStorageMutationProof,
+) -> Result<DmFlakeyGuard> {
+    let spec = dm_flakey_spec(config, run_id, DmFaultBehavior::QuorumEio)?;
+    prepare_dm_flakey(
+        config,
+        &spec,
+        collector,
+        scenario.case_name,
+        &scenario.name,
+        proof,
+    )
+}
+
 impl DmFlakeyGuard {
     pub(crate) fn activate(&mut self) -> Result<u64> {
         ensure!(
@@ -1422,7 +1501,10 @@ impl DmFlakeyGuard {
             let initial_state = <Self as DmTransitionPort>::observe(self)
                 .context("observe device-mapper state immediately before fault apply")?;
             let proven_recovery_table = self.recovery_table.clone();
-            let suspend_mode = if self.behavior == DmFaultBehavior::StaleEio {
+            let suspend_mode = if matches!(
+                self.behavior,
+                DmFaultBehavior::StaleEio | DmFaultBehavior::QuorumEio
+            ) {
                 DmSuspendMode::NoFlush
             } else {
                 DmSuspendMode::Default
@@ -1553,11 +1635,17 @@ impl DmFlakeyGuard {
         };
         self.preflight_proof
             .validate_post_cleanup(&cleanup_observation)?;
-        self.collector.write_text(
+        let path = self.collector.write_text(
             &self.case_name,
             "host-storage-post-cleanup.json",
             &serde_json::to_string_pretty(&cleanup_observation)?,
         )?;
+        fs::File::open(&path)?.sync_all()?;
+        fs::File::open(
+            path.parent()
+                .context("missing post-cleanup artifact directory")?,
+        )?
+        .sync_all()?;
         Ok(())
     }
 
@@ -1627,7 +1715,9 @@ impl DmFlakeyGuard {
         };
         let recovery_table = self.recovery_table.clone();
         let suspend_mode = match self.behavior {
-            DmFaultBehavior::ErrorInjection | DmFaultBehavior::StaleEio => DmSuspendMode::NoFlush,
+            DmFaultBehavior::ErrorInjection
+            | DmFaultBehavior::StaleEio
+            | DmFaultBehavior::QuorumEio => DmSuspendMode::NoFlush,
             DmFaultBehavior::DropWritesCrash => DmSuspendMode::NoLockFs,
         };
         if let Err(error) = self.mutation_lease.set_phase(HostMutationPhase::Rollback) {
@@ -2632,9 +2722,9 @@ impl Drop for DmFlakeyGuard {
                     );
                 }
                 let mode = match self.behavior {
-                    DmFaultBehavior::ErrorInjection | DmFaultBehavior::StaleEio => {
-                        DmSuspendMode::NoFlush
-                    }
+                    DmFaultBehavior::ErrorInjection
+                    | DmFaultBehavior::StaleEio
+                    | DmFaultBehavior::QuorumEio => DmSuspendMode::NoFlush,
                     DmFaultBehavior::DropWritesCrash => DmSuspendMode::NoLockFs,
                 };
                 match self

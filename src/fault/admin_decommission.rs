@@ -2278,6 +2278,8 @@ mod tests {
             version_id: version.map(str::to_string),
             request_version_id: None,
             is_delete_marker: None,
+            request_id: None,
+            extended_request_id: None,
             mutation_max_attempts: None,
             mutation_attempts: None,
             read_purpose: None,

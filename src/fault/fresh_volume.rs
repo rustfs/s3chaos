@@ -2941,6 +2941,7 @@ impl<'a> FreshVolumeDriver<'a> {
             resource_name: Some(guard.name().to_string()),
             chaos_status: Some(serde_json::from_str(&guard.json()?)?),
             dm_status: None,
+            quorum_dm_status: None,
             lifecycle_status: None,
         })?;
         Ok(ControllerSnapshotEvidence {

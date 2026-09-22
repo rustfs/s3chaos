@@ -262,6 +262,7 @@ impl FaultRunSpec {
         if plan
             .injection()
             .is_some_and(FaultPlan::requires_static_storage)
+            && scenario.name != crate::fault::scenarios::QUORUM_P_DM_EIO_SCENARIO
         {
             artifacts.required.extend(
                 [HOST_STORAGE_PROOF_ARTIFACT, HOST_STORAGE_CLEANUP_ARTIFACT].map(str::to_string),
@@ -585,6 +586,17 @@ impl FaultRunArtifactSpec {
                 | crate::fault::scenarios::QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
         ) {
             names.push(QUORUM_FAULT_ACTIVATION_ARTIFACT.to_string());
+            names.push("quorum-runtime-provenance.json".to_string());
+        }
+        if scenario == crate::fault::scenarios::QUORUM_P_DM_EIO_SCENARIO {
+            names.extend(
+                [
+                    "quorum-dm-active.json",
+                    "quorum-dm-after-workload.json",
+                    "quorum-dm-recovered.json",
+                ]
+                .map(str::to_string),
+            );
         }
         if crate::fault::scenarios::holds_node_down_after_crash(scenario) {
             names.extend(

@@ -56,6 +56,7 @@ pub const DM_DROP_WRITES_AFTER_ACK_MULTIPART_COMPLETE_SCENARIO: &str =
     "dm-drop-writes-after-ack-multipart-complete";
 pub const POD_CRASH_VERSIONED_HOT_SCENARIO: &str = "pod-crash-versioned-hot";
 pub const WARP_UNDER_CHAOS_SCENARIO: &str = "warp-under-chaos";
+pub const QUORUM_P_DM_EIO_SCENARIO: &str = "quorum-p-dm-eio";
 pub const QUORUM_P_IO_FAULT_SCENARIO: &str = "quorum-p-io-fault";
 pub const QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO: &str = "quorum-p-plus-one-io-fault";
 pub const FRESH_VOLUME_REPLACEMENT_SCENARIO: &str = "fresh-volume-replacement";
@@ -445,6 +446,7 @@ impl FaultScenarioSpec {
                 | NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
                 | POD_FAILURE_QUORUM_EDGE_SCENARIO
                 | QUORUM_P_IO_FAULT_SCENARIO
+                | QUORUM_P_DM_EIO_SCENARIO
                 | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
         )
     }
@@ -1188,6 +1190,37 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         conflict_domain: "performance-only run with isolated bucket prefix and no shared correctness threshold",
     },
     FaultScenarioSpec {
+        scenario: QUORUM_P_DM_EIO_SCENARIO,
+        detector: FaultDetectorSpec::gate_candidate(&[
+            DurabilityBugFamily::DataShardLoss,
+            DurabilityBugFamily::SilentDataCorruption,
+        ]),
+        case_name: "fault_quorum_p_dm_eio_preserves_read_quorum",
+        description: "Hold two explicitly approved dm devices at continuous block EIO in one proven EC 2+2 set, independently calibrate uncached reads, and retain the strict payload P-boundary S3 oracle.",
+        priority: FaultPriority::P0,
+        backend: FaultBackend::DeviceMapper,
+        status: FaultScenarioStatus::Executable,
+        workload_profile: FaultScenarioWorkloadProfile::Default,
+        isolation: FaultIsolation::DedicatedLinuxBlockDevice,
+        crds: &[],
+        required_tools: &[],
+        percent_supported: false,
+        param_schema: FaultParameterSchema::QuorumIo,
+        impact_policy: FaultImpactPolicy::ClientDisruptionOptional,
+        boundary: "rustfs-reliability/quorum-targeting",
+        ci_phase: "faults",
+        target: "two dedicated approved block devices carrying payload shards in one runtime-proven EC 2+2 set",
+        target_proof: &[
+            "artifact must prove erasure-set topology and P value before fault activation",
+            "artifact must bind every candidate and selected Pod/container/PVC/PV/mount to exactly one RustFS drive UUID in the same set",
+            "artifact must prove the complete non-target drive set",
+            "each exact approved device must return EIO to repeated uncached block reads under a continuous read/write error table before and after the workload",
+        ],
+        validation: "the stable typed cohort remains readable at P failed volumes; each mutation must fail without a success ACK when its write quorum exceeds the remaining shard count, and permitted writes must not leave half-committed versions",
+        observability: "runtime topology and volume binding proof, exact per-device host proofs, direct I/O calibration, dm tables, rollback and cleanup, workload history, checker reports, RustFS logs",
+        conflict_domain: "dedicated static-PV Tenant with two exclusive host/device/PV mutation leases; no concurrent fault or storage workflow",
+    },
+    FaultScenarioSpec {
         scenario: QUORUM_P_IO_FAULT_SCENARIO,
         detector: FaultDetectorSpec::gate_candidate(&[
             DurabilityBugFamily::DataShardLoss,
@@ -1750,7 +1783,7 @@ pub fn apply_catalog_defaults(config: &mut FaultTestConfig) -> Result<()> {
     spec.workload_profile.apply_to_config(config);
     if matches!(
         config.scenario.as_str(),
-        QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+        QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO | QUORUM_P_DM_EIO_SCENARIO
     ) && matches!(
         config.scenario_parameters,
         FaultInjectionParameters::Default
@@ -1761,7 +1794,7 @@ pub fn apply_catalog_defaults(config: &mut FaultTestConfig) -> Result<()> {
     }
     if matches!(
         config.scenario.as_str(),
-        QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+        QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO | QUORUM_P_DM_EIO_SCENARIO
     ) {
         config.workload_versioning = true;
         match config.scenario_parameters {
@@ -1803,7 +1836,9 @@ pub fn expected_workload_versioning_for_scenario(scenario: &str, env_value: bool
     Ok(spec.workload_profile.expected_versioning(env_value)
         || matches!(
             scenario,
-            QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+            QUORUM_P_IO_FAULT_SCENARIO
+                | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+                | QUORUM_P_DM_EIO_SCENARIO
         ))
 }
 
@@ -1813,6 +1848,7 @@ pub(in crate::fault) fn requires_prefault_multipart_staging(scenario: &str) -> b
         NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
             | POD_FAILURE_QUORUM_EDGE_SCENARIO
             | QUORUM_P_IO_FAULT_SCENARIO
+            | QUORUM_P_DM_EIO_SCENARIO
             | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
     )
 }
@@ -1847,10 +1883,10 @@ mod tests {
         NETWORK_CORRUPT_SCENARIO, NETWORK_DELAY_SCENARIO, NETWORK_PARTITION_ONE_SCENARIO,
         NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, ON_DISK_BITROT_SCENARIO,
         POD_CRASH_VERSIONED_HOT_SCENARIO, POD_FAILURE_QUORUM_EDGE_SCENARIO, POD_FAILURE_SCENARIO,
-        POD_GRACEFUL_RESTART_ONE_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
-        QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, ROLLING_RESTART_ALL_SCENARIO,
-        STALE_DISK_RETURN_DETECT_SCENARIO, WARP_UNDER_CHAOS_SCENARIO, acknowledged_mutation_kind,
-        apply_catalog_defaults, executable_scenario_catalog,
+        POD_GRACEFUL_RESTART_ONE_SCENARIO, POD_KILL_ONE_SCENARIO, QUORUM_P_DM_EIO_SCENARIO,
+        QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
+        ROLLING_RESTART_ALL_SCENARIO, STALE_DISK_RETURN_DETECT_SCENARIO, WARP_UNDER_CHAOS_SCENARIO,
+        acknowledged_mutation_kind, apply_catalog_defaults, executable_scenario_catalog,
         expected_workload_versioning_for_scenario, planned_qualification_catalog_json,
         requires_prefault_multipart_staging, scenario_catalog, scenario_catalog_json,
         scenario_spec,
@@ -1932,8 +1968,8 @@ mod tests {
             );
         }
 
-        assert_eq!(executable_scenario_catalog().count(), 30);
-        assert_eq!(scenario_catalog().len(), 35);
+        assert_eq!(executable_scenario_catalog().count(), 31);
+        assert_eq!(scenario_catalog().len(), 36);
         assert_eq!(
             scenario_catalog()
                 .iter()
@@ -2348,6 +2384,7 @@ mod tests {
                 IO_EIO_SCENARIO,
                 NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
                 POD_FAILURE_QUORUM_EDGE_SCENARIO,
+                QUORUM_P_DM_EIO_SCENARIO,
                 QUORUM_P_IO_FAULT_SCENARIO,
                 QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
             ]

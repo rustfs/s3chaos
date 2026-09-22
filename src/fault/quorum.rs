@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) mod activation;
+pub mod probe;
 
 pub const RUNTIME_TOPOLOGY_MAX_AGE_MS: u64 = 5_000;
 pub const MAX_ERASURE_SET_SHARDS: u32 = 16;
