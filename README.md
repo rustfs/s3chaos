@@ -82,28 +82,38 @@ Use `make fault-chaos-plan` only when reviewing the resolved plan without
 starting the suite. Override the canonical suite with
 `CHAOS_SUITE=/path/to/suite.yaml`; `fault-chaos-run` rejects static storage and
 Warp plans. The generic `fault-suite-*` targets remain available for custom
-non-static suites and the separate Warp campaign.
+non-static suites, single-attempt storage-recovery suites, and the separate Warp campaign.
 
-Runnable scenario families (28 executable entries): I/O faults (`io-eio`,
+Runnable scenario families (32 executable entries): I/O faults (`io-eio`,
 `io-read-mistake`, `io-latency`, `disk-full`, `dm-flakey*`, and the five
 typed `dm-drop-writes-after-ack-*` cases), network faults
 (`network-partition-one`, `network-partition-write-quorum-loss`,
 `network-delay/loss/corrupt/duplicate`), pod faults (`pod-kill-one`,
-`pod-failure`, `pod-crash-versioned-hot`), kubectl-driven lifecycle restarts
+`pod-failure`, `pod-failure-quorum-edge`, `pod-crash-versioned-hot`,
+`node-crash-proxy`), kubectl-driven lifecycle restarts
 (`pod-graceful-restart-one`, `rolling-restart-all`, `cluster-cold-restart`),
 stress (`stress-cpu`, `stress-memory`), typed volume quorum
 (`quorum-p-io-fault`, `quorum-p-plus-one-io-fault`), and the
-`warp-under-chaos` benchmark campaign.
+`warp-under-chaos` benchmark campaign, plus fresh-volume replacement and on-disk bitrot.
 Each typed volume quorum run captures bounded RustFS admin health samples before
 its probes/workload and after the workload/controller recheck; both samples
 require every non-target drive to be healthy and do not claim continuous health.
-A further five catalog entries remain qualification-only with status `Planned`
-(`fresh-volume-replacement`, admin decommission and
-rebalance, `on-disk-bitrot`, `stale-disk-return-detect`): they appear in
-`cargo run --bin s3chaos -- fault-catalog-json` but are filtered out of
-`make fault-list` and rejected by ordinary preflight and suite validation.
-Their concrete drivers are reachable only through the closed local
-qualification workflow described below.
+Three catalog entries remain qualification-only with status `Planned`:
+`admin-decommission`, `admin-rebalance`, and `stale-disk-return-detect`.
+Fresh-volume replacement and bitrot are executable through `fault-run` or a
+single-attempt `fault-suite-run`, with an explicit recovery case. Their four
+suite examples are in `fault/examples/`; each still requires dedicated storage,
+target proofs, destructive authorization, and the existing cleanup contracts.
+The existing `fault-qualify` interface remains available for all seven cases.
+
+```bash
+# After preparing the dedicated target and environment described below:
+export RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=fresh-volume-replacement-automatic-replacement
+make fault-run SCENARIO=fresh-volume-replacement
+# Or select the recovery case in a single-attempt suite:
+make fault-suite-run SUITE=fault/examples/on-disk-bitrot-admin-deep.yaml
+```
+
 Heal is a recovery mode of replacement and bitrot rather than a standalone
 healthy-cluster scenario. Long-running campaigns remain suite orchestration,
 not a fault backend or scenario family.
@@ -113,7 +123,7 @@ Volume-quorum runs require matching RustFS non-target drive-health observations
 before and after the workload. These endpoint guards are not continuous health
 monitoring; live qualification is still required before release gating.
 
-### Planned reliability qualification
+### Reliability qualification
 
 List the seven closed qualification cases, derived from the Rust typed catalog,
 and run exactly one through the same health watcher, evidence capture, artifact
@@ -160,8 +170,12 @@ make fault-console-serve CONSOLE_ROOT='<printed-run-root>'
 ```
 
 Inspect and validate the captured run before setting its recorded context,
-namespace, and Tenant for `make fault-cleanup`. Planned qualification remains a
-single-run workflow and is intentionally unavailable through FaultSuite.
+namespace, and Tenant for `make fault-cleanup`. The three Planned scenarios
+remain unavailable through FaultSuite. Executable
+storage-recovery suites require exactly one scenario with one repetition and
+an explicit `budgets.maxDuration`.
+Single-scenario storage recovery uses `RUSTFS_FAULT_TEST_DURATION_SECONDS` as
+its total deadline; suites use their `budgets.maxDuration`.
 
 Ready-to-run suites under [`fault/examples/`](fault/examples/) keep different
 execution environments and verdicts separate:

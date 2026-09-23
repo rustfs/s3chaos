@@ -389,12 +389,16 @@ pub(crate) async fn run_storage_recovery_case(
     deadline: RunDeadline,
 ) -> Result<()> {
     ensure!(
-        config.qualify_planned_storage
+        (config.qualify_planned_storage
+            || crate::fault::scenarios::scenario_spec(&scenario.name)?
+                .status
+                .is_executable())
+            && config.storage_recovery_case == Some(plan.case)
             && config.destructive_enabled
             && execution_plan.storage_recovery() == Some(plan)
             && scenario.name == plan.scenario
             && scenario.case_name == plan.case_name,
-        "storage-recovery runner requires one exact destructive planned qualification"
+        "storage-recovery runner requires one exact destructive storage case"
     );
     match plan.case {
         StorageRecoveryCase::OnDiskBitrotAutomaticScanner

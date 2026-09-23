@@ -79,9 +79,7 @@ pub struct FaultSuiteBudgets {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FaultSuiteScenario {
     pub name: String,
-    /// Closed planned-case selector. Parsing it keeps qualification suites
-    /// reviewable while ordinary suite resolution still rejects Planned
-    /// catalog entries before any execution plan is produced.
+    /// Exact recovery variant; Planned catalog entries remain unavailable to suites.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_recovery_case: Option<StorageRecoveryCase>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -429,6 +427,13 @@ impl FaultSuite {
             }
         }
         validate_static_storage_supervision(&scenarios)?;
+        ensure!(
+            budget_duration.is_some()
+                || scenarios
+                    .iter()
+                    .all(|scenario| scenario.storage_recovery_case.is_none()),
+            "storage-recovery suites require budgets.maxDuration"
+        );
 
         Ok(ResolvedFaultSuite {
             api_version: self.api_version.clone(),
@@ -470,7 +475,7 @@ fn validate_static_storage_supervision(scenarios: &[ResolvedFaultSuiteScenario])
     {
         ensure!(
             scenarios.len() == 1 && static_scenario.repetitions == 1,
-            "device-mapper scenarios require a suite containing exactly one scenario with one repetition"
+            "dedicated-storage scenarios require a suite containing exactly one scenario with one repetition"
         );
     }
     Ok(())
@@ -516,8 +521,13 @@ impl ResolvedFaultSuiteScenario {
             scenario.name
         );
         ensure!(
-            scenario.storage_recovery_case.is_none(),
-            "scenario {} cannot use storageRecoveryCase outside explicit Planned qualification",
+            scenario.storage_recovery_case.is_some()
+                == matches!(
+                    scenario.name.as_str(),
+                    crate::fault::scenarios::FRESH_VOLUME_REPLACEMENT_SCENARIO
+                        | ON_DISK_BITROT_SCENARIO
+                ),
+            "scenario {} requires storageRecoveryCase exactly for storage recovery",
             scenario.name
         );
         ensure!(
@@ -594,7 +604,7 @@ impl ResolvedFaultSuiteScenario {
                     | crate::fault::scenarios::ADMIN_REBALANCE_SCENARIO
             ) {
                 "admin"
-            } else if scenario.name == ON_DISK_BITROT_SCENARIO {
+            } else if scenario.storage_recovery_case.is_some() {
                 "storage-recovery"
             } else {
                 "injection"
@@ -973,7 +983,9 @@ scenarios:
         );
         let expected = executable_scenario_catalog()
             .filter(|scenario| {
-                scenario.requires_chaos_mesh() && scenario.scenario != WARP_UNDER_CHAOS_SCENARIO
+                scenario.requires_chaos_mesh()
+                    && !scenario.requires_static_storage()
+                    && scenario.scenario != WARP_UNDER_CHAOS_SCENARIO
             })
             .map(|scenario| scenario.scenario)
             .collect::<BTreeSet<_>>();
@@ -1563,14 +1575,49 @@ scenarios:
     }
 
     #[test]
-    fn planned_bitrot_templates_parse_both_cases_but_retain_execution_gate() {
+    fn storage_suites_require_case_budget_and_one_attempt() {
+        for name in ["fresh-volume-replacement-automatic", "on-disk-bitrot"] {
+            let suite =
+                FaultSuite::from_yaml_path(format!("fault/examples/{name}.yaml")).expect("suite");
+            let mut missing_case = suite.clone();
+            missing_case.scenarios[0].storage_recovery_case = None;
+            assert!(
+                missing_case
+                    .resolve()
+                    .expect_err("case required")
+                    .to_string()
+                    .contains("storageRecoveryCase")
+            );
+            let mut missing_budget = suite.clone();
+            missing_budget.budgets.max_duration = None;
+            assert!(
+                missing_budget
+                    .resolve()
+                    .expect_err("budget required")
+                    .to_string()
+                    .contains("maxDuration")
+            );
+            let mut repeated = suite.clone();
+            repeated.scenarios[0].repetitions = 2;
+            assert!(
+                repeated
+                    .resolve()
+                    .expect_err("one attempt")
+                    .to_string()
+                    .contains("exactly one scenario")
+            );
+        }
+    }
+
+    #[test]
+    fn executable_bitrot_templates_resolve_both_cases() {
         for (yaml, expected_case) in [
             (
-                include_str!("../../fault/planned/on-disk-bitrot.yaml"),
+                include_str!("../../fault/examples/on-disk-bitrot.yaml"),
                 StorageRecoveryCase::OnDiskBitrotAutomaticScanner,
             ),
             (
-                include_str!("../../fault/planned/on-disk-bitrot-admin-deep.yaml"),
+                include_str!("../../fault/examples/on-disk-bitrot-admin-deep.yaml"),
                 StorageRecoveryCase::OnDiskBitrotAdminDeep,
             ),
         ] {
@@ -1583,10 +1630,9 @@ scenarios:
                 Some(expected_case)
             );
 
-            let error = suite
-                .resolve()
-                .expect_err("planned on-disk-bitrot must retain the execution gate");
-            assert!(error.to_string().contains("not executable"));
+            let resolved = suite.resolve().expect("executable bitrot suite");
+            assert_eq!(resolved.scenarios[0].execution_type, "storage-recovery");
+            assert!(resolved.scenarios[0].requires_static_storage);
         }
     }
 
@@ -1951,14 +1997,14 @@ scenarios:
     }
 
     #[test]
-    fn planned_fresh_volume_suites_are_case_unique_and_ordinary_resolution_is_blocked() {
+    fn executable_fresh_volume_suites_resolve_exact_cases() {
         for (path, expected) in [
             (
-                "fault/planned/fresh-volume-replacement-automatic.yaml",
+                "fault/examples/fresh-volume-replacement-automatic.yaml",
                 crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementAutomaticReplacement,
             ),
             (
-                "fault/planned/fresh-volume-replacement-admin-deep.yaml",
+                "fault/examples/fresh-volume-replacement-admin-deep.yaml",
                 crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementAdminDeep,
             ),
         ] {
@@ -1968,10 +2014,9 @@ scenarios:
                 panic!("each qualification suite must contain exactly one case")
             };
             assert_eq!(scenario.storage_recovery_case, Some(expected));
-            let error = suite
-                .resolve()
-                .expect_err("ordinary suite resolution must reject Planned scenarios");
-            assert!(error.to_string().contains("is not executable"));
+            let resolved = suite.resolve().expect("executable fresh-volume suite");
+            assert_eq!(resolved.scenarios[0].execution_type, "storage-recovery");
+            assert!(resolved.scenarios[0].requires_static_storage);
         }
     }
 

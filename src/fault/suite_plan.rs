@@ -750,10 +750,10 @@ fn scenario_config(
     attempt_dir: &Path,
 ) -> Result<FaultTestConfig> {
     let mut config = base.clone();
-    // Planned-admin qualification is a single-run opt-in. A suite expands
-    // ordinary catalog scenarios from the same process environment and must
-    // never inherit that authorization into its attempts.
+    // Qualification is a single-run opt-in. Suites must not inherit ambient
+    // authorization for Planned scenarios into their ordinary attempts.
     config.qualify_planned_admin = false;
+    config.qualify_planned_storage = false;
     config.scenario = scenario.name.clone();
     config.scenario_parameters = scenario.params.clone();
     config.storage_recovery_case = scenario.storage_recovery_case;
@@ -914,6 +914,36 @@ mod tests {
     };
     use serde_json::json;
     use std::{path::Path, path::PathBuf, time::Duration};
+
+    #[test]
+    fn storage_examples_plan_without_inheriting_qualification_authorization() {
+        for name in [
+            "fresh-volume-replacement-automatic",
+            "fresh-volume-replacement-admin-deep",
+            "on-disk-bitrot",
+            "on-disk-bitrot-admin-deep",
+        ] {
+            let suite = FaultSuite::from_yaml_path(format!("fault/examples/{name}.yaml"))
+                .expect("suite")
+                .resolve()
+                .expect("resolved");
+            let expected_case = suite.scenarios[0].storage_recovery_case.expect("case");
+            let mut base = FaultTestConfig::for_test("real-cluster", "local-static");
+            base.qualify_planned_admin = true;
+            base.qualify_planned_storage = true;
+            let expansion =
+                build_fault_suite_plan_expansion(suite, base, "storage-suite".to_string())
+                    .expect("plan");
+            assert!(expansion.plan.requires_static_storage);
+            assert!(!expansion.attempts[0].config.qualify_planned_admin);
+            assert!(!expansion.attempts[0].config.qualify_planned_storage);
+            assert_eq!(expansion.plan.attempts.len(), 1);
+            assert!(matches!(expansion.plan.attempts[0].execution,
+                Some(crate::fault::spec::FaultRunExecutionSpec::StorageRecovery { case, .. }) if case == expected_case));
+            let value = expansion.plan.to_json().expect("serialized plan");
+            assert!(value.contains("storage-recovery"));
+        }
+    }
 
     #[test]
     fn suite_template_plan_matches_golden_output() {

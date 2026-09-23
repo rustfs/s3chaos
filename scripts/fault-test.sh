@@ -65,21 +65,21 @@ Commands:
   chaos-run <file>      Run an ordinary Chaos Mesh-only suite.
   dm-run <scenario>     Run exactly one supervised device-mapper scenario.
   list                  List catalog scenarios.
-  qualify-list          List closed planned-qualification cases.
-  qualify <case>        Run one supervised planned qualification.
+  qualify-list          List closed reliability qualification cases.
+  qualify <case>        Run one supervised reliability qualification.
   qualify-analyze <run-root>
                         Render machine-readable analysis for one qualification.
   suite-template        Print a YAML FaultSuite template.
   suite-validate <file> Validate a YAML FaultSuite contract.
   suite-plan <file>     Render the resolved destructive FaultSuite plan.
-  suite-run <file>      Run a non-static YAML FaultSuite sequentially.
+  suite-run <file>      Run a YAML suite; storage recovery requires one attempt.
   dashboard-install     Install/upgrade Chaos Mesh with Dashboard enabled.
   dashboard-port-forward [port]
                         Port-forward the Chaos Mesh Dashboard locally.
   cleanup               Remove managed Chaos and the owned fault namespace.
 
-RUSTFS_FAULT_TEST_EXPECTED_CONTEXT is optional for ordinary runs. Planned
-qualification requires an explicit expected context, namespace, and Tenant.
+RUSTFS_FAULT_TEST_EXPECTED_CONTEXT is optional for ordinary injection runs.
+Storage recovery and qualification require an explicit context, namespace, and Tenant.
 RUSTFS_FAULT_TEST_PROCESS_TERMINATION_GRACE_SECONDS controls the graceful
 shutdown window before non-storage runs are escalated to SIGKILL (default: 60).
 EOF
@@ -418,7 +418,7 @@ validate_qualification_env_contract() {
         stale-disk-return-detect)
           ;;
         *)
-          die "unsupported planned storage scenario: $scenario"
+          die "unsupported storage-recovery scenario: $scenario"
           ;;
       esac
       ;;
@@ -659,6 +659,16 @@ preflight() {
   if [[ "$mode" == "qualification" ]]; then
     validate_qualification_env_contract \
       "$qualification_case" "$scenario" "$QUALIFICATION_KIND" "$QUALIFICATION_STORAGE_CASE"
+  elif [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" ]]; then
+    require_nonempty_env RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE
+    qualification_case="$RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE"
+    local contract case_scenario case_kind storage_case
+    contract="$(qualification_case_contract "$qualification_case")" \
+      || die "unknown storage-recovery case: $qualification_case"
+    IFS=$'\t' read -r case_scenario case_kind storage_case <<<"$contract"
+    [[ "$case_scenario" == "$scenario" && "$case_kind" == "storage" ]] \
+      || die "storage-recovery case does not match scenario $scenario"
+    validate_qualification_env_contract "$qualification_case" "$scenario" storage "$storage_case"
   fi
   require_nonempty_env RUSTFS_FAULT_TEST_SERVER_IMAGE
 
@@ -689,7 +699,7 @@ preflight() {
   for tool in $(scenario_required_tools "$scenario"); do
     require_command "$tool"
   done
-  if [[ "$scenario" == "on-disk-bitrot" && "$mode" == "qualification" ]]; then
+  if [[ "$scenario" == "on-disk-bitrot" ]]; then
     target_config="$RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG"
     target_namespace="$(jq -er '.volume.namespace | strings | select(length > 0)' "$target_config")" \
       || die "bitrot target config lacks volume.namespace"
@@ -703,6 +713,11 @@ preflight() {
       || die "on-disk-bitrot requires a pre-created owned fault namespace with privileged Pod Security"
     [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] \
       || die "on-disk-bitrot requires pod-security.kubernetes.io/enforce=privileged on $FAULT_NAMESPACE"
+  elif [[ "$scenario" == "fresh-volume-replacement" ]]; then
+    kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1 \
+      || die "$scenario requires a pre-created owned privileged namespace"
+    [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] \
+      || die "$scenario requires pod-security.kubernetes.io/enforce=privileged"
   elif scenario_requires_static_storage "$scenario"; then
     validate_dm_env_contract "$scenario"
     kubectl_cluster -n "$RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE" \
@@ -710,11 +725,7 @@ preflight() {
       || die "$scenario requires the configured pre-provisioned host observer Pod"
     kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1 || die "$scenario requires a pre-created owned fault namespace with privileged Pod Security"
     [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] || die "$scenario requires pod-security.kubernetes.io/enforce=privileged on $FAULT_NAMESPACE"
-  elif [[ "$qualification_case" == fresh-volume-replacement-* ]]; then
-    kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1 \
-      || die "$qualification_case requires a pre-created owned fault namespace with privileged Pod Security"
-    [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] \
-      || die "$qualification_case requires pod-security.kubernetes.io/enforce=privileged on $FAULT_NAMESPACE"
+
   fi
 
   echo "preflight passed: context=$FAULT_CONTEXT scenario=$scenario nodes=$ready_nodes storageClass=${RUSTFS_FAULT_TEST_STORAGE_CLASS} objects=$WORKLOAD_OBJECTS concurrency=$WORKLOAD_CONCURRENCY pods=$RUSTFS_POD_COUNT volume=$RUSTFS_VOLUME_PATH"
@@ -1185,10 +1196,15 @@ run_scenario() {
   local -a qualification_env
   case "$qualification_kind" in
     ordinary)
+      storage_case=""
+      if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" ]]; then
+        storage_case="${RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE:-}"
+        [[ -n "$storage_case" ]] || die "storage recovery requires an exact case"
+      fi
       qualification_env=(
         RUSTFS_FAULT_TEST_QUALIFY_PLANNED_ADMIN=
         RUSTFS_FAULT_TEST_QUALIFY_PLANNED_STORAGE=
-        RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=
+        "RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=$storage_case"
       )
       ;;
     admin)
@@ -1335,7 +1351,9 @@ run_one() {
   initialize_summary "$run_root"
   run_root="$(cd "$run_root" && pwd -P)"
   build_fault_binary "$run_root" "scenario=$scenario"
-  if [[ "$mode" == "dm" ]]; then
+  if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" ]]; then
+    require_supported_scenario "$scenario"
+  elif [[ "$mode" == "dm" ]]; then
     require_dm_scenario "$scenario"
   else
     require_non_dm_scenario "$scenario"
@@ -1465,10 +1483,8 @@ run_qualification() {
   write_qualification_plan \
     "$run_root" "$qualification_case" "$QUALIFICATION_SCENARIO" \
     "$QUALIFICATION_KIND" "$QUALIFICATION_STORAGE_CASE"
-  is_planned_scenario "$QUALIFICATION_SCENARIO" \
-    || die "qualification scenario is no longer Planned: $QUALIFICATION_SCENARIO"
   preflight "$QUALIFICATION_SCENARIO" qualification "$qualification_case"
-  echo "s3chaos planned qualification binary ready: case=$qualification_case"
+  echo "s3chaos qualification binary ready: case=$qualification_case"
 
   rc=0
   if run_scenario \
@@ -1600,7 +1616,11 @@ preflight_suite() {
   fi
   scenario="$(jq -r '.attempts[0].scenario // empty' "$plan_path")"
   [[ -n "$scenario" ]] || die "fault suite plan contains no attempts: $suite"
-  preflight "$scenario"
+  if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" ]]; then
+    RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE="$(jq -er '.attempts[0].execution.case' "$plan_path")" preflight "$scenario"
+  else
+    preflight "$scenario"
+  fi
   while IFS= read -r crd; do
     [[ -n "$crd" ]] || continue
     kubectl_cluster get crd "$crd" >/dev/null
@@ -1628,7 +1648,10 @@ is_ordinary_chaos_suite_plan() {
 
 require_non_static_suite_plan() {
   local plan_path="$1"
-  jq -e '.requiresStaticStorage == false' "$plan_path" >/dev/null \
+  jq -e '.requiresStaticStorage == false or
+    ((.attempts | length) == 1 and
+     (.attempts[0].scenario == "fresh-volume-replacement" or .attempts[0].scenario == "on-disk-bitrot") and
+     .attempts[0].execution.type == "storage-recovery")' "$plan_path" >/dev/null \
     || die "fault-suite-run does not execute device-mapper suites; run exactly one scenario in the foreground with make fault-dm-run SCENARIO=<name>"
 }
 

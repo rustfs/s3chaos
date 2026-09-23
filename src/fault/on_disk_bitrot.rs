@@ -2908,16 +2908,17 @@ impl LiveOnDiskBitrotRuntime {
         run_id: &str,
         deadline: RunDeadline,
     ) -> Result<Self> {
-        let target_path = config.storage_recovery_target_config.as_deref().context(
-            "planned on-disk-bitrot requires RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG",
-        )?;
+        let target_path = config
+            .storage_recovery_target_config
+            .as_deref()
+            .context("on-disk-bitrot requires RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG")?;
         let (target, target_body) = BitrotLiveTargetConfig::load(target_path)?;
         target.validate_static(config)?;
         ensure!(
-            config.qualify_planned_storage
+            config.destructive_enabled
                 && config.storage_recovery_case == Some(storage_plan.case)
                 && target.bucket.starts_with("s3chaos-bitrot-"),
-            "planned bitrot live adapter lacks exact qualification or a dedicated bucket"
+            "bitrot live adapter lacks destructive authorization, an exact case, or a dedicated bucket"
         );
         let case_dir = collector.case_dir(scenario.case_name);
         fs::create_dir_all(&case_dir)?;

@@ -83,11 +83,19 @@ pub async fn run_selected_scenario_from_env() -> Result<()> {
 pub async fn run_scenario_with_config(mut config: FaultTestConfig) -> Result<()> {
     scenarios::apply_catalog_defaults(&mut config)?;
     let reference_root = config.cluster.artifacts_dir.clone();
+    let deadline = if matches!(
+        config.scenario.as_str(),
+        scenarios::FRESH_VOLUME_REPLACEMENT_SCENARIO | scenarios::ON_DISK_BITROT_SCENARIO
+    ) {
+        RunDeadline::new(Some(config.duration.as_secs()))?
+    } else {
+        RunDeadline::default()
+    };
     run_prepared_scenario_with_config_and_reference_root(
         config,
         reference_root,
         fault_run_id(),
-        RunDeadline::default(),
+        deadline,
     )
     .await
 }

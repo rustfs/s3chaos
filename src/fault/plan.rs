@@ -130,7 +130,7 @@ impl ExecutionPlan {
                     scenario.name
                 );
                 let case = options.storage_recovery_case.context(
-                    "RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE is required for planned storage qualification",
+                    "RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE is required for storage recovery",
                 )?;
                 ensure!(
                     case.scenario() == scenario.name,
@@ -1640,25 +1640,43 @@ mod tests {
     }
 
     #[test]
-    fn every_cataloged_scenario_has_one_current_fault_plan() {
+    fn every_cataloged_scenario_has_one_current_execution_plan() {
         let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
 
         for spec in executable_scenario_catalog() {
             config.scenario = spec.scenario.to_string();
+            config.storage_recovery_case = crate::fault::storage_recovery::StorageRecoveryCase::ALL
+                .into_iter()
+                .find(|case| case.scenario() == spec.scenario);
             let scenario = FaultScenario::from_config(&config).expect("scenario");
-            let plan = FaultPlan::from_scenario(&scenario, spec).expect("plan");
-
-            assert_eq!(
-                plan.faults().len(),
-                1,
-                "{} should remain an independent single-fault scenario",
-                spec.scenario
-            );
-            assert_parameters_match_catalog_schema(
-                spec.scenario,
-                plan.faults()[0].parameters(),
-                spec.param_schema,
-            );
+            let execution = ExecutionPlan::from_scenario_with_options(
+                &scenario,
+                spec,
+                FaultPlanOptions::from_config(&config),
+            )
+            .expect("execution plan");
+            if let Some(case) = config.storage_recovery_case {
+                assert_eq!(execution.kind(), ExecutionKind::StorageRecovery);
+                assert_eq!(
+                    execution.storage_recovery().expect("storage plan").case,
+                    case
+                );
+                assert!(execution.requires_static_storage());
+                assert!(execution.injection().is_none());
+            } else {
+                let plan = execution.injection().expect("injection plan");
+                assert_eq!(
+                    plan.faults().len(),
+                    1,
+                    "{} should remain an independent single-fault scenario",
+                    spec.scenario
+                );
+                assert_parameters_match_catalog_schema(
+                    spec.scenario,
+                    plan.faults()[0].parameters(),
+                    spec.param_schema,
+                );
+            }
         }
     }
 

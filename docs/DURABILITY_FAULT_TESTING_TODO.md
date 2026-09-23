@@ -176,8 +176,9 @@ guardrails when implementing the ordered TODO below.
   Meaning: current executable catalog scenarios still mostly cover
   inject-recover-verify faults. Fresh volume replacement, admin
   decommission/rebalance, on-disk bitrot, and stale disk with dangling cleanup
-  now have closed qualification workflows but remain Planned pending live
-  evidence. Long-run suite campaigns remain in the ordered TODO below.
+  have closed qualification workflows. Fresh-volume replacement and bitrot are
+  executable; admin topology and stale-disk return remain Planned. Long-run
+  suite campaigns remain in the ordered TODO below.
 
 - [ ] PARTIAL: Keep admin operations as scenario-owned product/recovery steps.
   Meaning: decommission/rebalance now have a fault-owned narrow port, typed
@@ -456,10 +457,9 @@ guardrails when implementing the ordered TODO below.
   `host-storage-post-cleanup.json`. Failed mapper rollback attempts suspension
   and retains the helper and mutation marker for manual recovery. A filesystem
   check failure instead leaves the recovered mapper active, the filesystem
-  unmounted, and the node quarantined. PV replacement, bitrot, and stale-disk
-  flows remain qualification-only Planned entries; their adapters now apply
-  scenario-specific PV, device, mutation, inventory, and rollback proofs and
-  still require live qualification.
+  unmounted, and the node quarantined. PV replacement and bitrot are executable;
+  stale-disk return remains Planned. Their adapters apply
+  scenario-specific PV, device, mutation, inventory, and rollback proofs.
 
 - [x] DONE: Make host/storage mutation preflight side-effect free.
   Meaning: host preflight reads Kubernetes metadata and fixed read-only host
@@ -546,8 +546,7 @@ Reporting only projects this typed checker result into failure-summary fields.
   volumes, before declaring heal success. `ForceReadThroughProof` now rejects
   any artifact that does not leave exactly read quorum online or excludes the
   repaired shard. Fresh-volume and bitrot qualification drivers now execute
-  that exact-quorum targeting; live-cluster calibration remains before either
-  scenario can leave Planned status.
+  that exact-quorum targeting through executable scenarios.
 
 - [ ] PARTIAL: Add `fresh-volume-replacement-heal`.
   Meaning: replace one PVC/PV with an empty volume, record original and
@@ -555,8 +554,7 @@ Reporting only projects this typed checker result into failure-summary fields.
   proof that the new volume contains the committed versions. The typed
   generation, pre-adoption emptiness, heal, and forced-read evidence contracts
   are connected to the Local-PV replacement driver, including Operator pause,
-  empty-volume proof, rollback, and cleanup. Live Operator and RustFS
-  qualification remains outstanding.
+  empty-volume proof, rollback, and cleanup.
 
 - [ ] PARTIAL: Add `on-disk-bitrot-heal`.
   Meaning: mutate bytes in one shard on a dedicated host volume, prove exact
@@ -565,8 +563,7 @@ Reporting only projects this typed checker result into failure-summary fields.
   mutation proof accepts only an exact RustFS object-version mapping and refuses
   guessed private paths. The driver now obtains that mapping with a bounded,
   offline XL2 inspector plus the privileged storage helper; it accepts the
-  current capability profile and fails closed on unknown formats. Live
-  qualification remains outstanding.
+  current capability profile and fails closed on unknown formats.
 
 - [ ] PARTIAL: Add heal observer artifacts.
   Meaning: `heal-summary.json` and `heal-progress.jsonl` should explain heal
@@ -574,7 +571,7 @@ Reporting only projects this typed checker result into failure-summary fields.
   source. Typed summary/progress validation now requires monotonic counters and
   a matching successful terminal sample. Fresh-volume emits the generic heal
   artifacts, and bitrot emits case-specific scanner/admin heal evidence during
-  execution; live convergence and timeout calibration remain outstanding.
+  execution.
 
 ### 10. Complete Admin Topology Workflows
 

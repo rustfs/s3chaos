@@ -405,6 +405,9 @@ RUSTFS_FAULT_TEST_QUALIFY_PLANNED_ADMIN=1
 RUSTFS_FAULT_TEST_QUALIFY_PLANNED_STORAGE=1
 RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=stale-disk-return
 run_scenario io-eio "$3/ordinary"
+mkdir -p "$3/executable-storage"
+RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=on-disk-bitrot-admin-deep
+run_scenario on-disk-bitrot "$3/executable-storage"
 "#,
             "fault-qualification-environment-test",
             script,
@@ -437,6 +440,13 @@ run_scenario io-eio "$3/ordinary"
         )
     );
 
+    let executable = read_log("executable-storage", "on-disk-bitrot");
+    assert!(
+        executable.contains("RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=on-disk-bitrot-admin-deep\n")
+    );
+    assert!(executable.contains("RUSTFS_FAULT_TEST_QUALIFY_PLANNED_ADMIN=\n"));
+    assert!(executable.contains("RUSTFS_FAULT_TEST_QUALIFY_PLANNED_STORAGE=\n"));
+
     let ordinary = read_log("ordinary", "io-eio");
     assert!(ordinary.contains("RUSTFS_FAULT_TEST_QUALIFY_PLANNED_ADMIN=\n"));
     assert!(ordinary.contains("RUSTFS_FAULT_TEST_QUALIFY_PLANNED_STORAGE=\n"));
@@ -445,7 +455,7 @@ run_scenario io-eio "$3/ordinary"
 
 #[cfg(unix)]
 #[test]
-fn bitrot_qualification_preflight_uses_its_storage_helper_not_the_dm_observer() {
+fn bitrot_preflight_uses_its_storage_helper_for_both_entrypoints() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let target = temporary.path().join("target.json");
     std::fs::write(
@@ -494,6 +504,10 @@ RUSTFS_FAULT_TEST_SERVER_IMAGE=rustfs:test
 RUSTFS_FAULT_TEST_STORAGE_CLASS=local-static
 RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG="$2"
 preflight on-disk-bitrot qualification on-disk-bitrot-admin-deep
+require_supported_scenario() { :; }
+qualification_case_contract() { printf 'on-disk-bitrot\tstorage\ton-disk-bitrot-admin-deep\n'; }
+RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE=on-disk-bitrot-admin-deep
+preflight on-disk-bitrot
 [[ ! -e "$TEST_ROOT/dm-preflight-used" ]]
 grep -Fx 'fault-ns get pod storage-helper' "$TEST_ROOT/kubectl-ns.log"
 "#,
@@ -699,4 +713,43 @@ analyze_qualification "$2"
 #[ignore = "destructive RustFS workload fault scenario; select with RUSTFS_FAULT_TEST_SCENARIO"]
 async fn fault_selected_scenario() -> Result<()> {
     s3chaos::fault::runner::run_selected_scenario_from_env().await
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_suite_shell_gate_preserves_single_attempt_and_dm_isolation() {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
+    for (scenario, kind, count, allowed) in [
+        ("fresh-volume-replacement", "storage-recovery", 1, true),
+        ("on-disk-bitrot", "storage-recovery", 1, true),
+        ("on-disk-bitrot", "injection", 1, false),
+        ("on-disk-bitrot", "storage-recovery", 2, false),
+        ("dm-flakey", "injection", 1, false),
+    ] {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let plan = directory.path().join("plan.json");
+        let attempt = serde_json::json!({"scenario": scenario, "execution": {"type": kind}});
+        std::fs::write(
+            &plan,
+            serde_json::json!({"requiresStaticStorage": true, "attempts": vec![attempt; count]})
+                .to_string(),
+        )
+        .expect("plan");
+        let result = Command::new("bash")
+            .args([
+                "-c",
+                "source \"$1\"; require_non_static_suite_plan \"$2\"",
+                "storage-gate",
+                script,
+            ])
+            .arg(plan)
+            .output()
+            .expect("shell gate");
+        assert_eq!(
+            result.status.success(),
+            allowed,
+            "{scenario}/{kind}/{count}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
 }
