@@ -219,6 +219,9 @@ async fn run_fault_case(
                     .run(run.prove_target(&prepared.endpoint, &mut preflight_phases))
                     .await?;
                 deadline.check()?;
+                if plan.workload_mode.runs_warp() {
+                    run.capture_warp_baseline(&prepared)?;
+                }
                 let mut active = run.activate_fault(&target).await?;
                 let skip_typed_oracle = active.quorum_activation.as_ref().is_some_and(|evidence| {
                     evidence.evidence().disposition()
@@ -241,6 +244,9 @@ async fn run_fault_case(
                 let recovered = run
                     .recover_access(&mut prepared, &target, &mut staged_multipart_uploads)
                     .await?;
+                if plan.workload_mode.runs_warp() {
+                    run.capture_warp_recovery(&prepared)?;
+                }
                 // A fault whose evidence can still change after removal (a
                 // lifecycle replacement that crashes after Ready) is re-read once
                 // the recovery gate has passed.
@@ -638,6 +644,14 @@ fn now_ms() -> u64 {
 
 fn warp_bucket_name(run_id: &str) -> String {
     format!("{}-warp", bucket_name(run_id))
+}
+
+fn warp_baseline_bucket_name(run_id: &str) -> String {
+    format!("{}-warp-base", bucket_name(run_id))
+}
+
+fn warp_recovery_bucket_name(run_id: &str) -> String {
+    format!("{}-warp-recv", bucket_name(run_id))
 }
 
 #[cfg(test)]

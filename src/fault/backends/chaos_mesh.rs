@@ -31,10 +31,11 @@ use crate::{
 mod runtime;
 
 pub use runtime::{
-    ChaosGuard, apply_iochaos, apply_networkchaos, apply_podchaos, apply_stresschaos,
-    cleanup_managed_chaos, cleanup_managed_iochaos, cleanup_managed_networkchaos,
-    cleanup_managed_podchaos, cleanup_managed_stresschaos, cleanup_run, cleanup_run_kind,
-    require_iochaos_crd, require_networkchaos_crd, require_podchaos_crd, require_stresschaos_crd,
+    ChaosGuard, apply_iochaos, apply_networkchaos, apply_podchaos, apply_schedule,
+    apply_stresschaos, chaos_schedule_is_armed, cleanup_managed_chaos, cleanup_managed_iochaos,
+    cleanup_managed_networkchaos, cleanup_managed_podchaos, cleanup_managed_stresschaos,
+    cleanup_run, cleanup_run_kind, require_iochaos_crd, require_networkchaos_crd,
+    require_podchaos_crd, require_schedule_crd, require_stresschaos_crd,
 };
 
 pub(crate) const RUN_ID_LABEL: &str = "rustfs-fault-test/run-id";
@@ -97,6 +98,10 @@ pub(crate) fn volume_fault_runtime_contract(
         ),
         FaultKind::RustfsVolumeEnospc => (
             IoChaosAction::Fault { errno: 28 },
+            vec!["WRITE".to_string()],
+        ),
+        FaultKind::RustfsVolumeErofs => (
+            IoChaosAction::Fault { errno: 30 },
             vec!["WRITE".to_string()],
         ),
         FaultKind::RustfsVolumeReadMistake => (
@@ -695,12 +700,18 @@ pub(crate) enum AppliedFault {
         guard: ChaosGuard,
         before_pods: Vec<PodIdentity>,
     },
+    PodKillStorm {
+        guard: ChaosGuard,
+        before_pods: Vec<PodIdentity>,
+        victim: PodIdentity,
+    },
 }
 
 enum FaultSpec {
     Io(IoChaosSpec),
     Pod(PodChaosSpec),
     PodKill(PodChaosSpec),
+    PodKillStorm(ScheduleSpec),
     Network(NetworkChaosSpec),
     Stress(StressChaosSpec),
 }
@@ -710,22 +721,34 @@ impl FaultSpec {
         match self {
             Self::Io(chaos) => chaos.manifest(),
             Self::Pod(chaos) | Self::PodKill(chaos) => chaos.manifest(),
+            Self::PodKillStorm(chaos) => chaos.manifest(),
             Self::Network(chaos) => chaos.manifest(),
             Self::Stress(chaos) => chaos.manifest(),
         }
     }
 }
 
+struct PodKillStormPins {
+    before_pods: Vec<PodIdentity>,
+    victim: PodIdentity,
+}
+
 pub(crate) fn apply_fault(request: &FaultApplyRequest<'_>) -> Result<AppliedFault> {
     let config = request.config;
     let cluster = &config.cluster;
     let scenario = request.scenario;
+    let storm = if request.injection.kind() == FaultKind::RustfsServerPodKillStorm {
+        Some(resolve_pod_kill_storm_victim(cluster)?)
+    } else {
+        None
+    };
     let spec = build_fault_spec(
         config,
         scenario,
         request.injection,
         request.run_id,
         request.resource_name_suffix,
+        storm.as_ref().map(|storm| storm.victim.name.as_str()),
     )?;
     let before_pods = if matches!(spec, FaultSpec::PodKill(_)) {
         Some(rustfs_pod_identities(cluster)?)
@@ -754,6 +777,16 @@ pub(crate) fn apply_fault(request: &FaultApplyRequest<'_>) -> Result<AppliedFaul
                 before_pods,
             })
         }
+        FaultSpec::PodKillStorm(chaos) => {
+            let Some(storm) = storm else {
+                unreachable!("pod kill storm resolves its victim before rendering");
+            };
+            Ok(AppliedFault::PodKillStorm {
+                guard: apply_schedule(cluster, &chaos)?,
+                before_pods: storm.before_pods,
+                victim: storm.victim,
+            })
+        }
         FaultSpec::Network(chaos) => Ok(AppliedFault::Experiment {
             guard: apply_networkchaos(cluster, &chaos)?,
             active_required: true,
@@ -771,6 +804,7 @@ fn build_fault_spec(
     injection: &FaultInjection,
     run_id: &str,
     resource_name_suffix: &str,
+    pinned_pod: Option<&str>,
 ) -> Result<FaultSpec> {
     let cluster = &config.cluster;
     let io_targeting = || -> Result<(u8, Option<u32>)> {
@@ -786,6 +820,22 @@ fn build_fault_spec(
             let (percent, targets) = io_targeting()?;
             Ok(FaultSpec::Io(
                 IoChaosSpec::enospc_on_rustfs_volume(
+                    cluster,
+                    &config.chaos_namespace,
+                    run_id,
+                    &scenario.name,
+                    injection.rustfs_volume_path()?,
+                    percent,
+                    injection.duration(),
+                )?
+                .with_fixed_targets(targets)?
+                .with_name_suffix(resource_name_suffix),
+            ))
+        }
+        FaultKind::RustfsVolumeErofs => {
+            let (percent, targets) = io_targeting()?;
+            Ok(FaultSpec::Io(
+                IoChaosSpec::erofs_on_rustfs_volume(
                     cluster,
                     &config.chaos_namespace,
                     run_id,
@@ -860,6 +910,21 @@ fn build_fault_spec(
             )
             .with_name_suffix(resource_name_suffix),
         )),
+        FaultKind::RustfsServerPodKillStorm => {
+            let pod_name = pinned_pod.context(
+                "pod-restart-storm requires the highest-ordinal pod before the schedule is rendered",
+            )?;
+            Ok(FaultSpec::PodKillStorm(
+                ScheduleSpec::pod_kill_storm(
+                    cluster,
+                    &config.chaos_namespace,
+                    run_id,
+                    &scenario.name,
+                    pod_name,
+                )?
+                .with_name_suffix(resource_name_suffix),
+            ))
+        }
         FaultKind::RustfsServerPodFailure => {
             // Honor the plan-declared blast radius: the quorum-edge scenario
             // fails more than one Pod at once, everything else stays
@@ -882,6 +947,16 @@ fn build_fault_spec(
             };
             Ok(FaultSpec::Pod(chaos.with_name_suffix(resource_name_suffix)))
         }
+        FaultKind::RustfsServerNetworkAsymmetricPartition => Ok(FaultSpec::Network(
+            NetworkChaosSpec::partition_one_way(
+                cluster,
+                &config.chaos_namespace,
+                run_id,
+                &scenario.name,
+                injection.duration(),
+            )?
+            .with_name_suffix(resource_name_suffix),
+        )),
         FaultKind::RustfsServerNetworkPartition => {
             // Honor the plan-declared blast radius: quorum-loss scenarios
             // partition more than one Pod, everything else stays single-target.
@@ -906,6 +981,7 @@ fn build_fault_spec(
         }
         FaultKind::RustfsServerNetworkDelay
         | FaultKind::RustfsServerNetworkLoss
+        | FaultKind::RustfsServerNetworkFlaky
         | FaultKind::RustfsServerNetworkCorrupt
         | FaultKind::RustfsServerNetworkDuplicate => {
             let chaos = match injection.kind() {
@@ -929,6 +1005,19 @@ fn build_fault_spec(
                     let (loss_percent, correlation_percent) =
                         injection.parameters().network_loss()?;
                     NetworkChaosSpec::loss_one_rustfs_pod(
+                        cluster,
+                        &config.chaos_namespace,
+                        run_id,
+                        &scenario.name,
+                        injection.duration(),
+                        loss_percent,
+                        correlation_percent,
+                    )?
+                }
+                FaultKind::RustfsServerNetworkFlaky => {
+                    let (loss_percent, correlation_percent) =
+                        injection.parameters().network_flaky()?;
+                    NetworkChaosSpec::flaky_loss_one_rustfs_pod(
                         cluster,
                         &config.chaos_namespace,
                         run_id,
@@ -1110,6 +1199,23 @@ pub struct NetworkDelayParameters {
     pub correlation_percent: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkChaosDirection {
+    Both,
+    /// Packets from the selected source Pod toward the peer selector.
+    /// The reverse path stays open, so this is a one-way blackhole.
+    To,
+}
+
+impl NetworkChaosDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::To => "to",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkChaosSpec {
     pub name: String,
@@ -1119,6 +1225,7 @@ pub struct NetworkChaosSpec {
     pub target_namespace: String,
     pub tenant_name: String,
     pub action: NetworkChaosAction,
+    pub direction: NetworkChaosDirection,
     pub duration: Duration,
     /// How many tenant Pods the source selector picks. 1 renders `mode: one`;
     /// N > 1 renders `mode: fixed` + `value: "N"` so the plan-declared blast
@@ -1273,6 +1380,47 @@ impl IoChaosSpec {
                 delay: parameters.delay,
             },
             percent: parameters.percent,
+            targets: None,
+            pod_names: None,
+            duration,
+        })
+    }
+
+    pub fn erofs_on_rustfs_volume(
+        config: &ClusterTestConfig,
+        chaos_namespace: impl Into<String>,
+        run_id: impl Into<String>,
+        scenario: impl Into<String>,
+        volume_path: impl Into<String>,
+        percent: u8,
+        duration: Duration,
+    ) -> Result<Self> {
+        ensure!(
+            (1..=100).contains(&percent),
+            "IOChaos percent must be in 1..=100, got {percent}"
+        );
+        ensure!(
+            duration > Duration::ZERO,
+            "IOChaos duration must be positive"
+        );
+
+        let run_id = run_id.into();
+        let short_run_id = run_id.chars().take(12).collect::<String>();
+        let scenario = scenario.into();
+
+        Ok(Self {
+            name: format!("rustfs-fault-io-erofs-{short_run_id}"),
+            namespace: chaos_namespace.into(),
+            run_id,
+            scenario,
+            target_namespace: config.test_namespace.clone(),
+            tenant_name: config.tenant_name.clone(),
+            container_name: "rustfs".to_string(),
+            volume_path: volume_path.into(),
+            path: None,
+            methods: vec!["WRITE".to_string()],
+            action: IoChaosAction::Fault { errno: 30 },
+            percent,
             targets: None,
             pod_names: None,
             duration,
@@ -1632,6 +1780,30 @@ impl NetworkChaosSpec {
         Ok(spec)
     }
 
+    /// One-way partition: traffic from the selected Pod toward every peer is
+    /// dropped, and the reverse direction is left intact. `mode: one` keeps
+    /// this off the bidirectional write-quorum evidence contract, which
+    /// requires `direction: both` and `mode: fixed`.
+    pub fn partition_one_way(
+        config: &ClusterTestConfig,
+        chaos_namespace: impl Into<String>,
+        run_id: impl Into<String>,
+        scenario: impl Into<String>,
+        duration: Duration,
+    ) -> Result<Self> {
+        let mut spec = Self::one_rustfs_pod(
+            config,
+            chaos_namespace,
+            run_id,
+            scenario,
+            duration,
+            "net-asym",
+            NetworkChaosAction::Partition,
+        )?;
+        spec.direction = NetworkChaosDirection::To;
+        Ok(spec)
+    }
+
     pub fn delay_one_rustfs_pod(
         config: &ClusterTestConfig,
         chaos_namespace: impl Into<String>,
@@ -1671,6 +1843,29 @@ impl NetworkChaosSpec {
             scenario,
             duration,
             "net-loss",
+            NetworkChaosAction::Loss {
+                loss: loss_percent.to_string(),
+                correlation: correlation_percent.to_string(),
+            },
+        )
+    }
+
+    pub fn flaky_loss_one_rustfs_pod(
+        config: &ClusterTestConfig,
+        chaos_namespace: impl Into<String>,
+        run_id: impl Into<String>,
+        scenario: impl Into<String>,
+        duration: Duration,
+        loss_percent: u8,
+        correlation_percent: u8,
+    ) -> Result<Self> {
+        Self::one_rustfs_pod(
+            config,
+            chaos_namespace,
+            run_id,
+            scenario,
+            duration,
+            "net-flaky",
             NetworkChaosAction::Loss {
                 loss: loss_percent.to_string(),
                 correlation: correlation_percent.to_string(),
@@ -1748,6 +1943,7 @@ impl NetworkChaosSpec {
             target_namespace: config.test_namespace.clone(),
             tenant_name: config.tenant_name.clone(),
             action,
+            direction: NetworkChaosDirection::Both,
             duration,
             targets: 1,
         })
@@ -1788,7 +1984,7 @@ spec:
       - {target_namespace}
     labelSelectors:
       rustfs.tenant: {tenant_name}
-  direction: both
+  direction: {direction}
   target:
     mode: all
     selector:
@@ -1810,6 +2006,7 @@ spec:
             tenant_name = self.tenant_name,
             action = action,
             mode = mode,
+            direction = self.direction.as_str(),
         )
     }
 
@@ -1989,13 +2186,148 @@ spec:
     }
 }
 
+/// Repeated pod-kill. Chaos Mesh `Schedule` is the actuator because one
+/// PodChaos is a single kill. The selector is one StatefulSet pod so the
+/// port-forward target (lowest ordinal) stays up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleSpec {
+    pub name: String,
+    pub namespace: String,
+    pub run_id: String,
+    pub scenario: String,
+    pub target_namespace: String,
+    pub pod_name: String,
+}
+
+impl ScheduleSpec {
+    pub fn pod_kill_storm(
+        config: &ClusterTestConfig,
+        chaos_namespace: impl Into<String>,
+        run_id: impl Into<String>,
+        scenario: impl Into<String>,
+        pod_name: impl Into<String>,
+    ) -> Result<Self> {
+        let pod_name = pod_name.into();
+        ensure!(
+            !pod_name.is_empty()
+                && pod_name.len() <= 253
+                && pod_name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && !pod_name.starts_with('-')
+                && !pod_name.ends_with('-'),
+            "pod-restart-storm target {pod_name:?} is not a DNS label"
+        );
+        let run_id = run_id.into();
+        let short_run_id = run_id.chars().take(12).collect::<String>();
+        Ok(Self {
+            name: format!("rustfs-fault-pod-kill-storm-{short_run_id}"),
+            namespace: chaos_namespace.into(),
+            run_id,
+            scenario: scenario.into(),
+            target_namespace: config.test_namespace.clone(),
+            pod_name,
+        })
+    }
+
+    pub fn with_name_suffix(mut self, suffix: &str) -> Self {
+        self.name.push_str(suffix);
+        self
+    }
+
+    pub fn manifest(&self) -> String {
+        format!(
+            r#"apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+metadata:
+  name: {name}
+  namespace: {namespace}
+  labels:
+    {run_id_label}: "{run_id}"
+    {scenario_label}: "{scenario}"
+    {managed_by_label}: {managed_by_value}
+spec:
+  schedule: "@every 15s"
+  concurrencyPolicy: Forbid
+  historyLimit: 1
+  startingDeadlineSeconds: 10
+  type: PodChaos
+  podChaos:
+    action: pod-kill
+    gracePeriod: 0
+    mode: one
+    selector:
+      pods:
+        {target_namespace}:
+          - {pod_name}
+"#,
+            name = self.name,
+            namespace = self.namespace,
+            run_id_label = RUN_ID_LABEL,
+            run_id = self.run_id,
+            scenario_label = SCENARIO_LABEL,
+            scenario = self.scenario,
+            managed_by_label = MANAGED_BY_LABEL,
+            managed_by_value = MANAGED_BY_VALUE,
+            target_namespace = self.target_namespace,
+            pod_name = self.pod_name,
+        )
+    }
+}
+
+pub(crate) fn highest_ordinal_pod_name<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<&'a str> {
+    let mut best: Option<(&'a str, u32)> = None;
+    let mut saw_any = false;
+    for name in names {
+        saw_any = true;
+        let ordinal = name
+            .rsplit_once('-')
+            .and_then(|(_, suffix)| suffix.parse::<u32>().ok())
+            .with_context(|| {
+                format!(
+                    "pod {name:?} has no numeric StatefulSet ordinal; pod-restart-storm fails closed"
+                )
+            })?;
+        match best {
+            Some((other, existing)) if existing == ordinal => {
+                bail!("pod-restart-storm found tied ordinal {ordinal} on {other:?} and {name:?}");
+            }
+            Some((_, existing)) if existing > ordinal => {}
+            _ => best = Some((name, ordinal)),
+        }
+    }
+    ensure!(
+        saw_any,
+        "pod-restart-storm requires at least one RustFS pod"
+    );
+    best.map(|(name, _)| name)
+        .context("pod-restart-storm requires a numeric ordinal")
+}
+
+fn resolve_pod_kill_storm_victim(cluster: &ClusterTestConfig) -> Result<PodKillStormPins> {
+    let before_pods = rustfs_pod_identities(cluster)?;
+    let victim_name = highest_ordinal_pod_name(before_pods.iter().map(|pod| pod.name.as_str()))?;
+    let victim = before_pods
+        .iter()
+        .find(|pod| pod.name == victim_name)
+        .cloned()
+        .context("highest-ordinal RustFS pod disappeared before the schedule was rendered")?;
+    Ok(PodKillStormPins {
+        before_pods,
+        victim,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         FaultSpec, IoChaosAction, IoChaosSpec, IoLatencyParameters, MAX_ERASURE_SET_SHARDS,
-        NetworkChaosAction, NetworkChaosSpec, NetworkDelayParameters,
+        NetworkChaosAction, NetworkChaosDirection, NetworkChaosSpec, NetworkDelayParameters,
         NetworkPartitionEvidenceContract, PodChaosAction, PodChaosSpec, PodFailureEvidenceContract,
-        StressChaosAction, StressChaosSpec, VolumeTargetEvidenceContract, build_fault_spec,
+        ScheduleSpec, StressChaosAction, StressChaosSpec, VolumeTargetEvidenceContract,
+        build_fault_spec, chaos_schedule_is_armed, highest_ordinal_pod_name,
         runtime::chaos_experiment_is_active, validate_fixed_volume_snapshot,
         validate_network_partition_snapshot, validate_pod_failure_snapshot,
         volume_fault_runtime_contract,
@@ -2111,8 +2443,8 @@ mod tests {
             Duration::from_secs(60),
         )
         .expect("fixed volume injection");
-        let spec =
-            build_fault_spec(&config, &scenario, &injection, "run-1", "").expect("fault spec");
+        let spec = build_fault_spec(&config, &scenario, &injection, "run-1", "", None)
+            .expect("fault spec");
         let runtime_contract = volume_fault_runtime_contract(&injection).expect("runtime contract");
         let FaultSpec::Io(spec) = spec else {
             panic!("expected IOChaos spec")
@@ -2360,8 +2692,9 @@ mod tests {
             .expect("metadata P+1 target count");
         assert_eq!(injection.selection(), FaultSelection::FixedTargets(9));
 
-        let FaultSpec::Io(spec) = build_fault_spec(&config, &scenario, &injection, "run-1", "")
-            .expect("IOChaos fault spec")
+        let FaultSpec::Io(spec) =
+            build_fault_spec(&config, &scenario, &injection, "run-1", "", None)
+                .expect("IOChaos fault spec")
         else {
             panic!("expected IOChaos spec")
         };
@@ -2827,8 +3160,15 @@ mod tests {
         )
         .expect("valid injection");
 
-        let spec = build_fault_spec(&config, &scenario, &injection, "run-1234567890", "-01")
-            .expect("fault spec");
+        let spec = build_fault_spec(
+            &config,
+            &scenario,
+            &injection,
+            "run-1234567890",
+            "-01",
+            None,
+        )
+        .expect("fault spec");
 
         match spec {
             FaultSpec::Io(spec) => {
@@ -2865,8 +3205,15 @@ mod tests {
         )
         .expect("valid injection");
 
-        let spec = build_fault_spec(&config, &scenario, &injection, "run-1234567890", "-02")
-            .expect("fault spec");
+        let spec = build_fault_spec(
+            &config,
+            &scenario,
+            &injection,
+            "run-1234567890",
+            "-02",
+            None,
+        )
+        .expect("fault spec");
 
         match spec {
             FaultSpec::Network(spec) => {
@@ -2898,8 +3245,15 @@ mod tests {
         )
         .expect("valid injection");
 
-        let spec = build_fault_spec(&config, &scenario, &injection, "run-1234567890", "-03")
-            .expect("fault spec");
+        let spec = build_fault_spec(
+            &config,
+            &scenario,
+            &injection,
+            "run-1234567890",
+            "-03",
+            None,
+        )
+        .expect("fault spec");
 
         match spec {
             FaultSpec::PodKill(spec) => {
@@ -2927,8 +3281,15 @@ mod tests {
         )
         .expect("valid injection");
 
-        let spec = build_fault_spec(&config, &scenario, &injection, "run-1234567890", "-04")
-            .expect("fault spec");
+        let spec = build_fault_spec(
+            &config,
+            &scenario,
+            &injection,
+            "run-1234567890",
+            "-04",
+            None,
+        )
+        .expect("fault spec");
 
         match spec {
             FaultSpec::Stress(spec) => {
@@ -2994,5 +3355,131 @@ mod tests {
         }"#;
 
         assert!(!chaos_experiment_is_active(status).expect("valid status"));
+    }
+
+    #[test]
+    fn asymmetric_partition_is_one_way_and_single_target() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let spec = NetworkChaosSpec::partition_one_way(
+            &config.cluster,
+            "chaos-mesh",
+            "run-1234567890",
+            "network-asymmetric-partition",
+            Duration::from_secs(60),
+        )
+        .expect("one-way partition");
+        let manifest = spec.manifest();
+        assert!(manifest.contains("name: rustfs-fault-net-asym-run-12345678"));
+        assert!(manifest.contains("action: partition"));
+        assert!(manifest.contains("direction: to"));
+        assert!(manifest.contains("mode: one"));
+        assert!(!manifest.contains("direction: both"));
+        assert_eq!(spec.direction, NetworkChaosDirection::To);
+        assert_eq!(spec.targets, 1);
+    }
+
+    #[test]
+    fn flaky_loss_uses_bursty_correlation_and_distinct_name() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let spec = NetworkChaosSpec::flaky_loss_one_rustfs_pod(
+            &config.cluster,
+            "chaos-mesh",
+            "run-1234567890",
+            "network-flaky",
+            Duration::from_secs(60),
+            10,
+            90,
+        )
+        .expect("flaky loss");
+        let manifest = spec.manifest();
+        assert!(manifest.contains("name: rustfs-fault-net-flaky-run-12345678"));
+        assert!(manifest.contains("action: loss"));
+        assert!(manifest.contains("loss: \"10\""));
+        assert!(manifest.contains("correlation: \"90\""));
+        assert!(manifest.contains("direction: both"));
+    }
+
+    #[test]
+    fn erofs_iochaos_returns_errno_30_on_writes() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let spec = IoChaosSpec::erofs_on_rustfs_volume(
+            &config.cluster,
+            "chaos-mesh",
+            "run-1234567890",
+            "io-read-only",
+            "/data/rustfs0",
+            100,
+            Duration::from_secs(60),
+        )
+        .expect("erofs");
+        let manifest = spec.manifest();
+        assert!(manifest.contains("errno: 30"));
+        assert!(manifest.contains("- WRITE"));
+        assert!(!manifest.contains("- READ"));
+        assert!(manifest.contains("percent: 100"));
+        assert_eq!(spec.action, IoChaosAction::Fault { errno: 30 });
+    }
+
+    #[test]
+    fn pod_kill_storm_schedule_pins_one_pod() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let spec = ScheduleSpec::pod_kill_storm(
+            &config.cluster,
+            "chaos-mesh",
+            "run-1234567890",
+            "pod-restart-storm",
+            "tenant-pool-0-3",
+        )
+        .expect("schedule");
+        let manifest = spec.manifest();
+        assert_eq!(manifest.matches("kind:").count(), 1);
+        assert!(manifest.contains("kind: Schedule"));
+        assert!(manifest.contains("schedule: \"@every 15s\""));
+        assert!(manifest.contains("concurrencyPolicy: Forbid"));
+        assert!(manifest.contains("historyLimit: 1"));
+        assert!(manifest.contains("type: PodChaos"));
+        assert!(manifest.contains("action: pod-kill"));
+        assert!(manifest.contains("gracePeriod: 0"));
+        assert!(manifest.contains("tenant-pool-0-3"));
+        assert!(
+            ScheduleSpec::pod_kill_storm(
+                &config.cluster,
+                "chaos-mesh",
+                "run-1",
+                "pod-restart-storm",
+                "Pod_3",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn highest_ordinal_pod_fails_closed() {
+        assert_eq!(
+            highest_ordinal_pod_name(["pool-0", "pool-2", "pool-1"]).expect("ordinal"),
+            "pool-2"
+        );
+        assert!(highest_ordinal_pod_name(["pool-1", "other-1"]).is_err());
+        assert!(highest_ordinal_pod_name(["pool-a"]).is_err());
+        assert!(highest_ordinal_pod_name(std::iter::empty()).is_err());
+    }
+
+    #[test]
+    fn schedule_armed_requires_status_time_and_no_deletion() {
+        assert!(
+            chaos_schedule_is_armed(r#"{"status":{"time":"2026-09-24T00:00:00Z"}}"#).expect("json")
+        );
+        assert!(
+            !chaos_schedule_is_armed(
+                r#"{"metadata":{"deletionTimestamp":"2026-01-01T00:00:01Z"},"status":{"time":"2026-09-24T00:00:00Z"}}"#
+            )
+            .expect("json")
+        );
+        assert!(!chaos_schedule_is_armed(r#"{"status":{}}"#).expect("json"));
+        assert!(!chaos_schedule_is_armed(r#"{"status":{"time":""}}"#).expect("json"));
+        assert!(
+            !chaos_schedule_is_armed(r#"{"status":{"lastScheduleTime":"2026-09-24T00:00:00Z"}}"#)
+                .expect("json")
+        );
     }
 }

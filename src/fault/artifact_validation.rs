@@ -2515,7 +2515,7 @@ fn validate_fault_artifacts_with_identity(
             QuorumEdgeRuntimeKind::PodFailure,
         )?;
     }
-    if options.scenario == scenarios::IO_EIO_SCENARIO {
+    if scenarios::proves_single_volume_eio_tolerance(&options.scenario) {
         validate_volume_availability_topology_evidence(&evidence, &target_proof)?;
     }
     if json_spec
@@ -2776,6 +2776,13 @@ fn validate_fault_artifacts_with_identity(
             workload_plan.object_count,
             catalog_floor_percent,
         )?;
+    }
+    if options.scenario == scenarios::WARP_UNDER_CHAOS_SCENARIO {
+        let metrics = fs::read_to_string(required(
+            &artifacts,
+            crate::fault::warp_metrics::WARP_POWERLOSS_METRICS_ARTIFACT,
+        )?)?;
+        crate::fault::warp_metrics::validate_success_metrics(&metrics, &options.scenario)?;
     }
     if scenarios::requires_quorum_edge_read_survival(&options.scenario) {
         validate_quorum_edge_read_survival_artifact(
@@ -4671,7 +4678,7 @@ fn validate_target_proof(
                         fault.name
                     )
                 })?;
-        } else if options.scenario == scenarios::IO_EIO_SCENARIO {
+        } else if scenarios::proves_single_volume_eio_tolerance(&options.scenario) {
             let unavailable_volumes = match spec_fault.selection.kind.as_str() {
                 // For legacy volume selections, `percent` is the I/O sampling
                 // rate on one selected volume, not a percentage of Pods.
@@ -5246,6 +5253,7 @@ fn fixed_volume_fault(spec: &FaultRunSpec) -> Option<&FaultRunFaultSpec> {
                 | "rustfs_volume_latency"
                 | "rustfs_volume_read_mistake"
                 | "rustfs_volume_enospc"
+                | "rustfs_volume_erofs"
         ))
     .then_some(fault)
 }
@@ -5816,6 +5824,7 @@ fn fixed_volume_injection_from_run_spec(
         "rustfs_volume_latency" => FaultKind::RustfsVolumeLatency,
         "rustfs_volume_read_mistake" => FaultKind::RustfsVolumeReadMistake,
         "rustfs_volume_enospc" => FaultKind::RustfsVolumeEnospc,
+        "rustfs_volume_erofs" => FaultKind::RustfsVolumeErofs,
         other => bail!("unsupported fixed volume fault kind {other:?}"),
     };
     let volume_path = fault

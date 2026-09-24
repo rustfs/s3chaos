@@ -1759,7 +1759,7 @@ scenarios:
             build_fault_suite_plan_expansion(suite, base, "chaos-suite-test".to_string())
                 .expect("canonical Chaos Mesh suite plan");
 
-        assert_eq!(expansion.plan.attempts.len(), 20);
+        assert_eq!(expansion.plan.attempts.len(), 25);
         assert!(expansion.plan.requires_chaos_mesh);
         assert!(!expansion.plan.requires_static_storage);
         assert!(expansion.plan.required_tools.is_empty());

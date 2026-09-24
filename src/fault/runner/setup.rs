@@ -25,10 +25,10 @@ use crate::{
         preflight::{PreflightCheck, PreflightPhase, TargetProof},
         reporting::FailureSummary,
         scenarios::{
-            FaultBackend, IO_EIO_SCENARIO, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+            FaultBackend, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
             POD_FAILURE_QUORUM_EDGE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
             QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, acknowledged_mutation_kind,
-            requires_prefault_multipart_staging,
+            proves_single_volume_eio_tolerance, requires_prefault_multipart_staging,
         },
         workload::S3WorkloadClient,
     },
@@ -589,7 +589,7 @@ impl FaultRun<'_> {
         )?;
         let mut topology_observed_at_ms = None;
         let mut execution_injection = plan.fault().clone();
-        if plan.scenario == IO_EIO_SCENARIO {
+        if proves_single_volume_eio_tolerance(&plan.scenario) {
             events.record(
                 "volume-availability-topology-proof",
                 RunEventStatus::Started,

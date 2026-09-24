@@ -21,13 +21,14 @@ use crate::framework::{config::ClusterTestConfig, kubectl::Kubectl};
 
 use super::{
     IoChaosSpec, MANAGED_BY_LABEL, MANAGED_BY_VALUE, NetworkChaosSpec, PodChaosSpec, RUN_ID_LABEL,
-    StressChaosSpec,
+    ScheduleSpec, StressChaosSpec,
 };
 
 const IOCHAOS_CRD: &str = "iochaos.chaos-mesh.org";
 const PODCHAOS_CRD: &str = "podchaos.chaos-mesh.org";
 const NETWORKCHAOS_CRD: &str = "networkchaos.chaos-mesh.org";
 const STRESSCHAOS_CRD: &str = "stresschaos.chaos-mesh.org";
+const SCHEDULE_CRD: &str = "schedules.chaos-mesh.org";
 
 #[derive(Debug, Clone)]
 pub struct ChaosGuard {
@@ -54,6 +55,10 @@ pub fn require_stresschaos_crd(config: &ClusterTestConfig) -> Result<()> {
     require_crd(config, STRESSCHAOS_CRD, "Chaos Mesh StressChaos")
 }
 
+pub fn require_schedule_crd(config: &ClusterTestConfig) -> Result<()> {
+    require_crd(config, SCHEDULE_CRD, "Chaos Mesh Schedule")
+}
+
 fn require_crd(config: &ClusterTestConfig, crd: &str, description: &str) -> Result<()> {
     let output = Kubectl::new(config).command(["get", "crd", crd]).run()?;
     ensure!(
@@ -68,7 +73,13 @@ fn require_crd(config: &ClusterTestConfig, crd: &str, description: &str) -> Resu
 pub fn cleanup_run(config: &ClusterTestConfig, namespace: &str, run_id: &str) -> Result<()> {
     let selector = format!("{RUN_ID_LABEL}={run_id}");
     let timeout = delete_timeout_arg(config);
-    for kind in ["iochaos", "podchaos", "networkchaos", "stresschaos"] {
+    for kind in [
+        "schedule",
+        "iochaos",
+        "podchaos",
+        "networkchaos",
+        "stresschaos",
+    ] {
         Kubectl::new(config)
             .namespaced(namespace)
             .command([
@@ -106,7 +117,13 @@ pub fn cleanup_run_kind(
 }
 
 pub fn cleanup_managed_chaos(config: &ClusterTestConfig, namespace: &str) -> Result<()> {
-    for kind in ["iochaos", "podchaos", "networkchaos", "stresschaos"] {
+    for kind in [
+        "schedule",
+        "iochaos",
+        "podchaos",
+        "networkchaos",
+        "stresschaos",
+    ] {
         cleanup_managed_kind(config, namespace, kind)?;
     }
     Ok(())
@@ -180,6 +197,16 @@ pub fn apply_networkchaos(
         &spec.namespace,
         spec.manifest(),
         "networkchaos",
+        &spec.name,
+    )
+}
+
+pub fn apply_schedule(config: &ClusterTestConfig, spec: &ScheduleSpec) -> Result<ChaosGuard> {
+    apply_manifest(
+        config,
+        &spec.namespace,
+        spec.manifest(),
+        "schedule",
         &spec.name,
     )
 }
@@ -380,6 +407,22 @@ impl ChaosGuard {
             name = self.name,
         )
     }
+}
+
+/// A Schedule stays armed after its first tick. It has no AllInjected
+/// condition, so the experiment helper cannot describe it. Activation is
+/// "the schedule has fired at least once and has not been deleted".
+///
+/// Chaos Mesh JSON-encodes `ScheduleStatus.LastScheduleTime` as
+/// `status.time`, not `status.lastScheduleTime`.
+pub fn chaos_schedule_is_armed(raw: &str) -> Result<bool> {
+    let value = serde_json::from_str::<Value>(raw).context("parse Chaos Mesh Schedule json")?;
+    let deleting = value.pointer("/metadata/deletionTimestamp").is_some();
+    let scheduled = value
+        .pointer("/status/time")
+        .and_then(Value::as_str)
+        .is_some_and(|timestamp| !timestamp.is_empty());
+    Ok(!deleting && scheduled)
 }
 
 pub(super) fn chaos_experiment_is_active(raw: &str) -> Result<bool> {

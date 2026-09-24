@@ -511,7 +511,11 @@ impl FaultTestConfig {
 }
 
 pub fn default_percent_for_scenario(scenario: &str) -> u8 {
-    if scenario == "disk-full" { 100 } else { 20 }
+    if scenario == "disk-full" || scenario == "io-read-only" {
+        100
+    } else {
+        20
+    }
 }
 
 pub(crate) fn validate_rustfs_volume_path(value: &str) -> Result<()> {
