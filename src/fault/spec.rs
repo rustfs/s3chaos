@@ -620,6 +620,9 @@ impl FaultRunArtifactSpec {
         }) {
             names.push(POD_LIFECYCLE_EVIDENCE_ARTIFACT.to_string());
         }
+        if scenario == crate::fault::scenarios::WARP_UNDER_CHAOS_SCENARIO {
+            names.push(crate::fault::warp_metrics::WARP_POWERLOSS_METRICS_ARTIFACT.to_string());
+        }
         names
     }
 }

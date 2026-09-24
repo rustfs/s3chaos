@@ -1,3 +1,8 @@
+# Performance-only Warp campaign. Metrics land in warp-powerloss-metrics.json
+# (in-run baseline ops/s, degraded ops/s, drop percent, fault-window error
+# percent, node-ready lag NOT_APPLICABLE, and time-to-baseline). Peer A/B
+# against MinIO or Pigsty SILO is not part of CI; see
+# docs/MAC_MINI_CHAOS_COVERAGE.md.
 apiVersion: rustfs.com/s3chaos/v1alpha1
 kind: FaultSuite
 metadata:

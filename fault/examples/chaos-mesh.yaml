@@ -3,7 +3,7 @@ kind: FaultSuite
 metadata:
   name: rustfs-chaos-mesh-regression
 budgets:
-  maxDuration: 8h
+  maxDuration: 9h
   stopOnFirstFailure: true
   continueOnSeverities: []
   maxClientDisruptions: 9200
@@ -62,6 +62,9 @@ scenarios:
   - name: network-partition-one
     faultDuration: 15m
     workloadProfile: regression
+  - name: network-asymmetric-partition
+    faultDuration: 15m
+    workloadProfile: regression
   - name: network-partition-write-quorum-loss
     faultDuration: 15m
     workloadProfile: regression
@@ -72,6 +75,13 @@ scenarios:
       kind: networkLoss
       lossPercent: 25
       correlationPercent: 25
+  - name: network-flaky
+    faultDuration: 15m
+    workloadProfile: regression
+    params:
+      kind: networkFlaky
+      lossPercent: 10
+      correlationPercent: 90
   - name: network-corrupt
     faultDuration: 15m
     workloadProfile: regression
@@ -88,6 +98,17 @@ scenarios:
       correlationPercent: 25
   - name: pod-failure
     faultDuration: 15m
+    workloadProfile: regression
+  - name: pod-restart-storm
+    faultDuration: 15m
+    workloadProfile: regression
+  - name: io-read-only
+    faultDuration: 15m
+    percent: 100
+    workloadProfile: regression
+  - name: io-eio-during-multipart
+    faultDuration: 15m
+    percent: 20
     workloadProfile: regression
   - name: stress-cpu
     faultDuration: 15m

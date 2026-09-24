@@ -28,15 +28,17 @@ use crate::fault::{
         DM_DROP_WRITES_AFTER_ACK_OVERWRITE_SCENARIO, DM_DROP_WRITES_AFTER_ACK_PUT_SCENARIO,
         DM_DROP_WRITES_AFTER_ACK_ZERO_BYTE_PUT_SCENARIO, DM_FLAKEY_SCENARIO,
         DM_FLAKEY_VERSIONED_HOT_SCENARIO, FRESH_VOLUME_REPLACEMENT_SCENARIO, FaultBackend,
-        FaultParameterSchema, FaultScenario, FaultScenarioSpec, IO_EIO_SCENARIO,
-        IO_LATENCY_SCENARIO, IO_READ_MISTAKE_SCENARIO, NETWORK_CORRUPT_SCENARIO,
-        NETWORK_DELAY_SCENARIO, NETWORK_DUPLICATE_SCENARIO, NETWORK_LOSS_SCENARIO,
+        FaultParameterSchema, FaultScenario, FaultScenarioSpec, IO_EIO_DURING_MULTIPART_SCENARIO,
+        IO_EIO_SCENARIO, IO_LATENCY_SCENARIO, IO_READ_MISTAKE_SCENARIO, IO_READ_ONLY_SCENARIO,
+        NETWORK_ASYMMETRIC_PARTITION_SCENARIO, NETWORK_CORRUPT_SCENARIO, NETWORK_DELAY_SCENARIO,
+        NETWORK_DUPLICATE_SCENARIO, NETWORK_FLAKY_SCENARIO, NETWORK_LOSS_SCENARIO,
         NETWORK_PARTITION_ONE_SCENARIO, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
         NODE_CRASH_PROXY_SCENARIO, ON_DISK_BITROT_SCENARIO, POD_CRASH_VERSIONED_HOT_SCENARIO,
         POD_FAILURE_QUORUM_EDGE_SCENARIO, POD_FAILURE_SCENARIO, POD_GRACEFUL_RESTART_ONE_SCENARIO,
-        POD_KILL_ONE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
-        ROLLING_RESTART_ALL_SCENARIO, STALE_DISK_RETURN_DETECT_SCENARIO, STRESS_CPU_SCENARIO,
-        STRESS_MEMORY_SCENARIO, WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
+        POD_KILL_ONE_SCENARIO, POD_RESTART_STORM_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
+        QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, ROLLING_RESTART_ALL_SCENARIO,
+        STALE_DISK_RETURN_DETECT_SCENARIO, STRESS_CPU_SCENARIO, STRESS_MEMORY_SCENARIO,
+        WARP_UNDER_CHAOS_SCENARIO, scenario_spec,
     },
     storage_recovery::StorageRecoveryCase,
 };
@@ -282,11 +284,15 @@ pub enum FaultKind {
     RustfsVolumeLatency,
     RustfsVolumeReadMistake,
     RustfsVolumeEnospc,
+    RustfsVolumeErofs,
     RustfsServerPodKill,
+    RustfsServerPodKillStorm,
     RustfsServerPodFailure,
     RustfsServerNetworkPartition,
+    RustfsServerNetworkAsymmetricPartition,
     RustfsServerNetworkDelay,
     RustfsServerNetworkLoss,
+    RustfsServerNetworkFlaky,
     RustfsServerNetworkCorrupt,
     RustfsServerNetworkDuplicate,
     RustfsServerCpuStress,
@@ -305,11 +311,17 @@ impl FaultKind {
             Self::RustfsVolumeLatency => "rustfs_volume_latency",
             Self::RustfsVolumeReadMistake => "rustfs_volume_read_mistake",
             Self::RustfsVolumeEnospc => "rustfs_volume_enospc",
+            Self::RustfsVolumeErofs => "rustfs_volume_erofs",
             Self::RustfsServerPodKill => "rustfs_server_pod_kill",
+            Self::RustfsServerPodKillStorm => "rustfs_server_pod_kill_storm",
             Self::RustfsServerPodFailure => "rustfs_server_pod_failure",
             Self::RustfsServerNetworkPartition => "rustfs_server_network_partition",
+            Self::RustfsServerNetworkAsymmetricPartition => {
+                "rustfs_server_network_asymmetric_partition"
+            }
             Self::RustfsServerNetworkDelay => "rustfs_server_network_delay",
             Self::RustfsServerNetworkLoss => "rustfs_server_network_loss",
+            Self::RustfsServerNetworkFlaky => "rustfs_server_network_flaky",
             Self::RustfsServerNetworkCorrupt => "rustfs_server_network_corrupt",
             Self::RustfsServerNetworkDuplicate => "rustfs_server_network_duplicate",
             Self::RustfsServerCpuStress => "rustfs_server_cpu_stress",
@@ -483,6 +495,12 @@ pub enum FaultInjectionParameters {
         #[serde(rename = "correlationPercent")]
         correlation_percent: u8,
     },
+    NetworkFlaky {
+        #[serde(rename = "lossPercent")]
+        loss_percent: u8,
+        #[serde(rename = "correlationPercent")]
+        correlation_percent: u8,
+    },
     StressCpu {
         workers: u32,
         load: u8,
@@ -533,6 +551,7 @@ impl FaultInjectionParameters {
             FaultParameterSchema::NetworkLoss => FaultKind::RustfsServerNetworkLoss,
             FaultParameterSchema::NetworkCorrupt => FaultKind::RustfsServerNetworkCorrupt,
             FaultParameterSchema::NetworkDuplicate => FaultKind::RustfsServerNetworkDuplicate,
+            FaultParameterSchema::NetworkFlaky => FaultKind::RustfsServerNetworkFlaky,
             FaultParameterSchema::StressCpu => FaultKind::RustfsServerCpuStress,
             FaultParameterSchema::StressMemory => FaultKind::RustfsServerMemoryStress,
             FaultParameterSchema::None => bail!("scenario does not support typed params yet"),
@@ -601,6 +620,16 @@ impl FaultInjectionParameters {
         }
     }
 
+    pub fn network_flaky(&self) -> Result<(u8, u8)> {
+        match self {
+            Self::NetworkFlaky {
+                loss_percent,
+                correlation_percent,
+            } => Ok((*loss_percent, *correlation_percent)),
+            other => bail!("expected networkFlaky parameters, got {:?}", other),
+        }
+    }
+
     pub fn stress_cpu(&self) -> Result<(u32, u8)> {
         match self {
             Self::StressCpu { workers, load } => Ok((*workers, *load)),
@@ -637,6 +666,10 @@ impl FaultInjectionParameters {
             FaultKind::RustfsServerNetworkDuplicate => Self::NetworkDuplicate {
                 duplicate_percent: 10,
                 correlation_percent: 25,
+            },
+            FaultKind::RustfsServerNetworkFlaky => Self::NetworkFlaky {
+                loss_percent: 10,
+                correlation_percent: 90,
             },
             FaultKind::RustfsServerCpuStress => Self::StressCpu {
                 workers: 1,
@@ -703,6 +736,23 @@ impl FaultInjectionParameters {
             ) => {
                 validate_percent("params.duplicatePercent", *duplicate_percent)?;
                 validate_correlation(*correlation_percent)?;
+                Ok(())
+            }
+            (
+                FaultKind::RustfsServerNetworkFlaky,
+                Self::NetworkFlaky {
+                    loss_percent,
+                    correlation_percent,
+                },
+            ) => {
+                ensure!(
+                    (1..=40).contains(loss_percent),
+                    "params.lossPercent for bursty loss must be between 1 and 40"
+                );
+                ensure!(
+                    (75..=100).contains(correlation_percent),
+                    "params.correlationPercent for bursty loss must be between 75 and 100"
+                );
                 Ok(())
             }
             (FaultKind::RustfsServerCpuStress, Self::StressCpu { workers, load }) => {
@@ -980,15 +1030,20 @@ fn fault_kind_accepts_backend(kind: FaultKind, backend: FaultBackend) -> bool {
         ) | (
             FaultKind::RustfsVolumeLatency
                 | FaultKind::RustfsVolumeReadMistake
-                | FaultKind::RustfsVolumeEnospc,
+                | FaultKind::RustfsVolumeEnospc
+                | FaultKind::RustfsVolumeErofs,
             FaultBackend::ChaosMeshIoChaos
         ) | (
-            FaultKind::RustfsServerPodKill | FaultKind::RustfsServerPodFailure,
+            FaultKind::RustfsServerPodKill
+                | FaultKind::RustfsServerPodKillStorm
+                | FaultKind::RustfsServerPodFailure,
             FaultBackend::ChaosMeshPodChaos
         ) | (
             FaultKind::RustfsServerNetworkPartition
+                | FaultKind::RustfsServerNetworkAsymmetricPartition
                 | FaultKind::RustfsServerNetworkDelay
                 | FaultKind::RustfsServerNetworkLoss
+                | FaultKind::RustfsServerNetworkFlaky
                 | FaultKind::RustfsServerNetworkCorrupt
                 | FaultKind::RustfsServerNetworkDuplicate,
             FaultBackend::ChaosMeshNetworkChaos
@@ -1012,7 +1067,8 @@ fn fault_kind_accepts_selection(kind: FaultKind, selection: FaultSelection) -> b
         FaultKind::RustfsVolumeIoError
         | FaultKind::RustfsVolumeLatency
         | FaultKind::RustfsVolumeReadMistake
-        | FaultKind::RustfsVolumeEnospc => match selection {
+        | FaultKind::RustfsVolumeEnospc
+        | FaultKind::RustfsVolumeErofs => match selection {
             FaultSelection::Percent(percent) => (1..=100).contains(&percent),
             // RustFS supports erasure sets up to 16 shards. Exact candidate
             // availability is proved at preflight and actual selection is
@@ -1043,8 +1099,11 @@ fn fault_kind_accepts_selection(kind: FaultKind, selection: FaultSelection) -> b
         // declare an n-pod blast radius that the backend silently narrows to
         // one — a weaker fault than requested, i.e. a false sense of coverage.
         FaultKind::RustfsServerPodKill
+        | FaultKind::RustfsServerPodKillStorm
+        | FaultKind::RustfsServerNetworkAsymmetricPartition
         | FaultKind::RustfsServerNetworkDelay
         | FaultKind::RustfsServerNetworkLoss
+        | FaultKind::RustfsServerNetworkFlaky
         | FaultKind::RustfsServerNetworkCorrupt
         | FaultKind::RustfsServerNetworkDuplicate
         | FaultKind::RustfsServerCpuStress
@@ -1072,13 +1131,18 @@ fn fault_kind_accepts_target(kind: FaultKind, target: &FaultTarget) -> bool {
         FaultKind::RustfsVolumeIoError
         | FaultKind::RustfsVolumeLatency
         | FaultKind::RustfsVolumeReadMistake
-        | FaultKind::RustfsVolumeEnospc => matches!(target, FaultTarget::RustfsVolume { .. }),
-        FaultKind::RustfsServerPodKill | FaultKind::RustfsServerPodFailure => {
+        | FaultKind::RustfsVolumeEnospc
+        | FaultKind::RustfsVolumeErofs => matches!(target, FaultTarget::RustfsVolume { .. }),
+        FaultKind::RustfsServerPodKill
+        | FaultKind::RustfsServerPodKillStorm
+        | FaultKind::RustfsServerPodFailure => {
             matches!(target, FaultTarget::RustfsServerPod)
         }
         FaultKind::RustfsServerNetworkPartition
+        | FaultKind::RustfsServerNetworkAsymmetricPartition
         | FaultKind::RustfsServerNetworkDelay
         | FaultKind::RustfsServerNetworkLoss
+        | FaultKind::RustfsServerNetworkFlaky
         | FaultKind::RustfsServerNetworkCorrupt
         | FaultKind::RustfsServerNetworkDuplicate => {
             matches!(target, FaultTarget::RustfsServerPeerNetwork)
@@ -1182,7 +1246,7 @@ impl FaultPlan {
                 FaultWorkloadMode::S3Mixed
             };
         let fault = match scenario.name.as_str() {
-            IO_EIO_SCENARIO => volume_fault(
+            IO_EIO_SCENARIO | IO_EIO_DURING_MULTIPART_SCENARIO => volume_fault(
                 FaultKind::RustfsVolumeIoError,
                 spec,
                 scenario,
@@ -1191,6 +1255,13 @@ impl FaultPlan {
             )?,
             POD_KILL_ONE_SCENARIO | POD_CRASH_VERSIONED_HOT_SCENARIO => FaultInjection::new(
                 FaultKind::RustfsServerPodKill,
+                spec.backend,
+                FaultTarget::RustfsServerPod,
+                FaultSelection::FixedTargets(1),
+                scenario.duration,
+            )?,
+            POD_RESTART_STORM_SCENARIO => FaultInjection::new(
+                FaultKind::RustfsServerPodKillStorm,
                 spec.backend,
                 FaultTarget::RustfsServerPod,
                 FaultSelection::FixedTargets(1),
@@ -1220,6 +1291,19 @@ impl FaultPlan {
                 FaultTarget::RustfsServerPeerNetwork,
                 FaultSelection::FixedTargets(1),
                 scenario.duration,
+            )?,
+            NETWORK_ASYMMETRIC_PARTITION_SCENARIO => FaultInjection::new(
+                FaultKind::RustfsServerNetworkAsymmetricPartition,
+                spec.backend,
+                FaultTarget::RustfsServerPeerNetwork,
+                FaultSelection::FixedTargets(1),
+                scenario.duration,
+            )?,
+            NETWORK_FLAKY_SCENARIO => network_fault(
+                FaultKind::RustfsServerNetworkFlaky,
+                spec,
+                scenario,
+                &options.scenario_parameters,
             )?,
             NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO => FaultInjection::new(
                 FaultKind::RustfsServerNetworkPartition,
@@ -1271,6 +1355,13 @@ impl FaultPlan {
             )?,
             DISK_FULL_SCENARIO => volume_fault(
                 FaultKind::RustfsVolumeEnospc,
+                spec,
+                scenario,
+                &options.rustfs_volume_path,
+                &options.scenario_parameters,
+            )?,
+            IO_READ_ONLY_SCENARIO => volume_fault(
+                FaultKind::RustfsVolumeErofs,
                 spec,
                 scenario,
                 &options.rustfs_volume_path,

@@ -512,6 +512,7 @@ pub(super) fn fixed_volume_target_count(plan: &FaultPlan) -> Option<u32> {
             | FaultKind::RustfsVolumeLatency
             | FaultKind::RustfsVolumeReadMistake
             | FaultKind::RustfsVolumeEnospc
+            | FaultKind::RustfsVolumeErofs
     ) {
         return None;
     }

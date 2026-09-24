@@ -35,6 +35,8 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::time::Duration;
 
 use super::access::{
     PortForwardLost, ensure_s3_access, wait_for_local_forward, wait_for_tenant_s3,
@@ -54,14 +56,14 @@ use super::targets::{
 };
 use super::{
     ActiveFault, FaultRun, FaultWorkload, PreparedWorkload, ProvenTarget, WorkloadTargetEvidence,
-    now_ms, warp_bucket_name,
+    now_ms, warp_baseline_bucket_name, warp_bucket_name, warp_recovery_bucket_name,
 };
 use crate::fault::backends::runtime::apply_fault;
 use crate::fault::quorum::QUORUM_FAULT_ACTIVATION_ARTIFACT;
 use crate::fault::workload::execution::{
     AVAILABILITY_REPORT_ARTIFACT, MixedWorkloadRequest, MixedWorkloadResult,
     QUORUM_EDGE_READ_SURVIVAL_ARTIFACT, QuorumEdgeReadSurvivalReport, ReadProbeSummary,
-    TypedQuorumReadCohortSource, TypedQuorumReadExpectation, probe_read_cohort,
+    TypedQuorumReadCohortSource, TypedQuorumReadExpectation, WarpMixedRequest, probe_read_cohort,
     probe_typed_quorum_read_cohort, require_typed_quorum_read_survival, run_mixed_workload,
     run_warp_mixed,
 };
@@ -919,21 +921,37 @@ impl FaultRun<'_> {
                 "running Warp workload under active faults",
                 Some(serde_json::json!({ "bucket": warp_bucket })),
             )?;
-            if let Err(error) = run_warp_mixed(
-                config.warp_duration,
+            let degraded = match run_warp_mixed(
                 collector,
                 scenario.case_name,
-                endpoint,
-                &warp_bucket,
-                access_key,
-                secret_key,
+                WarpMixedRequest {
+                    duration: config.warp_duration,
+                    endpoint,
+                    bucket: &warp_bucket,
+                    access_key,
+                    secret_key,
+                    transcript_name: "warp-mixed.txt",
+                },
             ) {
+                Ok(window) => window,
+                Err(error) => {
+                    self.record_failure(
+                        "warp-workload",
+                        "workload_or_product",
+                        &error,
+                        Some(serde_json::json!({ "bucket": warp_bucket })),
+                        Some((fault, "warp-failed")),
+                    )?;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.write_degraded_warp_window(&degraded) {
                 self.record_failure(
                     "warp-workload",
                     "workload_or_product",
                     &error,
                     Some(serde_json::json!({ "bucket": warp_bucket })),
-                    Some((fault, "warp-failed")),
+                    Some((fault, "warp-metrics-failed")),
                 )?;
                 return Err(error);
             }
@@ -974,6 +992,145 @@ impl FaultRun<'_> {
 
         Ok(())
     }
+
+    pub(super) fn capture_warp_baseline(&self, prepared: &PreparedWorkload) -> Result<()> {
+        let (access_key, secret_key) = resources::test_credentials();
+        let bucket = warp_baseline_bucket_name(&self.context.run_id);
+        self.context.events.record(
+            "warp-baseline",
+            RunEventStatus::Started,
+            "running in-run Warp baseline before the fault",
+            Some(serde_json::json!({ "bucket": bucket })),
+        )?;
+        let window = run_warp_mixed(
+            self.collector,
+            self.scenario.case_name,
+            WarpMixedRequest {
+                duration: self.config.warp_duration,
+                endpoint: &prepared.endpoint,
+                bucket: &bucket,
+                access_key,
+                secret_key,
+                transcript_name: "warp-baseline.txt",
+            },
+        )
+        .context("in-run Warp baseline failed")?;
+        self.write_json_artifact(
+            crate::fault::warp_metrics::WARP_BASELINE_WINDOW_ARTIFACT,
+            &window,
+        )?;
+        self.context.events.record(
+            "warp-baseline",
+            RunEventStatus::Succeeded,
+            "in-run Warp baseline recorded",
+            Some(serde_json::json!({
+                "bucket": bucket,
+                "opsPerSec": window.ops_per_sec,
+            })),
+        )?;
+        Ok(())
+    }
+
+    pub(super) fn capture_warp_recovery(&self, prepared: &PreparedWorkload) -> Result<()> {
+        let baseline =
+            self.read_warp_window(crate::fault::warp_metrics::WARP_BASELINE_WINDOW_ARTIFACT)?;
+        let degraded =
+            self.read_warp_window(crate::fault::warp_metrics::WARP_DEGRADED_WINDOW_ARTIFACT)?;
+        let (access_key, secret_key) = resources::test_credentials();
+        let bucket = warp_recovery_bucket_name(&self.context.run_id);
+        self.context.events.record(
+            "warp-recovery",
+            RunEventStatus::Started,
+            "sampling post-recovery Warp windows for time-to-baseline",
+            Some(serde_json::json!({ "bucket": bucket })),
+        )?;
+        let mut windows = Vec::new();
+        for index in 0..crate::fault::warp_metrics::WARP_RECOVERY_WINDOW_LIMIT {
+            self.deadline.check()?;
+            let transcript_name = format!("warp-recovery-{index:02}.txt");
+            let window = run_warp_mixed(
+                self.collector,
+                self.scenario.case_name,
+                WarpMixedRequest {
+                    duration: Duration::from_secs(
+                        crate::fault::warp_metrics::WARP_RECOVERY_WINDOW_SECONDS,
+                    ),
+                    endpoint: &prepared.endpoint,
+                    bucket: &bucket,
+                    access_key,
+                    secret_key,
+                    transcript_name: &transcript_name,
+                },
+            )
+            .with_context(|| format!("post-recovery Warp window {index} failed"))?;
+            windows.push(crate::fault::warp_metrics::RecoveryWindowRecord {
+                seconds: crate::fault::warp_metrics::WARP_RECOVERY_WINDOW_SECONDS,
+                ops_per_sec: window.ops_per_sec,
+            });
+            if matches!(
+                crate::fault::warp_metrics::evaluate_ttb(baseline.ops_per_sec, &windows)?,
+                crate::fault::warp_metrics::TtbReport::Reached { .. }
+            ) {
+                break;
+            }
+        }
+        self.write_warp_metrics(&baseline, &degraded, &windows)?;
+        self.context.events.record(
+            "warp-recovery",
+            RunEventStatus::Succeeded,
+            "post-recovery Warp windows recorded; NOT_REACHED is a measurement, not a failed run",
+            Some(serde_json::json!({ "windows": windows.len() })),
+        )?;
+        Ok(())
+    }
+
+    fn write_degraded_warp_window(
+        &self,
+        degraded: &crate::fault::warp_metrics::WarpWindow,
+    ) -> Result<()> {
+        self.write_json_artifact(
+            crate::fault::warp_metrics::WARP_DEGRADED_WINDOW_ARTIFACT,
+            degraded,
+        )?;
+        let baseline =
+            self.read_warp_window(crate::fault::warp_metrics::WARP_BASELINE_WINDOW_ARTIFACT)?;
+        self.write_warp_metrics(&baseline, degraded, &[])
+    }
+
+    fn write_warp_metrics(
+        &self,
+        baseline: &crate::fault::warp_metrics::WarpWindow,
+        degraded: &crate::fault::warp_metrics::WarpWindow,
+        windows: &[crate::fault::warp_metrics::RecoveryWindowRecord],
+    ) -> Result<()> {
+        let metrics = crate::fault::warp_metrics::assemble_metrics(
+            &self.scenario.name,
+            baseline,
+            degraded,
+            windows,
+        )?;
+        self.write_json_artifact(
+            crate::fault::warp_metrics::WARP_POWERLOSS_METRICS_ARTIFACT,
+            &metrics,
+        )
+    }
+
+    fn write_json_artifact(&self, name: &str, value: &impl serde::Serialize) -> Result<()> {
+        self.collector.write_text(
+            self.scenario.case_name,
+            name,
+            &serde_json::to_string_pretty(value)?,
+        )?;
+        Ok(())
+    }
+
+    fn read_warp_window(&self, name: &str) -> Result<crate::fault::warp_metrics::WarpWindow> {
+        let path = self.collector.case_dir(self.scenario.case_name).join(name);
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("read warp window {}", path.display()))?;
+        serde_json::from_str(&raw).with_context(|| format!("decode warp window {name}"))
+    }
+
     pub(super) fn verify_workload_targets(
         &self,
         target: &ProvenTarget,

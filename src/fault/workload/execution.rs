@@ -36,15 +36,28 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::sleep as async_sleep;
 
+pub(in crate::fault) struct WarpMixedRequest<'a> {
+    pub duration: Duration,
+    pub endpoint: &'a str,
+    pub bucket: &'a str,
+    pub access_key: &'a str,
+    pub secret_key: &'a str,
+    pub transcript_name: &'a str,
+}
+
 pub(in crate::fault) fn run_warp_mixed(
-    duration: Duration,
     collector: &ArtifactCollector,
     case_name: &str,
-    endpoint: &str,
-    bucket: &str,
-    access_key: &str,
-    secret_key: &str,
-) -> Result<()> {
+    request: WarpMixedRequest<'_>,
+) -> Result<crate::fault::warp_metrics::WarpWindow> {
+    let WarpMixedRequest {
+        duration,
+        endpoint,
+        bucket,
+        access_key,
+        secret_key,
+        transcript_name,
+    } = request;
     let host = endpoint
         .strip_prefix("http://")
         .or_else(|| endpoint.strip_prefix("https://"))
@@ -68,7 +81,7 @@ pub(in crate::fault) fn run_warp_mixed(
     );
     collector.write_text(
         case_name,
-        "warp-mixed.txt",
+        transcript_name,
         &format!(
             "$ {}\nexit: {:?}\nstdout:\n{}\nstderr:\n{}",
             display, output.code, output.stdout, output.stderr
@@ -79,7 +92,8 @@ pub(in crate::fault) fn run_warp_mixed(
         "warp mixed command failed with exit {:?}",
         output.code
     );
-    Ok(())
+    crate::fault::warp_metrics::parse_warp_stdout(&output.stdout)
+        .context("warp mixed report did not contain paired Average obj/s and Errors lines")
 }
 
 const PREFILL_VERIFY_ATTEMPTS: usize = 3;

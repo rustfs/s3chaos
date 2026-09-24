@@ -1,0 +1,38 @@
+# Warp power-loss metrics campaign.
+#
+# This suite runs the existing warp-under-chaos scenario (IOChaos EIO on one
+# volume plus a mixed S3 workload). It does not compare MinIO or Pigsty SILO
+# binaries; peer A/B stays an optional offline lab procedure.
+#
+# A successful run writes warp-powerloss-metrics.json with:
+# - baselineOpsPerSec: in-run Warp window before the fault
+# - degradedOpsPerSec: Warp window while the fault is active
+# - dropPercent: (baseline - degraded) / baseline * 100
+# - faultWindowErrorPercent: error percent of the degraded window
+# - nodeReadyLag: NOT_APPLICABLE (this campaign does not stop a node)
+# - ttbTo90PercentBaseline: REACHED {seconds} or NOT_REACHED after post-recovery
+#   10s windows. Three consecutive windows at or above 90% of baseline, covering
+#   at least 30s, are REACHED. NOT_REACHED does not fail the scenario.
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-fault-warp-powerloss
+budgets:
+  maxDuration: 2h
+  stopOnFirstFailure: true
+  continueOnSeverities: []
+  maxClientDisruptions: 1200
+  recoveryStableWindowSeconds: 60
+observability:
+  chaosDashboard: optional
+artifacts:
+  required: strict
+workloadProfiles:
+  performance:
+    objects: 2400
+    concurrency: 60
+scenarios:
+  - name: warp-under-chaos
+    faultDuration: 15m
+    percent: 20
+    workloadProfile: performance
