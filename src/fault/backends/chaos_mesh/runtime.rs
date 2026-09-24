@@ -412,11 +412,14 @@ impl ChaosGuard {
 /// A Schedule stays armed after its first tick. It has no AllInjected
 /// condition, so the experiment helper cannot describe it. Activation is
 /// "the schedule has fired at least once and has not been deleted".
+///
+/// Chaos Mesh JSON-encodes `ScheduleStatus.LastScheduleTime` as
+/// `status.time`, not `status.lastScheduleTime`.
 pub fn chaos_schedule_is_armed(raw: &str) -> Result<bool> {
     let value = serde_json::from_str::<Value>(raw).context("parse Chaos Mesh Schedule json")?;
     let deleting = value.pointer("/metadata/deletionTimestamp").is_some();
     let scheduled = value
-        .pointer("/status/lastScheduleTime")
+        .pointer("/status/time")
         .and_then(Value::as_str)
         .is_some_and(|timestamp| !timestamp.is_empty());
     Ok(!deleting && scheduled)

@@ -656,7 +656,7 @@ pub const FAULT_SCENARIO_CATALOG: &[FaultScenarioSpec] = &[
         target: "the highest-ordinal RustFS Pod, killed with gracePeriod 0 on a 15s Schedule for the fault window; mode one is pinned to that Pod so the port-forward target is not the victim",
         target_proof: &[
             "the Schedule manifest names exactly one RustFS Pod ordinal",
-            "activation waits until that Pod's UID disappears at least once and the Schedule has lastScheduleTime set",
+            "activation waits until that Pod's UID disappears at least once and the Schedule status field time is set",
             "the Schedule object remains armed for the workload; individual later kills are not counted",
         ],
         validation: "at least one kill of the selected Pod is observed before the workload, the Schedule stays armed while the mixed workload runs, every committed object remains readable and the workload meets the availability floor, and after the Schedule is deleted the Tenant returns Ready with committed objects intact",

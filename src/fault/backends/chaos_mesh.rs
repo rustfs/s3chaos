@@ -3465,17 +3465,21 @@ mod tests {
     }
 
     #[test]
-    fn schedule_armed_requires_last_schedule_time_and_no_deletion() {
+    fn schedule_armed_requires_status_time_and_no_deletion() {
         assert!(
-            chaos_schedule_is_armed(r#"{"status":{"lastScheduleTime":"2026-01-01T00:00:00Z"}}"#)
-                .expect("json")
+            chaos_schedule_is_armed(r#"{"status":{"time":"2026-09-24T00:00:00Z"}}"#).expect("json")
         );
         assert!(
             !chaos_schedule_is_armed(
-                r#"{"metadata":{"deletionTimestamp":"2026-01-01T00:00:01Z"},"status":{"lastScheduleTime":"2026-01-01T00:00:00Z"}}"#
+                r#"{"metadata":{"deletionTimestamp":"2026-01-01T00:00:01Z"},"status":{"time":"2026-09-24T00:00:00Z"}}"#
             )
             .expect("json")
         );
         assert!(!chaos_schedule_is_armed(r#"{"status":{}}"#).expect("json"));
+        assert!(!chaos_schedule_is_armed(r#"{"status":{"time":""}}"#).expect("json"));
+        assert!(
+            !chaos_schedule_is_armed(r#"{"status":{"lastScheduleTime":"2026-09-24T00:00:00Z"}}"#)
+                .expect("json")
+        );
     }
 }

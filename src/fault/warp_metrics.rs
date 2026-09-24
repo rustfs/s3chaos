@@ -18,7 +18,7 @@
 //! the fault is active, and short post-recovery windows. Peer binaries are
 //! not part of this artifact.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const WARP_POWERLOSS_METRICS_ARTIFACT: &str = "warp-powerloss-metrics.json";
@@ -75,59 +75,177 @@ pub(crate) struct WarpPowerLossMetrics {
     pub(crate) notes: Vec<String>,
 }
 
+struct WarpOpSection {
+    name: String,
+    rate: Option<f64>,
+    requests: Option<u64>,
+    errors: Option<u64>,
+}
+
 pub(crate) fn parse_warp_stdout(stdout: &str) -> Result<WarpWindow> {
-    let mut ops = Vec::new();
-    let mut errors = Vec::new();
+    let mut sections = Vec::new();
+    let mut current: Option<WarpOpSection> = None;
     for line in stdout.lines() {
         let line = line.trim();
-        if let Some(rate) = parse_average_obj_rate(line) {
-            ops.push(rate);
-        } else if let Some(percent) = parse_error_percent(line) {
-            errors.push(percent);
+        if let Some((name, requests)) = parse_report_header(line) {
+            finish_section(&mut sections, current.take())?;
+            current = Some(WarpOpSection {
+                name,
+                rate: None,
+                requests,
+                errors: None,
+            });
+            continue;
+        }
+        if let Some(rate) = parse_average_rate(line) {
+            let section = current
+                .as_mut()
+                .context("warp Average line appeared before a Report header")?;
+            if section.rate.is_none() {
+                section.rate = Some(rate);
+            }
+            continue;
+        }
+        if let Some(count) = parse_star_error_count(line)? {
+            let section = current
+                .as_mut()
+                .context("warp Errors line appeared before a Report header")?;
+            if section.errors.is_some() {
+                bail!(
+                    "warp report for {} contains more than one Errors count",
+                    section.name
+                );
+            }
+            section.errors = Some(count);
+            continue;
+        }
+        if let Some(count) = parse_skipped_error_count(line) {
+            bail!(
+                "warp skipped an operation that recorded {count} errors, so the report has no request total for that operation"
+            );
         }
     }
+    finish_section(&mut sections, current)?;
+
+    let has_named_op = sections.iter().any(|section| section.name != "Total");
+    let sections: Vec<_> = if has_named_op {
+        sections
+            .into_iter()
+            .filter(|section| section.name != "Total")
+            .collect()
+    } else {
+        sections
+    };
     ensure!(
-        !ops.is_empty() && ops.len() == errors.len(),
-        "warp report did not contain paired Average obj/s and Errors lines"
+        !sections.is_empty(),
+        "warp report did not contain an Average obj/s or ops/s line"
     );
-    let total_ops = ops.iter().sum::<f64>();
+
+    let mut total_ops = 0.0;
+    let mut total_errors = 0u64;
+    let mut total_requests = 0u64;
+    let mut missing_requests = false;
+    for section in &sections {
+        let rate = section.rate.with_context(|| {
+            format!(
+                "warp report for {} did not contain an Average obj/s or ops/s line",
+                section.name
+            )
+        })?;
+        ensure!(
+            rate.is_finite() && rate >= 0.0,
+            "warp report for {} has a non-finite or negative rate",
+            section.name
+        );
+        total_ops += rate;
+        let errors = section.errors.unwrap_or(0);
+        total_errors += errors;
+        match section.requests {
+            Some(requests) => total_requests += requests,
+            None => missing_requests = true,
+        }
+    }
     ensure!(
         total_ops.is_finite() && total_ops >= 0.0,
         "warp obj/s total is not a finite non-negative rate"
     );
-    let weighted_errors = ops
-        .iter()
-        .zip(errors.iter())
-        .map(|(rate, error)| rate * error)
-        .sum::<f64>();
-    let error_percent = if total_ops == 0.0 {
-        errors.iter().copied().sum::<f64>() / errors.len() as f64
+    let error_percent = if total_errors == 0 {
+        0.0
     } else {
-        weighted_errors / total_ops
+        ensure!(
+            !missing_requests && total_requests > 0,
+            "warp report recorded {total_errors} errors but no request totals; error percent is errors/requests"
+        );
+        let percent = (total_errors as f64) * 100.0 / (total_requests as f64);
+        ensure!(
+            percent.is_finite() && percent <= 100.0,
+            "warp error percent {percent} is above 100; error count {total_errors} exceeds request count {total_requests}"
+        );
+        percent
     };
-    ensure!(
-        error_percent.is_finite() && (0.0..=100.0).contains(&error_percent),
-        "warp error percent {error_percent} is outside 0..=100"
-    );
     Ok(WarpWindow {
         ops_per_sec: round2(total_ops),
         error_percent: round2(error_percent),
     })
 }
 
-fn parse_average_obj_rate(line: &str) -> Option<f64> {
+fn finish_section(sections: &mut Vec<WarpOpSection>, section: Option<WarpOpSection>) -> Result<()> {
+    let Some(section) = section else {
+        return Ok(());
+    };
+    ensure!(
+        section.rate.is_some(),
+        "warp report for {} did not contain an Average obj/s or ops/s line",
+        section.name
+    );
+    sections.push(section);
+    Ok(())
+}
+
+fn parse_report_header(line: &str) -> Option<(String, Option<u64>)> {
+    let rest = line.strip_prefix("Report:")?.trim();
+    let name_end = rest.find([' ', '.']).unwrap_or(rest.len());
+    let name = rest[..name_end].trim();
+    if name.is_empty() {
+        return None;
+    }
+    let requests = rest.find('(').and_then(|start| {
+        let after = rest.get(start + 1..)?;
+        let (count, _) = after.split_once(" reqs)")?;
+        count.trim().parse::<u64>().ok()
+    });
+    Some((name.to_string(), requests))
+}
+
+fn parse_average_rate(line: &str) -> Option<f64> {
     let rest = line.strip_prefix("* Average:")?.trim();
-    let (_, rate) = rest.rsplit_once(',')?;
-    let rate = rate.trim().strip_suffix("obj/s")?.trim();
-    let rate = rate.parse::<f64>().ok()?;
+    let head = rest
+        .split_once(" obj/s")
+        .or_else(|| rest.split_once(" ops/s"))?
+        .0;
+    let token = head.split_whitespace().next_back()?;
+    let token = token.trim_end_matches(',');
+    let rate = token.parse::<f64>().ok()?;
     rate.is_finite().then_some(rate)
 }
 
-fn parse_error_percent(line: &str) -> Option<f64> {
-    let rest = line.strip_prefix("* Errors:")?.trim();
-    let percent = rest.strip_suffix('%')?.trim();
-    let percent = percent.parse::<f64>().ok()?;
-    percent.is_finite().then_some(percent)
+fn parse_star_error_count(line: &str) -> Result<Option<u64>> {
+    let Some(rest) = line.strip_prefix("* Errors:") else {
+        return Ok(None);
+    };
+    let rest = rest.trim();
+    if rest.ends_with('%') {
+        bail!("warp Errors line {rest:?} is a percentage; Warp reports an integer error count");
+    }
+    // First-error text is `* <message>`. Ignore it when the message itself
+    // begins with "Errors:" so only a bare integer count is consumed.
+    Ok(rest.parse::<u64>().ok())
+}
+
+fn parse_skipped_error_count(line: &str) -> Option<u64> {
+    let rest = line.strip_prefix("Errors:")?.trim();
+    let count = rest.parse::<u64>().ok()?;
+    (count > 0).then_some(count)
 }
 
 pub(crate) fn drop_percent(baseline_ops: f64, degraded_ops: f64) -> Result<f64> {
@@ -280,20 +398,115 @@ fn round2(value: f64) -> f64 {
 mod tests {
     use super::*;
 
-    const REPORT: &str = r#"
-Operation: GET
-* Average: 1.00 MiB/s, 100.00 obj/s
-* Errors: 0.00%
-Operation: PUT
-* Average: 2.00 MiB/s, 50.00 obj/s
-* Errors: 10.00%
+    const ZERO_ERROR_DEFAULT: &str = r#"
+Report: GET. Concurrency: 20. Ran: 10s
+ * Average: 1.00 MiB/s, 100.00 obj/s
+
+──────────────────────────────────
+
+Report: PUT. Concurrency: 20. Ran: 10s
+ * Average: 2.00 MiB/s, 50.00 obj/s
+"#;
+
+    const ZERO_ERROR_DETAILS: &str = r#"
+Report: GET (1000 reqs). Ran Duration: 10s, starting 00:00:00 UTC
+ * Objects per request: 1. Size: 4096 bytes. Concurrency: 20.
+ * Average: 1.00 MiB/s, 100.00 obj/s (10s)
+
+Report: STAT (400 reqs). Ran Duration: 10s, starting 00:00:00 UTC
+ * Objects per request: 1. Concurrency: 20.
+ * Average: 10.00 ops/s (10s)
+"#;
+
+    const NONZERO_ERROR_DETAILS: &str = r#"
+Report: GET (1000 reqs). Ran Duration: 10s, starting 00:00:00 UTC
+ * Objects per request: 1. Size: 4096 bytes. Concurrency: 20.
+ * Average: 1.00 MiB/s, 100.00 obj/s (10s)
+Throughput by host:
+ * 10.0.0.1: Avg: 1.00 MiB/s, 100.00 obj/s (10s)
+Throughput, split into 2 x 1s:
+ * Fastest: 2.00 MiB/s, 200.00 obj/s (1s, starting 00:00:00 UTC)
+ * 50% Median: 1.00 MiB/s, 100.00 obj/s (1s, starting 00:00:01 UTC)
+ * Slowest: 0.50 MiB/s, 50.00 obj/s (1s, starting 00:00:02 UTC)
+
+──────────────────────────────────
+
+Report: PUT (200 reqs). Ran Duration: 10s, starting 00:00:00 UTC
+ * Objects per request: 1. Size: 4096 bytes. Concurrency: 20.
+ * Average: 2.00 MiB/s, 50.00 obj/s, 20 errors (10s)
+ * Errors: 20
+ - First Errors:
+ * Errors: 1 request failed
+ * put failed: connection reset
+
+──────────────────────────────────
+
+Report: Total (1200 reqs). Ran Duration: 10s, starting 00:00:00 UTC
+ * Average: 3.00 MiB/s, 150.00 obj/s, 20 errors (10s)
+ * Errors: 20
 "#;
 
     #[test]
-    fn warp_stdout_parser_weights_error_percent_by_ops() {
-        let window = parse_warp_stdout(REPORT).expect("report");
+    fn warp_stdout_zero_errors_omit_the_errors_line() {
+        let window = parse_warp_stdout(ZERO_ERROR_DEFAULT).expect("default report");
         assert_eq!(window.ops_per_sec, 150.0);
-        assert_eq!(window.error_percent, 3.33);
+        assert_eq!(window.error_percent, 0.0);
+
+        let details = parse_warp_stdout(ZERO_ERROR_DETAILS).expect("details report");
+        assert_eq!(details.ops_per_sec, 110.0);
+        assert_eq!(details.error_percent, 0.0);
+    }
+
+    #[test]
+    fn warp_stdout_error_percent_is_errors_over_requests() {
+        let window = parse_warp_stdout(NONZERO_ERROR_DETAILS).expect("details report");
+        assert_eq!(window.ops_per_sec, 150.0);
+        assert_eq!(window.error_percent, 1.67);
+    }
+
+    #[test]
+    fn warp_stdout_rejects_error_counts_without_request_totals() {
+        let report = r#"
+Report: PUT. Concurrency: 20. Ran: 10s
+ * Average: 2.00 MiB/s, 50.00 obj/s
+ * Errors: 20
+"#;
+        let error = parse_warp_stdout(report).expect_err("missing requests");
+        assert!(error.to_string().contains("request"));
+    }
+
+    #[test]
+    fn warp_stdout_rejects_more_errors_than_requests() {
+        let report = r#"
+Report: PUT (10 reqs). Ran Duration: 10s, starting 00:00:00 UTC
+ * Average: 2.00 MiB/s, 50.00 obj/s, 11 errors (10s)
+ * Errors: 11
+"#;
+        let error = parse_warp_stdout(report).expect_err("errors exceed requests");
+        assert!(error.to_string().contains("above 100"));
+    }
+
+    #[test]
+    fn warp_stdout_rejects_percentage_error_lines() {
+        let report = r#"
+Report: PUT (200 reqs). Ran Duration: 10s, starting 00:00:00 UTC
+ * Average: 2.00 MiB/s, 50.00 obj/s (10s)
+ * Errors: 10.00%
+"#;
+        let error = parse_warp_stdout(report).expect_err("percent");
+        assert!(error.to_string().contains("integer"));
+    }
+
+    #[test]
+    fn warp_stdout_rejects_skipped_operations_that_recorded_errors() {
+        let report = r#"
+Skipping DELETE too few samples. Longer benchmark run required for reliable results.
+Errors: 4
+Report: GET (1000 reqs). Ran Duration: 10s, starting 00:00:00 UTC
+ * Average: 1.00 MiB/s, 100.00 obj/s (10s)
+"#;
+        let error = parse_warp_stdout(report).expect_err("skipped errors");
+        assert!(error.to_string().contains("skipped"));
     }
 
     #[test]

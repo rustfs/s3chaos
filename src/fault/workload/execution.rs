@@ -73,6 +73,10 @@ pub(in crate::fault) fn run_warp_mixed(
         "--obj.size=4KiB".to_string(),
         "--tls=false".to_string(),
         "--autoterm".to_string(),
+        // Details only change the text report. Each operation then includes
+        // "(N reqs)", which is the denominator for error percent. Warp still
+        // omits the Errors line when the count is zero.
+        "--analyze.v".to_string(),
     ]);
     let output = command.run()?;
     let display = command.display().replace(
@@ -93,7 +97,7 @@ pub(in crate::fault) fn run_warp_mixed(
         output.code
     );
     crate::fault::warp_metrics::parse_warp_stdout(&output.stdout)
-        .context("warp mixed report did not contain paired Average obj/s and Errors lines")
+        .context("parse warp mixed stdout report")
 }
 
 const PREFILL_VERIFY_ATTEMPTS: usize = 3;
