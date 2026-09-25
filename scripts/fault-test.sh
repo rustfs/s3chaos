@@ -668,7 +668,7 @@ preflight() {
   ready_nodes="$(kubectl_cluster get nodes -o json | jq -r '[.items[]
     | select(.spec.unschedulable != true)
     | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length')"
-  min_nodes="${RUSTFS_FAULT_TEST_MIN_NODES:-4}"
+  min_nodes="$(resolve_min_ready_nodes)"
   [[ "$min_nodes" =~ ^[0-9]+$ && "$min_nodes" -ge 1 ]] || die "RUSTFS_FAULT_TEST_MIN_NODES must be a positive integer, got $min_nodes"
   [[ "$ready_nodes" -ge "$min_nodes" ]] || die "at least $min_nodes schedulable Ready node(s) are required, found $ready_nodes"
   disk_pressure_nodes="$(kubectl_cluster get nodes -o json | jq -r '[.items[]
@@ -727,9 +727,87 @@ preflight_cleanup() {
   require_namespace_ownership
 }
 
+# Four nodes when the tenant must spread. One node is enough when pods may
+# colocate: a single-node k3s/OrbStack/kind cluster otherwise cannot run any
+# scenario unless the operator sets RUSTFS_FAULT_TEST_MIN_NODES=1 by hand.
+resolve_min_ready_nodes() {
+  if [[ -n "${RUSTFS_FAULT_TEST_MIN_NODES:-}" ]]; then
+    printf '%s\n' "$RUSTFS_FAULT_TEST_MIN_NODES"
+    return 0
+  fi
+  local spread
+  spread="$(printf '%s' "${RUSTFS_FAULT_TEST_TENANT_SPREAD_ACROSS_HOSTS:-true}" | tr '[:upper:]' '[:lower:]')"
+  case "$spread" in
+    1|true|yes) printf '4\n' ;;
+    0|false|no) printf '1\n' ;;
+    *) die "RUSTFS_FAULT_TEST_TENANT_SPREAD_ACROSS_HOSTS must be a boolean: 1/0, true/false, or yes/no" ;;
+  esac
+}
+
+CHAOS_DELETE_WAIT_SECONDS="${RUSTFS_FAULT_TEST_CHAOS_DELETE_WAIT_SECONDS:-40}"
+
 cleanup_managed_chaos() {
-  kubectl_ns "$CHAOS_NAMESPACE" delete iochaos,podchaos,networkchaos,stresschaos \
-    -l "$MANAGER_SELECTOR" --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
+  local kind
+  for kind in schedule iochaos podchaos networkchaos stresschaos; do
+    kubectl_ns "$CHAOS_NAMESPACE" delete "$kind" -l "$MANAGER_SELECTOR" \
+      --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
+  done
+  if [[ -n "${FAULT_NAMESPACE:-}" ]]; then
+    kubectl_ns "$FAULT_NAMESPACE" delete podiochaos --all \
+      --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
+  fi
+  local deadline=$((SECONDS + CHAOS_DELETE_WAIT_SECONDS))
+  while (( SECONDS < deadline )); do
+    if ! chaos_leftovers_remain; then
+      return 0
+    fi
+    sleep 2
+  done
+  clear_stuck_chaos_finalizers
+  for kind in schedule iochaos podchaos networkchaos stresschaos; do
+    kubectl_ns "$CHAOS_NAMESPACE" delete "$kind" -l "$MANAGER_SELECTOR" \
+      --ignore-not-found=true --timeout="${CHAOS_DELETE_WAIT_SECONDS}s" >/dev/null 2>&1 || true
+  done
+  if [[ -n "${FAULT_NAMESPACE:-}" ]]; then
+    kubectl_ns "$FAULT_NAMESPACE" delete podiochaos --all \
+      --ignore-not-found=true --timeout="${CHAOS_DELETE_WAIT_SECONDS}s" >/dev/null 2>&1 || true
+  fi
+}
+
+chaos_leftovers_remain() {
+  if kubectl_ns "$CHAOS_NAMESPACE" get schedule,iochaos,podchaos,networkchaos,stresschaos \
+    -l "$MANAGER_SELECTOR" -o name 2>/dev/null | grep -q .; then
+    return 0
+  fi
+  if [[ -n "${FAULT_NAMESPACE:-}" ]]; then
+    kubectl_ns "$FAULT_NAMESPACE" get podiochaos -o name 2>/dev/null | grep -q .
+    return
+  fi
+  return 1
+}
+
+clear_stuck_chaos_finalizers() {
+  local kind names name
+  for kind in schedule iochaos podchaos networkchaos stresschaos; do
+    names="$(kubectl_ns "$CHAOS_NAMESPACE" get "$kind" -l "$MANAGER_SELECTOR" \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      echo "warning: clearing finalizers on stuck ${kind}/${name} in ${CHAOS_NAMESPACE}" >&2
+      kubectl_ns "$CHAOS_NAMESPACE" patch "$kind" "$name" --type=merge \
+        -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+    done <<<"$names"
+  done
+  if [[ -n "${FAULT_NAMESPACE:-}" ]]; then
+    names="$(kubectl_ns "$FAULT_NAMESPACE" get podiochaos \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      echo "warning: clearing finalizers on stuck podiochaos/${name} in ${FAULT_NAMESPACE}" >&2
+      kubectl_ns "$FAULT_NAMESPACE" patch podiochaos "$name" --type=merge \
+        -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+    done <<<"$names"
+  fi
 }
 
 capture_process_group() {

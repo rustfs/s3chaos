@@ -44,6 +44,8 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -149,7 +151,8 @@ fn cleanup_fault_backend(
             // chaos CR leaked by a prior run or a prior suite attempt of a
             // different kind would otherwise stay active during this attempt and
             // be misattributed to (or mask) the fault under test.
-            chaos_mesh::cleanup_managed_chaos(&config.cluster, &config.chaos_namespace)
+            chaos_mesh::cleanup_managed_chaos(&config.cluster, &config.chaos_namespace)?;
+            chaos_mesh::cleanup_podiochaos(&config.cluster, &config.cluster.test_namespace)
         }
         FaultBackend::DeviceMapper => Ok(()),
         FaultBackend::PlannedReliabilityWorkflow => Ok(()),
@@ -180,11 +183,19 @@ struct PodKillFaultHandle {
     config: Box<ClusterTestConfig>,
 }
 
+struct PodKillController {
+    stop: Arc<AtomicBool>,
+    kills: Arc<AtomicU64>,
+    error: Arc<Mutex<Option<String>>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
 struct PodKillStormFaultHandle {
     guard: Box<ChaosGuard>,
     before_pods: Vec<PodIdentity>,
     victim: PodIdentity,
     config: Box<ClusterTestConfig>,
+    controller: Mutex<Option<PodKillController>>,
 }
 
 struct DmFlakeyFaultHandle {
@@ -317,6 +328,7 @@ fn apply_chaos_mesh_fault_backend(request: &FaultApplyRequest<'_>) -> Result<App
             before_pods,
             victim,
             config: Box::new(request.config.cluster.clone()),
+            controller: Mutex::new(None),
         })),
     }
 }
@@ -414,8 +426,12 @@ impl FaultFailureArtifactSource for PodKillStormFaultHandle {
 impl FaultLifecyclePort for PodKillStormFaultHandle {
     fn wait_active(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
+        let started = Instant::now();
         let mut last_status;
         loop {
+            if self.controller_running() {
+                return self.wait_for_controller_kill(deadline);
+            }
             let armed = match self.guard.json() {
                 Ok(status) => {
                     let armed = chaos_mesh::chaos_schedule_is_armed(&status)?;
@@ -437,6 +453,10 @@ impl FaultLifecyclePort for PodKillStormFaultHandle {
             if armed && victim_gone {
                 return Ok(());
             }
+            if chaos_mesh::pod_kill_storm_needs_controller_loop(started.elapsed(), armed) {
+                self.start_controller_loop()?;
+                return self.wait_for_controller_kill(deadline);
+            }
             if Instant::now() >= deadline {
                 bail!(
                     "timed out waiting for schedule/{name} to kill {} after {timeout:?}\nlast status:\n{last_status}",
@@ -449,6 +469,22 @@ impl FaultLifecyclePort for PodKillStormFaultHandle {
     }
 
     fn ensure_active(&self, stage: &str) -> Result<()> {
+        if self.controller_running() {
+            let snapshot = self.controller_snapshot();
+            if let Some(error) = snapshot.error {
+                bail!("pod-restart-storm controller loop failed at {stage}: {error}");
+            }
+            ensure!(
+                snapshot.kills >= 1,
+                "pod-restart-storm controller loop has not killed {} at {stage}",
+                self.victim.name
+            );
+            ensure!(
+                !snapshot.stopped,
+                "pod-restart-storm controller loop stopped before {stage}"
+            );
+            return Ok(());
+        }
         let status = self.guard.json()?;
         ensure!(
             chaos_mesh::chaos_schedule_is_armed(&status)?,
@@ -459,6 +495,7 @@ impl FaultLifecyclePort for PodKillStormFaultHandle {
     }
 
     fn delete(&mut self, timeout: Duration) -> Result<()> {
+        stop_pod_kill_controller(&self.controller);
         self.guard.delete(timeout)?;
         wait_for_rustfs_pod_replacement(&self.config, &self.before_pods, timeout)
     }
@@ -469,6 +506,196 @@ impl FaultLifecyclePort for PodKillStormFaultHandle {
 
     fn failure_artifacts(&self) -> Option<&dyn FaultFailureArtifactSource> {
         Some(self)
+    }
+}
+
+struct ControllerSnapshot {
+    kills: u64,
+    stopped: bool,
+    error: Option<String>,
+}
+
+impl PodKillStormFaultHandle {
+    fn controller_running(&self) -> bool {
+        self.controller
+            .lock()
+            .expect("pod-restart-storm controller lock")
+            .is_some()
+    }
+
+    fn controller_snapshot(&self) -> ControllerSnapshot {
+        let slot = self
+            .controller
+            .lock()
+            .expect("pod-restart-storm controller lock");
+        let Some(controller) = slot.as_ref() else {
+            return ControllerSnapshot {
+                kills: 0,
+                stopped: true,
+                error: None,
+            };
+        };
+        ControllerSnapshot {
+            kills: controller.kills.load(Ordering::SeqCst),
+            stopped: controller.stop.load(Ordering::SeqCst),
+            error: controller
+                .error
+                .lock()
+                .expect("pod-restart-storm error lock")
+                .clone(),
+        }
+    }
+
+    fn start_controller_loop(&self) -> Result<()> {
+        let mut slot = self
+            .controller
+            .lock()
+            .expect("pod-restart-storm controller lock");
+        if slot.is_some() {
+            return Ok(());
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let kills = Arc::new(AtomicU64::new(0));
+        let error = Arc::new(Mutex::new(None));
+        let config = (*self.config).clone();
+        let victim = self.victim.name.clone();
+        let chaos_namespace = self.guard.namespace().to_string();
+        eprintln!(
+            "warning: pod-restart-storm schedule/{} did not set status.time within {}s; driving pinned pod-kill of {victim} from the harness loop",
+            self.guard.name(),
+            chaos_mesh::POD_KILL_STORM_SCHEDULE_GRACE.as_secs(),
+        );
+        let stop_thread = Arc::clone(&stop);
+        let kills_thread = Arc::clone(&kills);
+        let error_thread = Arc::clone(&error);
+        let handle = std::thread::spawn(move || {
+            if let Err(error) =
+                drive_pinned_pod_kills(config, chaos_namespace, victim, stop_thread, kills_thread)
+            {
+                *error_thread.lock().expect("pod-restart-storm error lock") =
+                    Some(format!("{error:#}"));
+            }
+        });
+        *slot = Some(PodKillController {
+            stop,
+            kills,
+            error,
+            handle: Some(handle),
+        });
+        Ok(())
+    }
+
+    fn wait_for_controller_kill(&self, deadline: Instant) -> Result<()> {
+        loop {
+            let snapshot = self.controller_snapshot();
+            if let Some(error) = snapshot.error {
+                bail!("pod-restart-storm controller loop failed: {error}");
+            }
+            if snapshot.kills >= 1 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "timed out waiting for the pod-restart-storm controller loop to kill {}",
+                    self.victim.name
+                );
+            }
+            sleep(Duration::from_secs(1));
+        }
+    }
+}
+
+impl Drop for PodKillStormFaultHandle {
+    fn drop(&mut self) {
+        stop_pod_kill_controller(&self.controller);
+    }
+}
+
+fn stop_pod_kill_controller(controller: &Mutex<Option<PodKillController>>) {
+    let taken = controller
+        .lock()
+        .expect("pod-restart-storm controller lock")
+        .take();
+    if let Some(controller) = taken {
+        controller.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = controller.handle {
+            let _ = handle.join();
+        }
+    }
+}
+
+const POD_KILL_STORM_INTERVAL: Duration = Duration::from_secs(15);
+
+fn drive_pinned_pod_kills(
+    config: ClusterTestConfig,
+    chaos_namespace: String,
+    victim: String,
+    stop: Arc<AtomicBool>,
+    kills: Arc<AtomicU64>,
+) -> Result<()> {
+    let mut generation = 0u32;
+    while !stop.load(Ordering::SeqCst) {
+        generation = generation.saturating_add(1);
+        let previous = wait_for_named_pod(&config, &victim, &stop, Duration::from_secs(30))?;
+        let Some(previous) = previous else {
+            return Ok(());
+        };
+        let spec = chaos_mesh::PodChaosSpec::kill_named_pod(
+            &config,
+            &chaos_namespace,
+            format!("loop{generation:04}"),
+            "pod-restart-storm",
+            &victim,
+        )?;
+        let mut guard = chaos_mesh::apply_podchaos(&config, &spec)?;
+        let kill_deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                guard.delete(Duration::from_secs(20))?;
+                return Ok(());
+            }
+            let current = rustfs_pod_identities(&config)?;
+            if pod_deletion_observed(std::slice::from_ref(&previous), &current) {
+                kills.fetch_add(1, Ordering::SeqCst);
+                break;
+            }
+            if Instant::now() >= kill_deadline {
+                guard.delete(Duration::from_secs(20))?;
+                bail!("controller pod-kill did not replace {victim} within 30s");
+            }
+            sleep(Duration::from_secs(1));
+        }
+        guard.delete(Duration::from_secs(20))?;
+        let sleep_until = Instant::now() + POD_KILL_STORM_INTERVAL;
+        while Instant::now() < sleep_until {
+            if stop.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            sleep(Duration::from_secs(1));
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_named_pod(
+    config: &ClusterTestConfig,
+    victim: &str,
+    stop: &AtomicBool,
+    timeout: Duration,
+) -> Result<Option<PodIdentity>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let pods = rustfs_pod_identities(config)?;
+        if let Some(pod) = pods.into_iter().find(|pod| pod.name == victim) {
+            return Ok(Some(pod));
+        }
+        if Instant::now() >= deadline {
+            bail!("controller pod-kill could not find {victim} within {timeout:?}");
+        }
+        sleep(Duration::from_secs(1));
     }
 }
 

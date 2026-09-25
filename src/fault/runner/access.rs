@@ -247,24 +247,64 @@ pub(crate) async fn ensure_s3_access(
     config: &ClusterTestConfig,
     endpoint: &str,
 ) -> Result<()> {
-    if let Some(guard) = port_forward {
-        if guard.ensure_running().is_err() {
-            let local_port = endpoint
-                .rsplit_once(':')
-                .and_then(|(_, port)| port.parse::<u16>().ok())
-                .context("parse local S3 port-forward endpoint")?;
-            let spec = PortForwardSpec::tenant_io_with_local_port(
-                &config.test_namespace,
-                &config.tenant_name,
-                local_port,
-            );
-            let kubectl = Kubectl::new(config);
-            *guard = spec.start_with_temp_log(&kubectl)?;
-        }
-        return wait_for_tenant_s3(guard, endpoint, config.timeout).await;
+    if port_forward.is_none() {
+        return wait_for_s3_endpoint(endpoint, config.timeout).await;
     }
 
-    wait_for_s3_endpoint(endpoint, config.timeout).await
+    let local_port = endpoint
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .context("parse local S3 port-forward endpoint")?;
+    let namespace = config.test_namespace.clone();
+    let tenant = config.tenant_name.clone();
+    let kubectl = Kubectl::new(config);
+    maintain_forwarded_s3_access(port_forward, endpoint, config.timeout, || {
+        PortForwardSpec::tenant_io_with_local_port(&namespace, &tenant, local_port)
+            .start_with_temp_log(&kubectl)
+    })
+    .await
+}
+
+/// Keep an S3 port-forward up until the endpoint answers or `timeout` elapses.
+///
+/// A forward that is already dead, or that dies while the endpoint is still
+/// coming up (the backing Pod was killed, or the sandbox disappeared after a
+/// rolling restart), is replaced and the wait continues. The previous
+/// behavior restarted only when the process was dead on entry, then treated a
+/// mid-wait exit as a terminal [`PortForwardLost`].
+pub(crate) async fn maintain_forwarded_s3_access(
+    port_forward: &mut Option<PortForwardGuard>,
+    endpoint: &str,
+    timeout: Duration,
+    mut start_forward: impl FnMut() -> Result<PortForwardGuard>,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("timed out waiting for S3 endpoint {endpoint} after port-forward restarts");
+        }
+        let needs_start = match port_forward.as_mut() {
+            None => true,
+            Some(guard) => guard.ensure_running().is_err(),
+        };
+        if needs_start {
+            // Drop the dead child before the replacement binds the same port.
+            drop(port_forward.take());
+            *port_forward = Some(start_forward()?);
+        }
+        let Some(guard) = port_forward.as_mut() else {
+            bail!("S3 port-forward was not restarted");
+        };
+        match wait_for_tenant_s3(guard, endpoint, remaining).await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.is::<PortForwardLost>() => {
+                drop(port_forward.take());
+                async_sleep(Duration::from_millis(200)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Context marking an error as the S3 port-forward process having exited.
@@ -423,6 +463,56 @@ mod tests {
             error
                 .to_string()
                 .contains("did not accept a TCP connection within"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_forward_is_replaced_and_the_wait_continues() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.expect("stream");
+                let _ = std::io::Write::write_all(
+                    &mut stream,
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+        });
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let mut slot = Some(forward_running(0));
+        // sleep 0 can still be unreaped when the wait starts; give it time to exit
+        // so the assertion is about a forward that is already dead.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let restarts = std::sync::atomic::AtomicUsize::new(0);
+        maintain_forwarded_s3_access(&mut slot, &endpoint, Duration::from_secs(8), || {
+            restarts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(forward_running(30))
+        })
+        .await
+        .expect("a replacement forward reaches the endpoint");
+        assert!(
+            restarts.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the dead forward must be replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_forward_that_never_answers_does_not_restart() {
+        let mut slot = Some(forward_running(30));
+        let endpoint = format!("http://127.0.0.1:{}", released_port());
+        let restarts = std::sync::atomic::AtomicUsize::new(0);
+        let error =
+            maintain_forwarded_s3_access(&mut slot, &endpoint, Duration::from_secs(1), || {
+                restarts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(forward_running(30))
+            })
+            .await
+            .expect_err("nothing serves S3");
+        assert_eq!(restarts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            format!("{error:#}").contains("timed out waiting for S3 endpoint"),
             "{error:#}"
         );
     }

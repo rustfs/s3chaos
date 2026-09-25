@@ -1,0 +1,196 @@
+name: Release gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      rustfs_version:
+        description: RustFS release tag
+        required: true
+        type: string
+      rustfs_prev_version:
+        description: Previous tag for upgrade and warp regression
+        required: false
+        type: string
+        default: ""
+      tier:
+        description: smoke, standard, or full
+        required: true
+        type: choice
+        options:
+          - smoke
+          - standard
+          - full
+        default: smoke
+      dry_run:
+        description: Plan and artifact checks only
+        required: true
+        type: boolean
+        default: true
+      run_kind:
+        description: Boot an amd64 kind cluster and install Chaos Mesh before the gate
+        required: true
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [rustfs-release]
+  schedule:
+    - cron: "17 6 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Resolve release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      prev: ${{ steps.meta.outputs.prev }}
+      tier: ${{ steps.meta.outputs.tier }}
+      dry_run: ${{ steps.meta.outputs.dry_run }}
+      run_kind: ${{ steps.meta.outputs.run_kind }}
+    steps:
+      - id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.rustfs_version }}
+          INPUT_PREV: ${{ github.event.inputs.rustfs_prev_version }}
+          INPUT_TIER: ${{ github.event.inputs.tier }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          INPUT_KIND: ${{ github.event.inputs.run_kind }}
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+          DISPATCH_PREV: ${{ github.event.client_payload.prev_version }}
+          DISPATCH_TIER: ${{ github.event.client_payload.tier }}
+          DISPATCH_DRY_RUN: ${{ github.event.client_payload.dry_run }}
+        run: |
+          set -euo pipefail
+          version=""
+          prev=""
+          tier="smoke"
+          dry_run="true"
+          run_kind="false"
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              version="$INPUT_VERSION"
+              prev="$INPUT_PREV"
+              tier="${INPUT_TIER:-smoke}"
+              dry_run="${INPUT_DRY_RUN:-true}"
+              run_kind="${INPUT_KIND:-false}"
+              ;;
+            repository_dispatch)
+              version="$DISPATCH_VERSION"
+              prev="$DISPATCH_PREV"
+              tier="${DISPATCH_TIER:-smoke}"
+              dry_run="${DISPATCH_DRY_RUN:-true}"
+              ;;
+            *)
+              version="$(gh api repos/rustfs/rustfs/releases/latest --jq .tag_name)"
+              tier="smoke"
+              dry_run="true"
+              ;;
+          esac
+          test -n "$version"
+          case "$version" in
+            *[!A-Za-z0-9._+-]*) echo "invalid rustfs version" >&2; exit 1 ;;
+          esac
+          if [[ -n "$prev" ]]; then
+            case "$prev" in
+              *[!A-Za-z0-9._+-]*) echo "invalid previous version" >&2; exit 1 ;;
+            esac
+          fi
+          case "$tier" in
+            smoke|standard|full) ;;
+            *) echo "invalid tier" >&2; exit 1 ;;
+          esac
+          case "$dry_run" in
+            true|false) ;;
+            *) echo "invalid dry_run" >&2; exit 1 ;;
+          esac
+          case "$run_kind" in
+            true|false) ;;
+            *) echo "invalid run_kind" >&2; exit 1 ;;
+          esac
+          {
+            echo "version=$version"
+            echo "prev=$prev"
+            echo "tier=$tier"
+            echo "dry_run=$dry_run"
+            echo "run_kind=$run_kind"
+          } >> "$GITHUB_OUTPUT"
+
+  gate:
+    name: Artifact checks and tier plan
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release gate
+        env:
+          RUSTFS_VERSION: ${{ needs.resolve.outputs.version }}
+          RUSTFS_PREV_VERSION: ${{ needs.resolve.outputs.prev }}
+          RELEASE_GATE_TIER: ${{ needs.resolve.outputs.tier }}
+          RELEASE_GATE_DRY_RUN: ${{ needs.resolve.outputs.dry_run }}
+          RELEASE_GATE_FETCH: "1"
+        run: make release-gate
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-gate-${{ needs.resolve.outputs.version }}
+          path: target/release-gate/**
+
+  kind-amd64:
+    name: kind amd64 Chaos Mesh
+    needs: resolve
+    if: needs.resolve.outputs.run_kind == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+
+      - name: Install Chaos Mesh
+        run: |
+          helm repo add chaos-mesh https://charts.chaos-mesh.org
+          helm upgrade --install chaos-mesh chaos-mesh/chaos-mesh \
+            -n chaos-mesh --create-namespace --version 2.8.3 \
+            --set chaosDaemon.runtime=containerd \
+            --set chaosDaemon.socketPath=/run/containerd/containerd.sock \
+            --set dashboard.create=false \
+            --wait --timeout 10m
+
+      - name: Run the selected tier
+        env:
+          RUSTFS_VERSION: ${{ needs.resolve.outputs.version }}
+          RUSTFS_PREV_VERSION: ${{ needs.resolve.outputs.prev }}
+          RELEASE_GATE_TIER: ${{ needs.resolve.outputs.tier }}
+          RELEASE_GATE_FETCH: "1"
+          RUSTFS_FAULT_TEST_TENANT_SPREAD_ACROSS_HOSTS: "false"
+          RUSTFS_RELEASE_GATE_ARCH: x86_64
+          RUSTFS_RELEASE_GATE_TODA: "1"
+        run: |
+          set -euo pipefail
+          if kubectl get crd tenants.rustfs.com >/dev/null 2>&1; then
+            RELEASE_GATE_DRY_RUN=0 RUSTFS_RELEASE_GATE_HAS_CLUSTER=1 make release-gate
+          else
+            echo "RustFS Tenant CRD is not installed on this kind cluster."
+            echo "IOChaos is possible here because the runner is amd64; install the operator and re-run with RELEASE_GATE_DRY_RUN=0."
+            RELEASE_GATE_DRY_RUN=1 make release-gate
+          fi
+
+      - name: Upload kind report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-gate-kind-${{ needs.resolve.outputs.version }}
+          path: target/release-gate/**

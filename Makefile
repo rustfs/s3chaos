@@ -12,7 +12,11 @@ FAULT_SCRIPT := $(CURDIR)/scripts/fault-test.sh
 PROTOCOL_SCRIPT := $(CURDIR)/scripts/protocol-test.sh
 PROTOCOL_COMPAT_SCRIPT := $(CURDIR)/scripts/protocol-compatibility.sh
 
-.PHONY: check fmt fmt-check clippy test fault-check fault-list fault-qualify-list fault-qualify fault-qualify-analyze fault-preflight fault-run fault-chaos-plan fault-chaos-run fault-dm-run fault-suite-template fault-suite-validate fault-suite-plan fault-suite-run fault-console-json fault-console-serve fault-dashboard-install fault-dashboard-port-forward fault-cleanup protocol-check protocol-list protocol-compatibility-mint protocol-mint-cleanup protocol-suite-template protocol-suite-validate protocol-suite-plan protocol-suite-run protocol-cleanup protocol-validate-artifacts protocol-validate-mint-artifacts protocol-validate-mint-session
+.PHONY: check fmt fmt-check clippy test fault-check fault-list fault-qualify-list fault-qualify fault-qualify-analyze fault-preflight fault-run fault-chaos-plan fault-chaos-run fault-dm-run fault-suite-template fault-suite-validate fault-suite-plan fault-suite-run fault-console-json fault-console-serve fault-dashboard-install fault-dashboard-port-forward fault-cleanup release-gate protocol-check protocol-list protocol-compatibility-mint protocol-mint-cleanup protocol-suite-template protocol-suite-validate protocol-suite-plan protocol-suite-run protocol-cleanup protocol-validate-artifacts protocol-validate-mint-artifacts protocol-validate-mint-session
+
+RELEASE_GATE_TIER ?= standard
+RELEASE_GATE_DRY_RUN ?= 0
+RELEASE_GATE_FETCH ?= 1
 
 check: fmt-check clippy test
 
@@ -93,6 +97,23 @@ fault-dashboard-port-forward:
 
 fault-cleanup:
 	+bash $(FAULT_SCRIPT) cleanup
+
+# Full RustFS release gate. Example:
+#   make release-gate RUSTFS_VERSION=1.0.1-preview.11 RUSTFS_PREV_VERSION=1.0.0 RELEASE_GATE_TIER=full
+# Dry-run plans every case and still verifies artifacts when RELEASE_GATE_FETCH=1:
+#   make release-gate RUSTFS_VERSION=1.0.1-preview.11 RELEASE_GATE_DRY_RUN=1 RELEASE_GATE_TIER=full
+release-gate:
+	@test -n "$(RUSTFS_VERSION)" || (echo "RUSTFS_VERSION is required, for example: make release-gate RUSTFS_VERSION=1.0.1-preview.11" >&2; exit 1)
+	bash -n $(CURDIR)/scripts/release-gate-upgrade.sh
+	bash -n $(CURDIR)/scripts/release-gate-host-disk.sh
+	+RUSTFS_VERSION="$(RUSTFS_VERSION)" \
+		RUSTFS_PREV_VERSION="$(RUSTFS_PREV_VERSION)" \
+		RUSTFS_IMAGE="$(RUSTFS_IMAGE)" \
+		RUSTFS_PREV_IMAGE="$(RUSTFS_PREV_IMAGE)" \
+		RELEASE_GATE_TIER="$(RELEASE_GATE_TIER)" \
+		RELEASE_GATE_DRY_RUN="$(RELEASE_GATE_DRY_RUN)" \
+		RELEASE_GATE_FETCH="$(RELEASE_GATE_FETCH)" \
+		cargo run --quiet --manifest-path Cargo.toml --bin s3chaos -- release-gate
 
 protocol-check: check
 	bash -n $(PROTOCOL_SCRIPT)
