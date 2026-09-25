@@ -73,10 +73,29 @@ impl FaultRun<'_> {
             .prepare_quiet_mutation(&prepared.s3, staged_uploads)
             .await?;
         let result = async {
+            let calibration_pods = if self.config.ack_calibration.is_some() {
+                Some(self.observe_ack_calibration(&prepared.endpoint).await?)
+            } else {
+                None
+            };
             let target = self
                 .deadline
                 .run(self.prove_target(&prepared.endpoint, preflight_phases))
                 .await?;
+            if let Some(pods) = calibration_pods {
+                ensure!(
+                    pods.len() == target.pods_before.len()
+                        && pods
+                            .iter()
+                            .all(|pod| target.target_proof.resolved_pods.iter().any(
+                                |proven| proven.name == pod.name
+                                    && proven.uid == pod.uid
+                                    && proven.rustfs_container_id.as_deref()
+                                        == Some(pod.container_id.as_str())
+                            )),
+                    "calibration Pod identities changed before target proof"
+                );
+            }
             self.deadline.check()?;
             let prepared_fault = match self.prepare_ack_fault(&target) {
                 Ok(prepared) => prepared,
@@ -123,6 +142,86 @@ impl FaultRun<'_> {
             cleanup.disarm();
         }
         result
+    }
+
+    async fn observe_ack_calibration(
+        &self,
+        endpoint: &str,
+    ) -> Result<Vec<crate::fault::acknowledged_mutation::AckCalibrationPod>> {
+        use crate::fault::acknowledged_mutation::{
+            ACK_CALIBRATION_ARTIFACT, AckBucketMode, AckCalibrationEvidence, calibration_pod,
+        };
+        let mode = self
+            .config
+            .ack_calibration
+            .context("calibration mode missing")?;
+        crate::fault::acknowledged_mutation::require_calibration_image(
+            &self.config.cluster.rustfs_image,
+        )?;
+        let kubectl = crate::framework::kubectl::Kubectl::new(&self.config.cluster)
+            .namespaced(&self.config.cluster.test_namespace);
+        let selector = format!("rustfs.tenant={}", self.config.cluster.tenant_name);
+        let output = kubectl
+            .command(["get", "pods", "-l", &selector, "-o", "json"])
+            .run_bounded(self.deadline.bounded_timeout(self.config.request_timeout)?)
+            .await?;
+        ensure!(output.code == Some(0), "cannot observe calibration Pods");
+        let raw: serde_json::Value = serde_json::from_str(&output.stdout)?;
+        let pods = raw["items"]
+            .as_array()
+            .context("calibration Pod list is missing")?
+            .iter()
+            .map(|pod| calibration_pod(pod, mode, &self.config.cluster.rustfs_image))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(!pods.is_empty(), "calibration requires observed Pods");
+        ensure!(
+            pods.iter().all(|pod| pod.image_id == pods[0].image_id),
+            "calibration requires a homogeneous RustFS image digest"
+        );
+        let (access_key, secret_key) = crate::framework::resources::test_credentials();
+        let admin = crate::rustfs::RustfsAdminTransport::new(
+            endpoint,
+            "us-east-1",
+            access_key,
+            secret_key,
+            None,
+            "ack-calibration",
+        )?;
+        let response = self
+            .deadline
+            .run(admin.request(
+                http::Method::GET,
+                &format!("/rustfs/admin/v3/bucket-durability/{}", self.context.bucket),
+                &[],
+                Vec::new(),
+                None,
+            ))
+            .await?;
+        ensure!(
+            response.status == 200,
+            "calibration bucket durability GET failed: {}",
+            response.status
+        );
+        let bucket_response: AckBucketMode = serde_json::from_slice(&response.body)?;
+        ensure!(
+            bucket_response.bucket == self.context.bucket
+                && bucket_response.mode.as_deref() == Some(mode.as_str()),
+            "effective bucket override differs from requested ACK calibration mode"
+        );
+        let evidence = AckCalibrationEvidence {
+            scenario: self.scenario.name.clone(),
+            run_id: self.context.run_id.clone(),
+            mode,
+            observed_at_ms: now_ms(),
+            bucket_response,
+            pods,
+        };
+        self.collector.write_text(
+            self.scenario.case_name,
+            ACK_CALIBRATION_ARTIFACT,
+            &serde_json::to_string_pretty(&evidence)?,
+        )?;
+        Ok(evidence.pods)
     }
 
     async fn prepare_quiet_mutation(

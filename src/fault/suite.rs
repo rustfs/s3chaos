@@ -79,6 +79,8 @@ pub struct FaultSuiteBudgets {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FaultSuiteScenario {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_calibration: Option<crate::fault::acknowledged_mutation::AckCalibrationMode>,
     /// Closed planned-case selector. Parsing it keeps qualification suites
     /// reviewable while ordinary suite resolution still rejects Planned
     /// catalog entries before any execution plan is produced.
@@ -301,6 +303,8 @@ pub struct ResolvedFaultSuiteBudgets {
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedFaultSuiteScenario {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ack_calibration: Option<crate::fault::acknowledged_mutation::AckCalibrationMode>,
     pub execution_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_recovery_case: Option<StorageRecoveryCase>,
@@ -545,6 +549,20 @@ impl ResolvedFaultSuiteScenario {
         if let Some(expected_failure) = &scenario.expected_failure {
             expected_failure.validate(&scenario.name)?;
         }
+        if let Some(mode) = scenario.ack_calibration {
+            use crate::fault::acknowledged_mutation::AckCalibrationMode;
+            ensure!(
+                crate::fault::scenarios::acknowledged_mutation_kind(&scenario.name).is_some(),
+                "ackCalibration requires an ACK-triggered scenario"
+            );
+            ensure!(
+                match mode {
+                    AckCalibrationMode::Strict => scenario.expected_failure.is_none(),
+                    AckCalibrationMode::Relaxed => scenario.expected_failure.is_some(),
+                },
+                "strict ACK calibration requires PASS; relaxed requires a typed expectedFailure"
+            );
+        }
         let params = scenario.params.clone().unwrap_or_default();
         ensure!(
             spec.param_schema != crate::fault::scenarios::FaultParameterSchema::QuorumIo
@@ -600,6 +618,7 @@ impl ResolvedFaultSuiteScenario {
                 "injection"
             }
             .to_string(),
+            ack_calibration: scenario.ack_calibration,
             storage_recovery_case: scenario.storage_recovery_case,
             params,
             repetitions: scenario.repetitions,
@@ -869,6 +888,31 @@ mod tests {
         storage_recovery::StorageRecoveryCase,
     };
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn calibration_requires_ack_scenario_and_opposite_control_outcomes() {
+        let yaml = |scenario: &str, mode: &str, expected: bool| {
+            format!(
+                "apiVersion: rustfs.com/s3chaos/v1alpha1\nkind: FaultSuite\nmetadata:\n  name: calibration\nscenarios:\n  - name: {scenario}\n    ackCalibration: {mode}\n{}",
+                if expected {
+                    "    expectedFailure:\n      classification: committed_version_missing\n      severity: fail_correctness\n      responsibilityDomain: product\n      evidenceRefs: [checker-pre-recommit-report.json, fault-evidence.json, run-events.jsonl]\n"
+                } else {
+                    ""
+                }
+            )
+        };
+        for (scenario, mode, expected, valid) in [
+            ("dm-drop-writes-after-ack-put", "strict", false, true),
+            ("dm-drop-writes-after-ack-put", "relaxed", true, true),
+            ("dm-drop-writes-after-ack-put", "strict", true, false),
+            ("dm-drop-writes-after-ack-put", "relaxed", false, false),
+            ("io-eio", "strict", false, false),
+        ] {
+            let suite: FaultSuite =
+                serde_yaml_ng::from_str(&yaml(scenario, mode, expected)).unwrap();
+            assert_eq!(suite.resolve().is_ok(), valid, "{scenario} {mode}");
+        }
+    }
 
     #[test]
     fn resolves_valid_fault_suite() {

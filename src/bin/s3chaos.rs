@@ -69,6 +69,7 @@ async fn main() -> Result<()> {
         "fault-suite-run" => run_signal_aware(run_fault_suite(args)).await,
         "fault-suite-template" => print_fault_suite_template(),
         "fault-suite-validate" => validate_fault_suite(args),
+        "fault-ack-calibration-analyze" => analyze_ack_calibration(args),
         "fault-validate-artifacts" => validate_fault_artifacts_command(args),
         "fault-run-spec-equal" => validate_fault_run_spec_equivalence(args),
         "protocol-catalog-json" => print_protocol_catalog_json(),
@@ -106,6 +107,7 @@ fn print_help() -> Result<()> {
     println!("  fault-suite-run <suite.yaml>");
     println!("  fault-suite-template");
     println!("  fault-suite-validate <suite.yaml>");
+    println!("  fault-ack-calibration-analyze <strict-suite-root> <relaxed-suite-root>");
     println!("  fault-validate-artifacts <scenario> <artifact-root> [--validation-summary-tsv]");
     println!("  fault-run-spec-equal <run-spec.json> <run-spec.yaml>");
     println!("  protocol-catalog-json");
@@ -679,6 +681,18 @@ fn validate_fault_suite(mut args: impl Iterator<Item = String>) -> Result<()> {
         resolved.metadata.name,
         resolved.scenarios.len()
     );
+    Ok(())
+}
+
+fn analyze_ack_calibration(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let strict = args.next().context("requires strict suite root")?;
+    let relaxed = args.next().context("requires relaxed suite root")?;
+    ensure!(args.next().is_none(), "accepts exactly two suite roots");
+    let report = s3chaos::fault::ack_calibration::validate_ack_calibration_pair(
+        std::path::Path::new(&strict),
+        std::path::Path::new(&relaxed),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 

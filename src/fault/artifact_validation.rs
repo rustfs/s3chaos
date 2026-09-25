@@ -7328,6 +7328,88 @@ fn validate_ack_triggered_dm_artifacts(
         require_boundary,
         require_recovered,
     } = context;
+    if let Some(mode) = run_spec
+        .scenario
+        .ack_trigger
+        .as_ref()
+        .and_then(|trigger| trigger.calibration_mode)
+    {
+        use crate::fault::acknowledged_mutation::{
+            ACK_CALIBRATION_ARTIFACT, AckCalibrationEvidence,
+        };
+        crate::fault::acknowledged_mutation::require_calibration_image(
+            &run_spec.cluster.rustfs_image,
+        )?;
+        let calibration: AckCalibrationEvidence =
+            read_json(&locate_artifact(root, case_name, ACK_CALIBRATION_ARTIFACT)?)?;
+        ensure!(
+            calibration.scenario == scenario
+                && calibration.run_id == run_id
+                && calibration.mode == mode,
+            "ACK calibration identity differs from run spec"
+        );
+        ensure!(
+            calibration.bucket_response.bucket == bucket
+                && calibration.bucket_response.mode.as_deref() == Some(mode.as_str()),
+            "ACK calibration bucket override differs from requested mode"
+        );
+        let target: TargetProof =
+            read_json(&locate_artifact(root, case_name, "target-proof.json")?)?;
+        ensure!(
+            target.run_id == run_id && target.scenario == scenario,
+            "ACK calibration target identity differs from run"
+        );
+        ensure!(
+            !calibration.pods.is_empty() && calibration.pods.len() == target.resolved_pods.len(),
+            "ACK calibration must cover every proven Pod"
+        );
+        let identities = calibration
+            .pods
+            .iter()
+            .map(|pod| (&pod.name, &pod.uid))
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            identities.len() == calibration.pods.len()
+                && target.resolved_pods.iter().all(|pod| identities
+                    .contains(&(&pod.name, &pod.uid))
+                    && calibration
+                        .pods
+                        .iter()
+                        .any(|observed| observed.name == pod.name
+                            && !observed.container_id.is_empty()
+                            && pod.rustfs_container_id.as_deref()
+                                == Some(observed.container_id.as_str()))),
+            "ACK calibration Pod/container identities differ from target proof"
+        );
+        ensure!(
+            calibration
+                .pods
+                .iter()
+                .all(|pod| pod.image == run_spec.cluster.rustfs_image
+                    && pod.image_id == calibration.pods[0].image_id
+                    && pod
+                        .image_id
+                        .rsplit_once("sha256:")
+                        .is_some_and(|(_, digest)| digest.len() == 64
+                            && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                    && pod.process_mode == mode.as_str()
+                    && pod.new_bucket_mode == mode.as_str()),
+            "ACK calibration Pod mode or image identity differs from run spec"
+        );
+        ensure!(
+            calibration.observed_at_ms > 0
+                && events
+                    .iter()
+                    .find(|event| event.stage == "run" && event.status == RunEventStatus::Started)
+                    .is_some_and(|event| event.at_ms <= calibration.observed_at_ms)
+                && events
+                    .iter()
+                    .find(|event| event.stage == "fault-prepare"
+                        && event.status == RunEventStatus::Started)
+                    .is_some_and(|event| calibration.observed_at_ms <= event.at_ms),
+            "ACK calibration mode was not observed before fault preparation"
+        );
+    }
     validate_history_scope_and_order(history, scenario, run_id, bucket)?;
     let preparation_started = events
         .iter()
@@ -14682,6 +14764,7 @@ mod tests {
 
         let mut ack_spec = run_spec.clone();
         ack_spec.scenario.ack_trigger = Some(crate::fault::spec::FaultRunAckTriggerSpec {
+            calibration_mode: None,
             mutation: crate::fault::acknowledged_mutation::AcknowledgedMutationKind::Put,
             operation_timeout_ms: 30_000,
             max_ack_to_fault_ms: 1_000,
@@ -16955,6 +17038,7 @@ mod tests {
         };
 
         let planned = FaultRunAckTriggerSpec {
+            calibration_mode: None,
             mutation: AcknowledgedMutationKind::Put,
             operation_timeout_ms: 30_000,
             max_ack_to_fault_ms: 5,
@@ -17932,6 +18016,576 @@ mod tests {
         }) {
             entry.is_latest = true;
         }
+    }
+
+    fn write_native_ack_calibration_control(
+        root: &std::path::Path,
+        relaxed: bool,
+    ) -> std::path::PathBuf {
+        use crate::fault::host_storage::{
+            DM_FILESYSTEM_CHECK_ARTIFACT, HOST_STORAGE_CLEANUP_ARTIFACT,
+        };
+        use crate::fault::{
+            acknowledged_mutation::AckCalibrationMode, suite::FaultSuite,
+            suite_plan::build_fault_suite_plan_expansion,
+        };
+        use std::path::{Path, PathBuf};
+        let mode = if relaxed {
+            AckCalibrationMode::Relaxed
+        } else {
+            AckCalibrationMode::Strict
+        };
+        let yaml = if relaxed {
+            include_str!("../../fault/examples/ack-put-relaxed.yaml")
+        } else {
+            include_str!("../../fault/examples/ack-put-strict.yaml")
+        };
+        let yaml = yaml
+            .replace("checker-pre-recommit-report.json", "checker-report.json")
+            .replace("objects: 64", "objects: 12");
+        let suite: FaultSuite = serde_yaml_ng::from_str(&yaml).unwrap();
+        let mut config = FaultTestConfig::for_test("real-cluster", "rustfs-fault-dm");
+        config.cluster.artifacts_dir = root.to_path_buf();
+        config.cluster.rustfs_image = format!("rustfs/rustfs@sha256:{}", "a".repeat(64));
+        config.workload_seed = Some(42);
+        config.max_ack_to_fault = Duration::from_millis(5);
+        let expansion = build_fault_suite_plan_expansion(
+            suite.resolve().unwrap(),
+            config,
+            format!("suite-{}", mode.as_str()),
+        )
+        .unwrap();
+        let suite_root = PathBuf::from(&expansion.plan.artifact_root);
+        let attempt = &expansion.plan.attempts[0];
+        let run_id = attempt.run_id.as_deref().unwrap();
+        let mut config = expansion.attempts[0].config.clone();
+        config.workload = crate::fault::config::FaultWorkloadProfile::new(12, 4).unwrap();
+        config.prefill_concurrency = 4;
+        config.dm_name = Some("rustfs-fault-dm".into());
+        config.dm_node = Some("worker-a".into());
+        config.dm_mount_path = Some("/data/rustfs-fault/dm-volume".into());
+        let scenario = FaultScenario::from_config(&config).unwrap();
+        let catalog = scenario_spec(&scenario.name).unwrap();
+        let plan = FaultPlan::from_scenario(&scenario, catalog).unwrap();
+        let workload = WorkloadPlan::seeded(config.workload_seed.unwrap(), 12, 4);
+        let run_spec = FaultRunSpec::resolved(
+            &config, &scenario, catalog, &plan, &workload, run_id, "bucket",
+        );
+        let case_dir = PathBuf::from(&attempt.artifacts.case_dir);
+        let attempt_dir = Path::new(&attempt.artifacts.attempt_dir);
+        write_success_artifacts(attempt_dir, &scenario.name);
+        fs::rename(
+            attempt_dir.join("fault_io_eio_preserves_committed_objects"),
+            &case_dir,
+        )
+        .unwrap();
+        for entry in fs::read_dir(&case_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .extension()
+                .is_some_and(|ext| ext == "json" || ext == "jsonl" || ext == "yaml")
+            {
+                let raw = fs::read_to_string(&path)
+                    .unwrap()
+                    .replace("run-00000000-0000-4000-8000-000000000001", run_id)
+                    .replace(
+                        "fault_io_eio_preserves_committed_objects",
+                        scenario.case_name,
+                    )
+                    .replace("fast-csi", "rustfs-fault-dm");
+                fs::write(path, raw).unwrap();
+            }
+        }
+        for name in ["workload-summary.json", "recommit-report.json"] {
+            fs::remove_file(case_dir.join(name)).unwrap();
+        }
+        let mut workload_json = json!(workload);
+        workload_json["scenario"] = json!(scenario.name);
+        workload_json["run_id"] = json!(run_id);
+        write_json(&case_dir, "workload-plan.json", &workload_json);
+        write_json(&case_dir, "run-spec.json", &json!(run_spec));
+        fs::write(
+            case_dir.join("run-spec.yaml"),
+            serde_yaml_ng::to_string(&run_spec).unwrap(),
+        )
+        .unwrap();
+        let mut metadata: Value = read_json(&case_dir.join("run-metadata.json")).unwrap();
+        metadata["backend"] = json!("device-mapper");
+        metadata["target"] = json!("dedicated-block-device");
+        metadata["fault_duration_seconds"] = json!(config.duration.as_secs());
+        metadata["percent"] = json!(config.percent);
+        metadata["workload_versioning"] = json!(true);
+        write_json(&case_dir, "run-metadata.json", &metadata);
+        let mut target_proof = TargetProof::from_plan(&config, &scenario, catalog, &plan, run_id)
+            .with_resolved_pod_proofs((0..4).map(|index| {
+                let mut pod = TargetResolvedPodProof::new(format!("p{index}"), format!("u{index}"))
+                    .with_node(if index == 0 {
+                        "worker-a".into()
+                    } else {
+                        format!("node-{index}")
+                    })
+                    .with_ready(true);
+                pod.rustfs_container_id = Some(format!("containerd://process-{index}"));
+                pod = pod.with_persistent_volume_claims(vec![TargetPersistentVolumeClaimProof {
+                    name: format!("data-rustfs-{index}"),
+                    uid: format!("pvc-uid-{index}"),
+                    volume_name: Some(if index == 0 {
+                        "pv-a".into()
+                    } else {
+                        format!("pv-{index}")
+                    }),
+                    storage_class: Some("rustfs-fault-dm".into()),
+                    persistent_volume: Some(TargetPersistentVolumeProof {
+                        name: if index == 0 {
+                            "pv-a".into()
+                        } else {
+                            format!("pv-{index}")
+                        },
+                        uid: if index == 0 {
+                            "pv-uid-a".into()
+                        } else {
+                            format!("pv-uid-{index}")
+                        },
+                        source: Some("local".into()),
+                        required_node_affinity: None,
+                        node: Some(if index == 0 {
+                            "storage-host-a".into()
+                        } else {
+                            format!("node-{index}")
+                        }),
+                        device_or_path: Some(if index == 0 {
+                            "/data/rustfs-fault/dm-volume".into()
+                        } else {
+                            format!("/data/rustfs-fault/volume-{index}")
+                        }),
+                    }),
+                }]);
+                pod
+            }));
+        target_proof.generated_at_ms = 6;
+        write_json(&case_dir, "target-proof.json", &json!(target_proof));
+        let mut preflight: Value = read_json(&case_dir.join("preflight-summary.json")).unwrap();
+        preflight["phases"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name":"host-storage-mutation-proof","status":"passed","checks":[{"name":"host_storage_proof","status":"passed","message":"dedicated target proven","responsibilityDomain":"harness"}]}));
+        write_json(&case_dir, "preflight-summary.json", &preflight);
+        let host_proof = HostStorageMutationProof::prove_device_mapper(
+            HostStorageMutationIntent {
+                scenario: scenario.name.clone(),
+                fault_name: run_spec.faults[0].name.clone(),
+                fault_kind: run_spec.faults[0].kind.clone(),
+                run_id: run_id.to_string(),
+                context: config.cluster.context.clone(),
+                namespace: config.cluster.test_namespace.clone(),
+                tenant: config.cluster.tenant_name.clone(),
+                observer_namespace: "rustfs-fault-observers".to_string(),
+                observer_pod: "observer-worker-a".to_string(),
+                backend_specific_destructive_opt_in: true,
+                allowlist: HostStorageAllowlist {
+                    nodes: vec!["worker-a".to_string()],
+                    devices: vec!["/dev/mapper/rustfs-fault-dm".to_string()],
+                    persistent_volumes: vec!["pv-a".to_string()],
+                },
+                fault_table: Some("0 1024 flakey /dev/loop0 0 0 86400 1 drop_writes".to_string()),
+            },
+            HostStorageTargetObservation {
+                node: "worker-a".to_string(),
+                node_uid: "node-uid-a".to_string(),
+                node_labels: BTreeMap::from([(
+                    "kubernetes.io/hostname".to_string(),
+                    "storage-host-a".to_string(),
+                )]),
+                pod: "p0".to_string(),
+                pod_uid: "u0".to_string(),
+                volume_name: "data".to_string(),
+                persistent_volume_claim: "data-rustfs-0".to_string(),
+                persistent_volume_claim_uid: "pvc-uid-0".to_string(),
+                persistent_volume_claim_phase: "Bound".to_string(),
+                persistent_volume: "pv-a".to_string(),
+                persistent_volume_uid: "pv-uid-a".to_string(),
+                persistent_volume_phase: "Bound".to_string(),
+                persistent_volume_claim_ref: HostStoragePersistentVolumeClaimRef {
+                    namespace: "rustfs-fault-test".to_string(),
+                    name: "data-rustfs-0".to_string(),
+                    uid: "pvc-uid-0".to_string(),
+                },
+                node_selector: HostStorageNodeSelector {
+                    key: "kubernetes.io/hostname".to_string(),
+                    operator: "In".to_string(),
+                    values: vec!["storage-host-a".to_string()],
+                },
+                container_mount_path: "/data/rustfs0".to_string(),
+                persistent_volume_path: "/data/rustfs-fault/dm-volume".to_string(),
+                mapper_name: "rustfs-fault-dm".to_string(),
+                logical_device: "/dev/mapper/rustfs-fault-dm".to_string(),
+                canonical_device: "/dev/dm-0".to_string(),
+                mount_source: "/dev/mapper/rustfs-fault-dm".to_string(),
+                mount_canonical_source: "/dev/dm-0".to_string(),
+                filesystem: "ext4".to_string(),
+                recovery_table: "0 1024 linear /dev/loop0 0".to_string(),
+                observed_at_ms: 7,
+            },
+        )
+        .expect("host proof");
+        let recovery_snapshot = json!({
+            "stage": "recovered",
+            "mapper_name": "rustfs-fault-dm",
+            "canonical_device": "/dev/dm-0",
+            "suspended": false,
+            "observed_at_ms": 57,
+            "helper_pod": crate::fault::host_storage::helper_pod_name(run_id),
+            "mapping": {
+                "node": "worker-a",
+                "node_uid": "node-uid-a",
+                "node_labels": {"kubernetes.io/hostname": "storage-host-a"},
+                "pod": "p0",
+                "pod_uid": "u0",
+                "volume_name": "data",
+                "pvc": "data-rustfs-0",
+                "pvc_uid": "pvc-uid-0",
+                "pvc_phase": "Bound",
+                "pv": "pv-a",
+                "pv_uid": "pv-uid-a",
+                "pv_phase": "Bound",
+                "pv_claim_ref": {
+                    "namespace": "rustfs-fault-test",
+                    "name": "data-rustfs-0",
+                    "uid": "pvc-uid-0"
+                },
+                "node_selector": {
+                    "key": "kubernetes.io/hostname",
+                    "operator": "In",
+                    "values": ["storage-host-a"]
+                },
+                "container_mount_path": "/data/rustfs0",
+                "mount_path": "/data/rustfs-fault/dm-volume"
+            },
+            "table": "0 1024 linear /dev/loop0 0",
+            "status": "0 1024 linear"
+        });
+
+        write_json(&case_dir, HOST_STORAGE_PROOF_ARTIFACT, &json!(host_proof));
+        write_json(
+            &case_dir,
+            HOST_STORAGE_CLEANUP_ARTIFACT,
+            &json!({
+                "schemaVersion":1,"scenario":scenario.name,"faultName":run_spec.faults[0].name,"runId":run_id,
+                "observedAtMs":58,"node":"worker-a","persistentVolume":"pv-a","mapperName":"rustfs-fault-dm",
+                "logicalDevice":"/dev/mapper/rustfs-fault-dm","canonicalDevice":"/dev/dm-0","mountCanonicalSource":"/dev/dm-0",
+                "filesystemMounted":true,"nodeQuarantined":false,"recoveryTableSha256":host_proof.target.recovery_table_sha256
+            }),
+        );
+        let mut active = recovery_snapshot.clone();
+        active["stage"] = json!("active");
+        active["observed_at_ms"] = json!(12);
+        active["table"] = json!(host_proof.tables.fault_table);
+        let pods = (0..4)
+            .map(|index| json!({"name":format!("p{index}"),"uid":format!("u{index}")}))
+            .collect::<Vec<_>>();
+        let mut after = pods.clone();
+        after[0]["uid"] = json!("u0-new");
+        write_json(
+            &case_dir,
+            "fault-evidence.json",
+            &json!({
+                "scenario":scenario.name,"run_id":run_id,"backend":"device-mapper","target":"dedicated-block-device",
+                "injected":true,"active_during_workload":false,"recovered":true,"require_client_disruption":false,"client_disruptions":0,
+                "pods_before":pods,"pods_after":after,"active_snapshots":[{"stage":"active","resource_kind":"device-mapper","dm_status":active}],
+                "workload_snapshots":[],"fault_prepare_started_at_ms":6,"fault_apply_started_at_ms":11,"fault_active_at_ms":12,
+                "fault_delete_started_at_ms":50,"recovery_started_at_ms":50,"recovery_ended_at_ms":70,"dm_recovery_snapshot":recovery_snapshot
+            }),
+        );
+        write_json(
+            &case_dir,
+            DM_FILESYSTEM_CHECK_ARTIFACT,
+            &json!({
+                "schemaVersion":1,"scenario":scenario.name,"faultName":host_proof.fault_name,"runId":run_id,
+                "node":"worker-a","persistentVolume":"pv-a","mapperName":"rustfs-fault-dm","logicalDevice":"/dev/mapper/rustfs-fault-dm",
+                "canonicalDevice":"/dev/dm-0","mountPath":"/data/rustfs-fault/dm-volume","filesystem":"ext4","checker":"/usr/sbin/e2fsck",
+                "arguments":["-f","-n","/dev/mapper/rustfs-fault-dm"],"startedAtMs":52,"completedAtMs":54,"exitCode":0,
+                "stdout":"clean","stderr":"","clean":true,"mountedForRecovery":true,"unmountedForCheck":true,"remountedAfterCheck":true,"remountedAtMs":55
+            }),
+        );
+        let mount = json!({"source":"/dev/mapper/rustfs-fault-dm","canonical_source":"/dev/dm-0","filesystem":"ext4","options":"rw,relatime"});
+        write_json(
+            &case_dir,
+            "dm-crash-boundary.json",
+            &json!({
+                "scenario":scenario.name,"run_id":run_id,"started_at_ms":13,"completed_at_ms":20,"old_pod_uid":"u0",
+                "replacement_pod_uid":null,"filesystem_unmounted":true,"mapper_mounts_absent":true,"mount_before":mount,
+                "fault":{"table":host_proof.tables.fault_table}
+            }),
+        );
+        write_json(
+            &case_dir,
+            "dm-crash-recovered.json",
+            &json!({
+                "scenario":scenario.name,"run_id":run_id,"recovered_at_ms":59,"taint_removed":true,"mount":mount,
+                "expected_table":host_proof.tables.recovery_table,"fault":{"table":host_proof.tables.recovery_table}
+            }),
+        );
+        let mut fixture = AckFailureFixture::new(AcknowledgedMutationKind::Put);
+        fixture.restore_healthy_observations();
+        for record in &mut fixture.history {
+            record.run_id = Some(run_id.into());
+            record.key = record
+                .key
+                .as_ref()
+                .map(|value| value.replace("run-1", run_id));
+            if let Some(keys) = &mut record.listed_keys {
+                for key in keys {
+                    *key = key.replace("run-1", run_id);
+                }
+            }
+            if let Some(versions) = &mut record.listed_versions {
+                for version in versions {
+                    version.key = version.key.replace("run-1", run_id);
+                }
+            }
+            if record.kind != OperationKind::Put {
+                record.started_at_ms += 100;
+                record.ended_at_ms += 100;
+            }
+        }
+        fixture.ack.run_id = run_id.into();
+        fixture.ack.trigger_key = fixture.ack.trigger_key.replace("run-1", run_id);
+        fixture.report.run_id = run_id.into();
+        fixture.refresh_audit();
+        fixture.report.passed = true;
+        write_json(
+            &case_dir,
+            "checker-pre-recommit-report.json",
+            &json!(fixture.report),
+        );
+        let suffix = fixture.history[fixture.prefix_len..].to_vec();
+        fixture.prefix_len = fixture.history.len();
+        for mut record in suffix {
+            record.id.push_str("-final");
+            record.started_at_ms += 30;
+            record.ended_at_ms += 30;
+            record.started_sequence = Some(fixture.history.len() as u64 * 2 + 1);
+            record.ended_sequence = Some(fixture.history.len() as u64 * 2 + 2);
+            fixture.history.push(record);
+        }
+        if relaxed {
+            fixture.fail_data_version("trigger-version", true);
+            fixture.report.delete_marker_lineage_incomplete = vec![format!(
+                "{}: ListObjectVersions has no unique latest entry",
+                fixture.ack.trigger_key
+            )];
+            fixture.report.list_warnings = vec![format!(
+                "LIST prefix fault-test/{run_id}/ did not include expected live key {}",
+                fixture.ack.trigger_key
+            )];
+            fixture.report.final_list_warning_count = 1;
+        }
+        fixture.refresh_audit();
+        fixture.report.operation_cohorts.clear();
+        fixture.report.fault_window_relations.clear();
+        for record in &fixture.history[..fixture.prefix_len] {
+            if let Some(cohort) = record.durability_cohort {
+                *fixture
+                    .report
+                    .operation_cohorts
+                    .entry(cohort.as_str().into())
+                    .or_default() += 1;
+            }
+            if let Some(relation) = record.fault_window_relation {
+                *fixture
+                    .report
+                    .fault_window_relations
+                    .entry(relation.as_str().into())
+                    .or_default() += 1;
+            }
+        }
+        fixture.report.passed = !relaxed;
+        write_json(&case_dir, "checker-report.json", &json!(fixture.report));
+        write_json(
+            &case_dir,
+            "ack-to-fault-evidence.json",
+            &json!({
+                "scenario":scenario.name,"run_id":run_id,"trigger_operation_id":fixture.ack.trigger_operation_id,
+                "trigger_kind":"put","trigger_key":fixture.ack.trigger_key,"trigger_version_id":"trigger-version",
+                "trigger_acknowledged_at_ms":11,"fault_activated_at_ms":12,"ack_to_fault_ms":1,"max_ack_to_fault_ms":5,
+                "crash_boundary_started_at_ms":13,"crash_boundary_next_sequence":3,"ack_to_crash_boundary_ms":2
+            }),
+        );
+        fs::write(
+            case_dir.join("history.jsonl"),
+            fixture
+                .history
+                .iter()
+                .map(|record| serde_json::to_string(record).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let baseline: Value = read_json(&case_dir.join(RECOVERY_HEALTH_ARTIFACT)).unwrap();
+        let mut events = vec![];
+        for (at, stage, status) in [
+            (1, "run", "started"),
+            (5, "recovery-health-baseline", "succeeded"),
+            (6, "fault-prepare", "started"),
+            (7, "host-storage-mutation-preflight", "succeeded"),
+            (9, "fault-prepare", "succeeded"),
+            (11, "fault-apply", "started"),
+            (12, "fault-apply", "succeeded"),
+            (12, "ack-trigger", "succeeded"),
+            (20, "crash-recovery-boundary", "succeeded"),
+            (70, "recovery-evidence", "succeeded"),
+            (71, "post-recovery-write", "started"),
+            (200, "post-recovery-write", "succeeded"),
+            (201, "checker-pre-recommit", "started"),
+            (220, "checker-pre-recommit", "succeeded"),
+            (230, "checker-final", "started"),
+            (
+                250,
+                "checker-final",
+                if relaxed { "failed" } else { "succeeded" },
+            ),
+        ] {
+            let mut event = json!({"at_ms":at,"scenario":scenario.name,"run_id":run_id,"stage":stage,"status":status,"message":"fixture"});
+            if stage == "recovery-health-baseline" {
+                event["details"] = baseline["baseline"].clone();
+            }
+            events.push(event);
+        }
+        if relaxed {
+            events.push(json!({"at_ms":251,"scenario":scenario.name,"run_id":run_id,"stage":"checker-verdict","status":"failed","message":"loss"}));
+        }
+        events.push(json!({"at_ms":252,"scenario":scenario.name,"run_id":run_id,"stage":"run","status":if relaxed {"failed"} else {"succeeded"},"message":"fixture"}));
+        fs::write(
+            case_dir.join("run-events.jsonl"),
+            events
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        write_json(
+            &case_dir,
+            "ack-calibration-mode.json",
+            &json!({
+                "scenario":scenario.name,"run_id":run_id,"mode":mode,"observed_at_ms":2,"bucket_response":{"bucket":"bucket","mode":mode},
+                "pods":(0..4).map(|index|json!({"name":format!("p{index}"),"uid":format!("u{index}"),"image":config.cluster.rustfs_image,
+                    "image_id":format!("containerd://sha256:{}","a".repeat(64)),"container_id":format!("containerd://process-{index}"),
+                    "process_mode":mode,"new_bucket_mode":mode})).collect::<Vec<_>>()
+            }),
+        );
+        if relaxed {
+            let mut failure = serde_json::to_value(
+                FailureSummary::from_checker(
+                    &scenario.name,
+                    "checker-verdict",
+                    RecoveryStabilityClassification::CommittedVersionMissing,
+                    "loss",
+                )
+                .with_run_id(run_id)
+                .with_case_name(scenario.case_name),
+            )
+            .unwrap();
+            failure["final_list_warning_count"] = json!(fixture.report.final_list_warning_count);
+            failure["list_warnings"] = json!(fixture.report.list_warnings);
+            failure["observed_at_ms"] = json!(251);
+            failure["primary_evidence_refs"] = json!(
+                [
+                    "checker-report.json",
+                    "fault-evidence.json",
+                    "run-events.jsonl"
+                ]
+                .map(|name| case_dir
+                    .join(name)
+                    .strip_prefix(&suite_root)
+                    .unwrap()
+                    .display()
+                    .to_string())
+            );
+            write_json(&case_dir, "failure-summary.json", &failure);
+        }
+        write_json(&suite_root, "suite-plan.json", &json!(expansion.plan));
+        write_json(
+            &suite_root,
+            "suite-summary.json",
+            &json!({"runId":expansion.plan.run_id,"status":"succeeded","attempts":[{
+                "runId":run_id,"scenario":scenario.name,"status":if relaxed {"expected-failure"} else {"succeeded"},"startedAtMs":1,"endedAtMs":253
+            }]}),
+        );
+        suite_root
+    }
+
+    #[test]
+    fn native_ack_calibration_pair_revalidates_positive_and_negative_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        let strict = write_native_ack_calibration_control(&dir.path().join("strict"), false);
+        let relaxed = write_native_ack_calibration_control(&dir.path().join("relaxed"), true);
+        use crate::fault::ack_calibration::validate_ack_calibration_pair;
+        validate_ack_calibration_pair(&strict, &relaxed).unwrap();
+        let relocated = dir.path().join("relocated-strict");
+        fs::rename(&strict, &relocated).unwrap();
+        validate_ack_calibration_pair(&relocated, &relaxed).unwrap();
+        let plan: Value = read_json(&relaxed.join("suite-plan.json")).unwrap();
+        let case = std::path::PathBuf::from(
+            plan["attempts"][0]["artifacts"]["caseDir"]
+                .as_str()
+                .unwrap(),
+        );
+        let path = case.join("ack-calibration-mode.json");
+        let original: Value = read_json(&path).unwrap();
+        for (pointer, value) in [
+            ("/observed_at_ms", json!(0)),
+            ("/mode", json!("strict")),
+            ("/pods/0/container_id", json!("containerd://restarted")),
+            (
+                "/pods/0/image_id",
+                json!(format!("containerd://sha256:{}", "b".repeat(64))),
+            ),
+            ("/bucket_response/mode", json!("strict")),
+        ] {
+            let mut invalid = original.clone();
+            *invalid.pointer_mut(pointer).unwrap() = value;
+            write_json(&case, "ack-calibration-mode.json", &invalid);
+            assert!(
+                validate_ack_calibration_pair(&relocated, &relaxed).is_err(),
+                "{pointer}"
+            );
+        }
+        write_json(&case, "ack-calibration-mode.json", &original);
+        let summary: Value = read_json(&relaxed.join("suite-summary.json")).unwrap();
+        let mut invalid = summary.clone();
+        invalid["attempts"][0]["status"] = json!("succeeded");
+        write_json(&relaxed, "suite-summary.json", &invalid);
+        assert!(validate_ack_calibration_pair(&relocated, &relaxed).is_err());
+        write_json(&relaxed, "suite-summary.json", &summary);
+        let mut invalid = plan.clone();
+        invalid["attempts"][0]["scenario"] = json!("dm-drop-writes-after-ack-overwrite");
+        write_json(&relaxed, "suite-plan.json", &invalid);
+        assert!(validate_ack_calibration_pair(&relocated, &relaxed).is_err());
+        let mut invalid = plan.clone();
+        invalid["attempts"][0]["artifacts"]["caseDir"] = json!(format!(
+            "{}/../escape",
+            plan["artifactRoot"].as_str().unwrap()
+        ));
+        write_json(&relaxed, "suite-plan.json", &invalid);
+        assert!(validate_ack_calibration_pair(&relocated, &relaxed).is_err());
+        write_json(&relaxed, "suite-plan.json", &plan);
+        #[cfg(unix)]
+        {
+            let escaped = dir.path().join("escaped-case");
+            fs::rename(&case, &escaped).unwrap();
+            std::os::unix::fs::symlink(&escaped, &case).unwrap();
+            assert!(validate_ack_calibration_pair(&relocated, &relaxed).is_err());
+            fs::remove_file(&case).unwrap();
+            fs::rename(&escaped, &case).unwrap();
+        }
+        let failure: Value = read_json(&case.join("failure-summary.json")).unwrap();
+        let mut unrelated = failure.clone();
+        unrelated["classification"] = json!("availability_failure");
+        write_json(&case, "failure-summary.json", &unrelated);
+        assert!(validate_ack_calibration_pair(&relocated, &relaxed).is_err());
+        write_json(&case, "failure-summary.json", &failure);
+        validate_ack_calibration_pair(&relocated, &relaxed).unwrap();
     }
 
     #[test]

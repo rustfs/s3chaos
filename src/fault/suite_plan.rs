@@ -582,6 +582,7 @@ impl FaultSuitePlanAttempt {
             ack_trigger: acknowledged_mutation_kind(&input.scenario.name).map(|mutation| {
                 FaultRunAckTriggerSpec {
                     mutation,
+                    calibration_mode: input.config.ack_calibration,
                     operation_timeout_ms: input.config.ack_operation_timeout.as_millis() as u64,
                     max_ack_to_fault_ms: input.config.max_ack_to_fault.as_millis() as u64,
                 }
@@ -635,7 +636,17 @@ impl FaultSuitePlanAttempt {
             artifacts: FaultSuitePlanArtifacts {
                 attempt_dir: input.attempt_dir.display().to_string(),
                 case_dir: case_dir.display().to_string(),
-                required: FaultRunArtifactSpec::required_names_for_scenario(&input.scenario.name),
+                required: {
+                    let mut required =
+                        FaultRunArtifactSpec::required_names_for_scenario(&input.scenario.name);
+                    if input.config.ack_calibration.is_some() {
+                        required.push(
+                            crate::fault::acknowledged_mutation::ACK_CALIBRATION_ARTIFACT
+                                .to_string(),
+                        );
+                    }
+                    required
+                },
                 event_stream: "run-events.jsonl".to_string(),
             },
             budget: input.budget,
@@ -754,6 +765,13 @@ fn scenario_config(
     // ordinary catalog scenarios from the same process environment and must
     // never inherit that authorization into its attempts.
     config.qualify_planned_admin = false;
+    config.ack_calibration = scenario.ack_calibration;
+    if let Some(mode) = config.ack_calibration {
+        crate::fault::acknowledged_mutation::require_calibration_image(
+            &config.cluster.rustfs_image,
+        )?;
+        mode.configure(&mut config.cluster.rustfs_env)?;
+    }
     config.scenario = scenario.name.clone();
     config.scenario_parameters = scenario.params.clone();
     config.storage_recovery_case = scenario.storage_recovery_case;
