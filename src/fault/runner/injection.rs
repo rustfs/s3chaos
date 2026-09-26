@@ -26,9 +26,10 @@ use crate::{
         history::DurabilityCohort,
         quorum::require_fresh_runtime_observation,
         scenarios::{
-            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_FAILURE_QUORUM_EDGE_SCENARIO,
-            QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
-            requires_prefault_multipart_staging, requires_quorum_edge_read_survival,
+            NETWORK_LOSS_SCENARIO, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+            POD_FAILURE_QUORUM_EDGE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
+            QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, requires_prefault_multipart_staging,
+            requires_quorum_edge_read_survival,
         },
     },
     framework::resources,
@@ -37,6 +38,20 @@ use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::time::Duration;
+
+fn network_loss_min_percent() -> Result<Option<u8>> {
+    let Ok(value) = std::env::var("RUSTFS_FAULT_TEST_NETWORK_LOSS_MIN_PERCENT") else {
+        return Ok(None);
+    };
+    let parsed: u8 = value.trim().parse().with_context(|| {
+        format!("RUSTFS_FAULT_TEST_NETWORK_LOSS_MIN_PERCENT must be 1..=100, got {value}")
+    })?;
+    ensure!(
+        (1..=100).contains(&parsed),
+        "RUSTFS_FAULT_TEST_NETWORK_LOSS_MIN_PERCENT must be 1..=100, got {parsed}"
+    );
+    Ok(Some(parsed))
+}
 
 use super::access::{
     PortForwardLost, ensure_s3_access, wait_for_local_forward, wait_for_tenant_s3,
@@ -1553,6 +1568,16 @@ impl FaultRun<'_> {
             .summary
             .require_fault_evidence(require_client_disruption)
             .and_then(|()| {
+                if plan.scenario.as_str() == NETWORK_LOSS_SCENARIO
+                    && let Some(min_percent) = network_loss_min_percent()?
+                {
+                    crate::fault::workload::execution::sustained_error_rate(
+                        workload.summary.attempted(),
+                        workload.summary.disrupted(),
+                        min_percent,
+                        30,
+                    )?;
+                }
                 if matches!(
                     plan.scenario.as_str(),
                     NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO | POD_FAILURE_QUORUM_EDGE_SCENARIO
@@ -1647,6 +1672,12 @@ fn injected_source_pod_names(snapshots: &[FaultStatusSnapshot]) -> Result<BTreeS
     for snapshot in snapshots {
         if let Some(lifecycle) = &snapshot.lifecycle_status {
             targets.extend(lifecycle.target_pods.iter().cloned());
+            continue;
+        }
+        // A harness controller kills a pinned pod while the Schedule object
+        // still has no containerRecords. Those pods are the fault targets.
+        if let Some(controller_pods) = &snapshot.controller_target_pods {
+            targets.extend(controller_pods.iter().cloned());
             continue;
         }
         let Some(status) = &snapshot.chaos_status else {
@@ -1953,6 +1984,7 @@ mod availability_endpoint_tests {
             })),
             dm_status: None,
             lifecycle_status: None,
+            controller_target_pods: None,
         }
     }
 
@@ -1981,6 +2013,7 @@ mod availability_endpoint_tests {
                 pods: Vec::new(),
                 observed_at_ms: 1,
             }),
+            controller_target_pods: None,
         };
         let targets = injected_source_pod_names(&[snapshot]).expect("targets");
         assert_eq!(
@@ -2021,7 +2054,25 @@ mod availability_endpoint_tests {
             chaos_status: None,
             dm_status: None,
             lifecycle_status: None,
+            controller_target_pods: None,
         };
         assert!(injected_source_pod_names(&[dm_only]).is_err());
+    }
+
+    #[test]
+    fn controller_targets_name_the_storm_victim_without_schedule_records() {
+        let snapshot = FaultStatusSnapshot {
+            stage: "active".to_string(),
+            resource_kind: Some("Schedule".to_string()),
+            resource_name: Some("pod-restart-storm".to_string()),
+            chaos_status: Some(serde_json::json!({
+                "status": {"experiment": {}}
+            })),
+            dm_status: None,
+            lifecycle_status: None,
+            controller_target_pods: Some(vec!["primary-3".to_string()]),
+        };
+        let targets = injected_source_pod_names(&[snapshot]).expect("targets");
+        assert_eq!(targets, BTreeSet::from(["primary-3".to_string()]));
     }
 }

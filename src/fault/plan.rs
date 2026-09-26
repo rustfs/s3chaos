@@ -656,7 +656,10 @@ impl FaultInjectionParameters {
                 correlation_percent: 25,
             },
             FaultKind::RustfsServerNetworkLoss => Self::NetworkLoss {
-                loss_percent: 25,
+                // A 25% default often produces no client-visible error, so a
+                // direct network-loss run is not evidence. Suites that set
+                // lossPercent explicitly keep that value.
+                loss_percent: 80,
                 correlation_percent: 25,
             },
             FaultKind::RustfsServerNetworkCorrupt => Self::NetworkCorrupt {
@@ -1561,6 +1564,12 @@ mod tests {
         },
     };
     use std::time::Duration;
+
+    #[test]
+    fn network_loss_default_is_high_enough_to_be_client_visible() {
+        let params = FaultInjectionParameters::default_for_kind(FaultKind::RustfsServerNetworkLoss);
+        assert_eq!(params.network_loss().expect("loss"), (80, 25));
+    }
 
     #[test]
     fn scenario_plan_maps_io_eio_to_rustfs_volume_fault() {

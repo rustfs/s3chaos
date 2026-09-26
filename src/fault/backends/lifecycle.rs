@@ -1756,6 +1756,7 @@ impl LifecycleFaultHandle {
                     .collect(),
                 observed_at_ms: now_ms(),
             }),
+            controller_target_pods: None,
         })
     }
 }

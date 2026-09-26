@@ -55,6 +55,13 @@ make fault-check      # check + fault script/YAML validation
 make protocol-check   # check + bash -n on protocol scripts
 ```
 
+## Release gate
+
+`make release-gate RUSTFS_VERSION=<tag>` plans or runs the smoke, standard,
+or full tier for one RustFS release, including upgrade from
+`RUSTFS_PREV_VERSION` and a JSON/JUnit/Markdown report. Tiers, skip codes,
+and the Mac Mini arm64 limits are in `docs/RELEASE_GATE.md`.
+
 ## Fault-Injection Testing
 
 The normal correctness workflow uses one foreground command for all ordinary

@@ -20,6 +20,7 @@ use console_server::serve_console;
 use s3chaos::fault::{
     artifact_validation::{ArtifactValidationOptions, validate_fault_artifacts_and_write_report},
     console::build_console_snapshot,
+    release_gate::{ReleaseGateRequest, run_release_gate},
     runner::run_selected_scenario_from_env,
     scenarios::{planned_qualification_catalog_json, scenario_catalog_json},
     shutdown::run_signal_aware,
@@ -71,6 +72,16 @@ async fn main() -> Result<()> {
         "fault-suite-validate" => validate_fault_suite(args),
         "fault-validate-artifacts" => validate_fault_artifacts_command(args),
         "fault-run-spec-equal" => validate_fault_run_spec_equivalence(args),
+        "release-gate" => {
+            let report = run_release_gate(ReleaseGateRequest::from_env()?).await?;
+            if report.verdict != "pass" {
+                bail!(
+                    "release gate verdict is {}; see the report written under the output directory",
+                    report.verdict
+                );
+            }
+            Ok(())
+        }
         "protocol-catalog-json" => print_protocol_catalog_json(),
         "protocol-mint-evaluate" => evaluate_mint_artifacts(args),
         "protocol-mint-run" => run_mint_session_command(args).await,
@@ -108,6 +119,7 @@ fn print_help() -> Result<()> {
     println!("  fault-suite-validate <suite.yaml>");
     println!("  fault-validate-artifacts <scenario> <artifact-root> [--validation-summary-tsv]");
     println!("  fault-run-spec-equal <run-spec.json> <run-spec.yaml>");
+    println!("  release-gate");
     println!("  protocol-catalog-json");
     println!(
         "  protocol-mint-evaluate <inventory.yaml> <known-failures.yaml> <log.json> <stdout.log> <stderr.log> <container-exit-code> <verified-target-fingerprint> <evaluated-at> <artifact-root>"

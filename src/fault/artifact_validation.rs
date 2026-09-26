@@ -22303,6 +22303,7 @@ mod tests {
                     observed_at_ms: 21,
                 },
             ),
+            controller_target_pods: None,
         })
         .expect("snapshot json");
         assert!(

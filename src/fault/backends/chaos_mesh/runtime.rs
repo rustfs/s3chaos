@@ -129,6 +129,19 @@ pub fn cleanup_managed_chaos(config: &ClusterTestConfig, namespace: &str) -> Res
     Ok(())
 }
 
+/// PodIOChaos objects live in the target namespace, not the Chaos Mesh
+/// namespace, and a stuck finalizer there keeps the volume injected for the
+/// next scenario.
+pub fn cleanup_podiochaos(config: &ClusterTestConfig, namespace: &str) -> Result<()> {
+    let output = Kubectl::new(config)
+        .command(["get", "crd", "podiochaos.chaos-mesh.org"])
+        .run()?;
+    if output.code != Some(0) {
+        return Ok(());
+    }
+    cleanup_kind(config, namespace, "podiochaos", None)
+}
+
 pub fn cleanup_managed_iochaos(config: &ClusterTestConfig, namespace: &str) -> Result<()> {
     cleanup_managed_kind(config, namespace, "iochaos")
 }
@@ -147,18 +160,130 @@ pub fn cleanup_managed_stresschaos(config: &ClusterTestConfig, namespace: &str) 
 
 fn cleanup_managed_kind(config: &ClusterTestConfig, namespace: &str, kind: &str) -> Result<()> {
     let selector = format!("{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}");
+    cleanup_kind(config, namespace, kind, Some(selector))
+}
+
+/// Delete managed chaos, then clear finalizers on anything still present.
+/// A Chaos Mesh 2.8.3 IOChaos whose `chaos-mesh/records` finalizer never
+/// completes stays in the namespace and poisons the next scenario.
+fn cleanup_kind(
+    config: &ClusterTestConfig,
+    namespace: &str,
+    kind: &str,
+    selector: Option<String>,
+) -> Result<()> {
+    let timeout = stuck_chaos_delete_timeout();
+    if delete_kind(config, namespace, kind, selector.as_deref(), &timeout).is_ok() {
+        return Ok(());
+    }
+    let list = list_kind_json(config, namespace, kind, selector.as_deref())?;
+    let names = names_with_finalizers(&list).unwrap_or_default();
+    if names.is_empty() {
+        delete_kind(config, namespace, kind, selector.as_deref(), &timeout)?;
+        return Ok(());
+    }
+    for name in &names {
+        eprintln!(
+            "warning: clearing finalizers on stuck {kind}/{name} in {namespace} so a later scenario is not poisoned"
+        );
+        Kubectl::new(config)
+            .namespaced(namespace)
+            .command([
+                "patch",
+                kind,
+                name,
+                "--type=merge",
+                "-p",
+                r#"{"metadata":{"finalizers":[]}}"#,
+            ])
+            .run_checked()?;
+    }
+    delete_kind(config, namespace, kind, selector.as_deref(), &timeout)?;
+    Ok(())
+}
+
+fn delete_kind(
+    config: &ClusterTestConfig,
+    namespace: &str,
+    kind: &str,
+    selector: Option<&str>,
+    timeout: &str,
+) -> Result<()> {
+    let mut args = vec!["delete".to_string(), kind.to_string()];
+    if let Some(selector) = selector {
+        args.push("-l".to_string());
+        args.push(selector.to_string());
+    } else {
+        args.push("--all".to_string());
+    }
+    args.push("--ignore-not-found".to_string());
+    args.push(timeout.to_string());
     Kubectl::new(config)
         .namespaced(namespace)
-        .command([
-            "delete",
-            kind,
-            "-l",
-            &selector,
-            "--ignore-not-found",
-            &delete_timeout_arg(config),
-        ])
+        .command(args)
+        .run_checked()
+        .map(|_| ())
+}
+
+fn list_kind_json(
+    config: &ClusterTestConfig,
+    namespace: &str,
+    kind: &str,
+    selector: Option<&str>,
+) -> Result<String> {
+    let mut args = vec![
+        "get".to_string(),
+        kind.to_string(),
+        "-o".to_string(),
+        "json".to_string(),
+    ];
+    if let Some(selector) = selector {
+        args.push("-l".to_string());
+        args.push(selector.to_string());
+    }
+    let output = Kubectl::new(config)
+        .namespaced(namespace)
+        .command(args)
         .run_checked()?;
-    Ok(())
+    Ok(output.stdout)
+}
+
+fn stuck_chaos_delete_timeout() -> String {
+    "--timeout=40s".to_string()
+}
+
+/// Chaos Mesh encodes `ScheduleStatus.LastScheduleTime` as `status.time`.
+/// `@every` plus `startingDeadlineSeconds` on 2.8.3 can leave that field
+/// empty forever. After one interval plus the deadline, the harness drives
+/// the kill itself.
+pub const POD_KILL_STORM_SCHEDULE_GRACE: Duration = Duration::from_secs(30);
+
+pub fn pod_kill_storm_needs_controller_loop(elapsed: Duration, schedule_armed: bool) -> bool {
+    !schedule_armed && elapsed >= POD_KILL_STORM_SCHEDULE_GRACE
+}
+
+pub fn names_with_finalizers(list_json: &str) -> Result<Vec<String>> {
+    let value = serde_json::from_str::<Value>(list_json).context("parse chaos list json")?;
+    let items = value
+        .pointer("/items")
+        .and_then(Value::as_array)
+        .context("chaos list did not contain items")?;
+    let mut names = Vec::new();
+    for item in items {
+        let pending = item
+            .pointer("/metadata/finalizers")
+            .and_then(Value::as_array)
+            .is_some_and(|finalizers| !finalizers.is_empty());
+        if !pending {
+            continue;
+        }
+        let name = item
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .context("chaos resource missing metadata.name")?;
+        names.push(name.to_string());
+    }
+    Ok(names)
 }
 
 /// Bounds every label-selector cleanup delete so a chaos CR stuck on a

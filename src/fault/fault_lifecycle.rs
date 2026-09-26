@@ -189,6 +189,7 @@ mod tests {
                 chaos_status: None,
                 dm_status: None,
                 lifecycle_status: None,
+                controller_target_pods: None,
             })
         }
 

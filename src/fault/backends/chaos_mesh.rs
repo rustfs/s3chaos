@@ -31,11 +31,12 @@ use crate::{
 mod runtime;
 
 pub use runtime::{
-    ChaosGuard, apply_iochaos, apply_networkchaos, apply_podchaos, apply_schedule,
-    apply_stresschaos, chaos_schedule_is_armed, cleanup_managed_chaos, cleanup_managed_iochaos,
-    cleanup_managed_networkchaos, cleanup_managed_podchaos, cleanup_managed_stresschaos,
-    cleanup_run, cleanup_run_kind, require_iochaos_crd, require_networkchaos_crd,
-    require_podchaos_crd, require_schedule_crd, require_stresschaos_crd,
+    ChaosGuard, POD_KILL_STORM_SCHEDULE_GRACE, apply_iochaos, apply_networkchaos, apply_podchaos,
+    apply_schedule, apply_stresschaos, chaos_schedule_is_armed, cleanup_managed_chaos,
+    cleanup_managed_iochaos, cleanup_managed_networkchaos, cleanup_managed_podchaos,
+    cleanup_managed_stresschaos, cleanup_podiochaos, cleanup_run, cleanup_run_kind,
+    names_with_finalizers, pod_kill_storm_needs_controller_loop, require_iochaos_crd,
+    require_networkchaos_crd, require_podchaos_crd, require_schedule_crd, require_stresschaos_crd,
 };
 
 pub(crate) const RUN_ID_LABEL: &str = "rustfs-fault-test/run-id";
@@ -1004,7 +1005,7 @@ fn build_fault_spec(
                 FaultKind::RustfsServerNetworkLoss => {
                     let (loss_percent, correlation_percent) =
                         injection.parameters().network_loss()?;
-                    NetworkChaosSpec::loss_one_rustfs_pod(
+                    let mut spec = NetworkChaosSpec::loss_one_rustfs_pod(
                         cluster,
                         &config.chaos_namespace,
                         run_id,
@@ -1012,7 +1013,15 @@ fn build_fault_spec(
                         injection.duration(),
                         loss_percent,
                         correlation_percent,
-                    )?
+                    )?;
+                    if std::env::var("RUSTFS_RELEASE_GATE_NETWORK_LOSS_SCOPE")
+                        .ok()
+                        .as_deref()
+                        == Some("all")
+                    {
+                        spec = spec.with_all_sources();
+                    }
+                    spec
                 }
                 FaultKind::RustfsServerNetworkFlaky => {
                     let (loss_percent, correlation_percent) =
@@ -1168,6 +1177,12 @@ pub struct PodChaosSpec {
     /// `value: n`, which is how quorum-edge scenarios take more than one
     /// server offline at the same instant.
     pub targets: Option<u32>,
+    /// When set, the selector is this Pod name instead of the tenant label,
+    /// so a restart storm cannot kill the port-forward target.
+    pub pinned_pod: Option<String>,
+    /// `Some(0)` is the SIGKILL grace used by the restart-storm fallback.
+    /// `None` omits `gracePeriod` and keeps the historical pod-kill manifest.
+    pub grace_period_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1231,6 +1246,9 @@ pub struct NetworkChaosSpec {
     /// N > 1 renders `mode: fixed` + `value: "N"` so the plan-declared blast
     /// radius is honored instead of silently narrowing to a single Pod.
     pub targets: u32,
+    /// When set, the source selector is `mode: all` so every tenant Pod loses
+    /// packets. The default stays `mode: one`.
+    pub all_sources: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1649,7 +1667,39 @@ impl PodChaosSpec {
             tenant_name: config.tenant_name.clone(),
             action: PodChaosAction::PodKill,
             targets: None,
+            pinned_pod: None,
+            grace_period_seconds: None,
         }
+    }
+
+    /// Pod-kill pinned to one Pod name, with grace 0. The restart-storm
+    /// controller loop uses this when the Chaos Mesh Schedule does not fire.
+    pub fn kill_named_pod(
+        config: &ClusterTestConfig,
+        chaos_namespace: impl Into<String>,
+        run_id: impl Into<String>,
+        scenario: impl Into<String>,
+        pod_name: impl Into<String>,
+    ) -> Result<Self> {
+        let pod_name = pod_name.into();
+        ensure!(
+            !pod_name.is_empty()
+                && pod_name.len() <= 253
+                && pod_name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && !pod_name.starts_with('-')
+                && !pod_name.ends_with('-'),
+            "pinned pod-kill target {pod_name:?} is not a DNS label"
+        );
+        let mut spec = Self::kill_one_rustfs_pod(config, chaos_namespace, run_id, scenario);
+        spec.name = format!(
+            "rustfs-fault-pod-kill-named-{}",
+            spec.run_id.chars().take(12).collect::<String>()
+        );
+        spec.pinned_pod = Some(pod_name);
+        spec.grace_period_seconds = Some(0);
+        Ok(spec)
     }
 
     pub fn fail_one_rustfs_pod(
@@ -1675,6 +1725,8 @@ impl PodChaosSpec {
             tenant_name: config.tenant_name.clone(),
             action: PodChaosAction::PodFailure { duration },
             targets: None,
+            pinned_pod: None,
+            grace_period_seconds: None,
         })
     }
 
@@ -1699,8 +1751,20 @@ impl PodChaosSpec {
     pub fn manifest(&self) -> String {
         let action = self.action_manifest();
         let (mode, value) = match self.targets {
-            Some(targets) => ("fixed", format!("  value: \"{targets}\"\n")),
-            None => ("one", String::new()),
+            Some(targets) if self.pinned_pod.is_none() => {
+                ("fixed", format!("  value: \"{targets}\"\n"))
+            }
+            _ => ("one", String::new()),
+        };
+        let selector = match &self.pinned_pod {
+            Some(pod_name) => format!(
+                "    pods:\n      {}:\n        - {pod_name}",
+                self.target_namespace
+            ),
+            None => format!(
+                "    namespaces:\n      - {}\n    labelSelectors:\n      rustfs.tenant: {}",
+                self.target_namespace, self.tenant_name
+            ),
         };
         format!(
             r#"apiVersion: chaos-mesh.org/v1alpha1
@@ -1716,10 +1780,7 @@ spec:
 {action}
   mode: {mode}
 {value}  selector:
-    namespaces:
-      - {target_namespace}
-    labelSelectors:
-      rustfs.tenant: {tenant_name}
+{selector}
 "#,
             name = self.name,
             namespace = self.namespace,
@@ -1729,8 +1790,7 @@ spec:
             scenario = self.scenario,
             managed_by_label = MANAGED_BY_LABEL,
             managed_by_value = MANAGED_BY_VALUE,
-            target_namespace = self.target_namespace,
-            tenant_name = self.tenant_name,
+            selector = selector,
             action = action,
             mode = mode,
             value = value,
@@ -1739,7 +1799,10 @@ spec:
 
     fn action_manifest(&self) -> String {
         match self.action {
-            PodChaosAction::PodKill => "  action: pod-kill".to_string(),
+            PodChaosAction::PodKill => match self.grace_period_seconds {
+                Some(seconds) => format!("  action: pod-kill\n  gracePeriod: {seconds}"),
+                None => "  action: pod-kill".to_string(),
+            },
             PodChaosAction::PodFailure { duration } => {
                 format!(
                     "  action: pod-failure\n  duration: \"{}s\"",
@@ -1946,6 +2009,7 @@ impl NetworkChaosSpec {
             direction: NetworkChaosDirection::Both,
             duration,
             targets: 1,
+            all_sources: false,
         })
     }
 
@@ -1954,8 +2018,15 @@ impl NetworkChaosSpec {
         self
     }
 
+    pub fn with_all_sources(mut self) -> Self {
+        self.all_sources = true;
+        self
+    }
+
     fn mode_manifest(&self) -> String {
-        if self.targets == 1 {
+        if self.all_sources {
+            "  mode: all".to_string()
+        } else if self.targets == 1 {
             "  mode: one".to_string()
         } else {
             format!("  mode: fixed\n  value: \"{}\"", self.targets)
@@ -2325,9 +2396,10 @@ mod tests {
     use super::{
         FaultSpec, IoChaosAction, IoChaosSpec, IoLatencyParameters, MAX_ERASURE_SET_SHARDS,
         NetworkChaosAction, NetworkChaosDirection, NetworkChaosSpec, NetworkDelayParameters,
-        NetworkPartitionEvidenceContract, PodChaosAction, PodChaosSpec, PodFailureEvidenceContract,
-        ScheduleSpec, StressChaosAction, StressChaosSpec, VolumeTargetEvidenceContract,
-        build_fault_spec, chaos_schedule_is_armed, highest_ordinal_pod_name,
+        NetworkPartitionEvidenceContract, POD_KILL_STORM_SCHEDULE_GRACE, PodChaosAction,
+        PodChaosSpec, PodFailureEvidenceContract, ScheduleSpec, StressChaosAction, StressChaosSpec,
+        VolumeTargetEvidenceContract, build_fault_spec, chaos_schedule_is_armed,
+        highest_ordinal_pod_name, names_with_finalizers, pod_kill_storm_needs_controller_loop,
         runtime::chaos_experiment_is_active, validate_fixed_volume_snapshot,
         validate_network_partition_snapshot, validate_pod_failure_snapshot,
         volume_fault_runtime_contract,
@@ -2348,6 +2420,36 @@ mod tests {
             percent: 20,
             object_count: 12,
         }
+    }
+
+    #[test]
+    fn network_loss_all_sources_renders_mode_all() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let spec = NetworkChaosSpec::loss_one_rustfs_pod(
+            &config.cluster,
+            "chaos-mesh",
+            "run-1234567890",
+            "network-loss",
+            Duration::from_secs(60),
+            80,
+            0,
+        )
+        .expect("loss spec")
+        .with_all_sources();
+        let manifest = spec.manifest();
+        assert!(manifest.contains("\n  mode: all\n"), "{manifest}");
+        assert!(!manifest.contains("\n  mode: one\n"), "{manifest}");
+        let one = NetworkChaosSpec::loss_one_rustfs_pod(
+            &config.cluster,
+            "chaos-mesh",
+            "run-1234567890",
+            "network-loss",
+            Duration::from_secs(60),
+            80,
+            0,
+        )
+        .expect("default loss spec");
+        assert!(one.manifest().contains("\n  mode: one\n"));
     }
 
     #[test]
@@ -3462,6 +3564,64 @@ mod tests {
         assert!(highest_ordinal_pod_name(["pool-1", "other-1"]).is_err());
         assert!(highest_ordinal_pod_name(["pool-a"]).is_err());
         assert!(highest_ordinal_pod_name(std::iter::empty()).is_err());
+    }
+
+    #[test]
+    fn named_pod_kill_pins_the_storm_victim_with_sigkill_grace() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let spec = PodChaosSpec::kill_named_pod(
+            &config.cluster,
+            "chaos-mesh",
+            "loop0001",
+            "pod-restart-storm",
+            "tenant-pool-0-3",
+        )
+        .expect("pinned kill");
+        let manifest = spec.manifest();
+        assert!(manifest.contains("gracePeriod: 0"));
+        assert!(manifest.contains("tenant-pool-0-3"));
+        assert!(manifest.contains("pods:"));
+        assert!(!manifest.contains("labelSelectors"));
+        assert!(manifest.contains("\n  mode: one\n"));
+        assert!(
+            PodChaosSpec::kill_named_pod(
+                &config.cluster,
+                "chaos-mesh",
+                "loop0001",
+                "pod-restart-storm",
+                "Not_A_Pod",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn schedule_that_never_arms_falls_back_after_the_grace_window() {
+        assert!(!pod_kill_storm_needs_controller_loop(
+            Duration::from_secs(29),
+            false
+        ));
+        assert!(pod_kill_storm_needs_controller_loop(
+            POD_KILL_STORM_SCHEDULE_GRACE,
+            false
+        ));
+        assert!(!pod_kill_storm_needs_controller_loop(
+            Duration::from_secs(120),
+            true
+        ));
+    }
+
+    #[test]
+    fn stuck_iochaos_finalizers_are_the_ones_cleanup_clears() {
+        let names = names_with_finalizers(
+            r#"{"items":[
+                {"metadata":{"name":"stuck","finalizers":["chaos-mesh/records"]}},
+                {"metadata":{"name":"clean","finalizers":[]}},
+                {"metadata":{"name":"live"}}
+            ]}"#,
+        )
+        .expect("list");
+        assert_eq!(names, vec!["stuck".to_string()]);
     }
 
     #[test]

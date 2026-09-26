@@ -1656,6 +1656,36 @@ impl WorkloadSummary {
             + self.multipart_completes.disrupted()
             + self.multipart_aborts.disrupted()
     }
+
+    pub(in crate::fault) fn attempted(&self) -> usize {
+        self.puts.total()
+            + self.gets.total()
+            + self.deletes.total()
+            + self.lists.total()
+            + self.multipart_completes.total()
+            + self.multipart_aborts.total()
+    }
+}
+
+/// Network-loss passes only when a sustained sample's error rate meets the
+/// threshold. A single disrupted call in a quiet window is not enough, and a
+/// quiet window is not a pass.
+pub(in crate::fault) fn sustained_error_rate(
+    attempted: usize,
+    disrupted: usize,
+    min_percent: u8,
+    min_attempts: usize,
+) -> Result<()> {
+    ensure!(
+        attempted >= min_attempts,
+        "network-loss sample has {attempted} attempts; need at least {min_attempts}"
+    );
+    let rate = disrupted.saturating_mul(100) / attempted;
+    ensure!(
+        rate >= usize::from(min_percent),
+        "network-loss error rate {rate}% ({disrupted}/{attempted}) is below the {min_percent}% threshold"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
@@ -1697,6 +1727,14 @@ mod tests {
     use serde_json::json;
 
     use std::time::Duration;
+
+    #[test]
+    fn network_loss_rate_needs_a_sustained_sample() {
+        assert!(super::sustained_error_rate(100, 0, 10, 30).is_err());
+        assert!(super::sustained_error_rate(100, 20, 10, 30).is_ok());
+        assert!(super::sustained_error_rate(5, 5, 10, 30).is_err());
+        assert!(super::sustained_error_rate(30, 3, 10, 30).is_ok());
+    }
 
     #[test]
     fn mixed_workload_progress_records_the_starting_snapshot() {

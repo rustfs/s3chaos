@@ -1125,7 +1125,14 @@ fn exhaustive_entries(root: &Path) -> Result<Vec<String>> {
 
 fn device_id(metadata: &fs::Metadata) -> String {
     let device = metadata.dev();
-    format!("{}:{}", libc::major(device), libc::minor(device))
+    #[cfg(target_os = "linux")]
+    {
+        format!("{}:{}", libc::major(device), libc::minor(device))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        format!("{device}")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2942,6 +2949,7 @@ impl<'a> FreshVolumeDriver<'a> {
             chaos_status: Some(serde_json::from_str(&guard.json()?)?),
             dm_status: None,
             lifecycle_status: None,
+            controller_target_pods: None,
         })?;
         Ok(ControllerSnapshotEvidence {
             phase: phase.to_string(),

@@ -2782,15 +2782,7 @@ fn open_beneath(root: &File, relative: &str, flags: i32, mode: u32) -> Result<Fi
         mode: u64::from(mode),
         resolve: STORAGE_RESOLVE_FLAGS,
     };
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            root.as_raw_fd(),
-            path.as_ptr(),
-            &how,
-            size_of::<OpenHow>(),
-        )
-    } as i32;
+    let fd = openat2_fd(root.as_raw_fd(), &path, &how);
     if fd < 0 {
         return Err(std::io::Error::last_os_error())
             .with_context(|| format!("open contained storage path {relative:?}"));
@@ -2813,15 +2805,7 @@ fn ensure_absent_beneath(root: &File, relative: &str) -> Result<()> {
         mode: 0,
         resolve: STORAGE_RESOLVE_FLAGS,
     };
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            root.as_raw_fd(),
-            path.as_ptr(),
-            &how,
-            size_of::<OpenHow>(),
-        )
-    } as i32;
+    let fd = openat2_fd(root.as_raw_fd(), &path, &how);
     if fd >= 0 {
         drop(unsafe { File::from_raw_fd(fd) });
         bail!("run-owned stale orphan remains present after cleanup")
@@ -2972,11 +2956,44 @@ fn required<'a>(value: &'a Option<String>, label: &str) -> Result<&'a str> {
         .with_context(|| format!("{label} is absent"))
 }
 
+fn openat2_fd(dirfd: i32, path: &CString, how: &OpenHow) -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                dirfd,
+                path.as_ptr(),
+                how,
+                size_of::<OpenHow>(),
+            ) as i32
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (dirfd, path, how);
+        // RESOLVE_BENEATH is Linux-only. Fail closed instead of opening with
+        // a weaker check. The release-gate artifact command does not need it.
+        #[cfg(target_os = "macos")]
+        unsafe {
+            *libc::__error() = libc::ENOSYS;
+        }
+        -1
+    }
+}
+
 fn device_id(metadata: &std::fs::Metadata) -> String {
     let device = metadata.dev();
-    let major = libc::major(device);
-    let minor = libc::minor(device);
-    format!("{major}:{minor}")
+    #[cfg(target_os = "linux")]
+    {
+        let major = libc::major(device);
+        let minor = libc::minor(device);
+        format!("{major}:{minor}")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        format!("{device}")
+    }
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {

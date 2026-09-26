@@ -695,6 +695,86 @@ analyze_qualification "$2"
     assert_eq!(analysis["qualificationResult"]["outcome"], "failed");
 }
 
+#[cfg(unix)]
+#[test]
+fn min_ready_nodes_follow_spread_and_an_explicit_override() {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+source "$1"
+unset RUSTFS_FAULT_TEST_MIN_NODES
+unset RUSTFS_FAULT_TEST_TENANT_SPREAD_ACROSS_HOSTS
+printf 'default:%s\n' "$(resolve_min_ready_nodes)"
+RUSTFS_FAULT_TEST_TENANT_SPREAD_ACROSS_HOSTS=false
+printf 'spread-off:%s\n' "$(resolve_min_ready_nodes)"
+RUSTFS_FAULT_TEST_MIN_NODES=3
+printf 'override:%s\n' "$(resolve_min_ready_nodes)"
+"#,
+            "fault-min-nodes-test",
+            script,
+        ])
+        .output()
+        .expect("resolve min ready nodes");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "default:4\nspread-off:1\noverride:3\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stuck_chaos_finalizers_are_cleared_by_name() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+source "$1"
+CHAOS_NAMESPACE=chaos-ns
+FAULT_NAMESPACE=fault-ns
+MANAGER_SELECTOR='app.kubernetes.io/managed-by=s3chaos'
+LOG="$2/kubectl.log"
+kubectl_ns() {
+  printf '%s\n' "$*" >>"$LOG"
+  if [[ "$1" == chaos-ns && "$2" == get && "$3" == iochaos ]]; then
+    printf 'stuck-io\n'
+  elif [[ "$1" == fault-ns && "$2" == get && "$3" == podiochaos ]]; then
+    printf 'stuck-podio\n'
+  fi
+}
+clear_stuck_chaos_finalizers
+"#,
+            "fault-finalizer-cleanup-test",
+            script,
+            temporary.path().to_str().expect("temporary path"),
+        ])
+        .output()
+        .expect("clear stuck chaos finalizers");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = std::fs::read_to_string(temporary.path().join("kubectl.log")).expect("kubectl log");
+    assert!(log.contains("chaos-ns patch iochaos stuck-io"), "{log}");
+    assert!(
+        log.contains("fault-ns patch podiochaos stuck-podio"),
+        "{log}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("clearing finalizers on stuck iochaos/stuck-io")
+    );
+}
+
 #[tokio::test]
 #[ignore = "destructive RustFS workload fault scenario; select with RUSTFS_FAULT_TEST_SCENARIO"]
 async fn fault_selected_scenario() -> Result<()> {
