@@ -178,6 +178,11 @@ containerd 套接字。套接字仅 root 可写时，脚本使用 `sudo -n`，�
   挂载、open count 大于 1（宿主机挂载本身算 1），或者该设备的
   major:minor 出现在 PID 1 以外的挂载命名空间（`/proc/*/mountinfo`，包括
   hostPath Pod）时，结果是 `SKIP-dm-in-use`，不算通过，也不会卸载这个卷。
+  `master:N` 等于宿主该挂载 `shared:N`、且挂载点就是该路径或其子目录的
+  slave 不是占用者：systemd 服务收到的是这种副本，宿主卸载时它们会一起
+  消失。`kubepods` cgroup 里的进程仍然是占用者，包括以相同 `master:N`
+  传播进来的 hostPath。扫描把 `in-use`、`clear` 或 `error` 打到 stdout
+  并以 0 退出。
   在选中的 `dm-run` 之前和
   之后，如果故障 Tenant 的 pool 或其 PVC 使用
   `RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS`，门禁会删除这个 Tenant，只删除

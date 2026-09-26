@@ -446,26 +446,111 @@ rg_dm_open_count() {
   return 1
 }
 
-# Returns 0 when some mount namespace other than PID 1 has this major:minor.
-# Returns 1 when the scan finishes and only the host namespace has it.
+# Prints dev, mount point, shared id, and master id, separated by ASCII 0x1f.
+# shared and master are empty when that optional field is absent.
+# Returns 1 when the line is not a mountinfo record.
+rg_dm_mountinfo_ids() {
+  local line="$1"
+  local -a tok
+  local n i dev point shared="" master=""
+  [[ -n "$line" ]] || return 1
+  read -r -a tok <<<"$line"
+  n=${#tok[@]}
+  # id, parent, maj:min, root, mount point, options, then optional fields and '-'.
+  [[ "$n" -ge 7 ]] || return 1
+  dev="${tok[2]}"
+  point="${tok[4]}"
+  [[ "$dev" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+  for ((i = 6; i < n; i++)); do
+    [[ "${tok[$i]}" == "-" ]] && break
+    case "${tok[$i]}" in
+      shared:[0-9]*)
+        shared="${tok[$i]#shared:}"
+        [[ "$shared" =~ ^[0-9]+$ ]] || shared=""
+        ;;
+      master:[0-9]*)
+        master="${tok[$i]#master:}"
+        [[ "$master" =~ ^[0-9]+$ ]] || master=""
+        ;;
+    esac
+  done
+  # Unit separator, not tab: a blank shared id must not swallow master.
+  printf '%s\037%s\037%s\037%s\n' "$dev" "$point" "$shared" "$master"
+}
+
+# Returns 0 when some mount namespace other than PID 1 has this major:minor
+# as a real holder. Returns 1 when the scan finishes without one.
 # Returns 2 when the scan cannot be trusted.
+# $3 is the host mount path. A slave whose master:N equals the host mount's
+# shared:N, and whose mount point is that path or a directory under it,
+# disappears when the host unmounts (systemd PrivateTmp/ProtectSystem copies).
+# It is not a holder. A kubepods cgroup is a holder even for that slave shape,
+# because a hostPath volume with HostToContainer propagation uses the same
+# master id. Field 3 is the only major:minor; later fields are not.
 rg_dm_proc_has_foreign_mount() {
-  local majmin="$1" proc_root="$2" host_ns pid_dir pid ns
+  local majmin="$1" proc_root="$2" host_path="$3"
+  local host_ns pid_dir pid ns host_shared="" found_host=false
+  local line parsed dev point shared master saw slave_only
   [[ "$majmin" =~ ^[0-9]+:[0-9]+$ ]] || return 2
+  [[ "$host_path" == /* && "$host_path" != *" "* && "$host_path" != *"/" ]] || return 2
   host_ns="$(readlink "${proc_root}/1/ns/mnt" 2>/dev/null || true)"
   [[ -n "$host_ns" ]] || return 2
-  for pid_dir in "${proc_root}"/*; do
+  [[ -r "${proc_root}/1/mountinfo" ]] || return 2
+  while IFS= read -r line || [[ -n "${line:-}" ]]; do
+    parsed="$(rg_dm_mountinfo_ids "$line" || true)"
+    [[ -n "$parsed" ]] || continue
+    IFS=$'\037' read -r dev point shared master <<<"$parsed"
+    if [[ "$dev" == "$majmin" && "$point" == "$host_path" ]]; then
+      found_host=true
+      host_shared="$shared"
+      break
+    fi
+  done <"${proc_root}/1/mountinfo"
+  [[ "$found_host" == true ]] || return 2
+  for pid_dir in "${proc_root}"/[0-9]*; do
     pid="${pid_dir##*/}"
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
     [[ "$pid" == 1 ]] && continue
     ns="$(readlink "${pid_dir}/ns/mnt" 2>/dev/null || true)"
     [[ -n "$ns" && "$ns" != "$host_ns" ]] || continue
-    if awk -v dev="$majmin" '$3 == dev { found=1; exit } END { exit !found }' "${pid_dir}/mountinfo" 2>/dev/null; then
+    [[ -r "${pid_dir}/mountinfo" ]] || continue
+    saw=false
+    slave_only=true
+    while IFS= read -r line || [[ -n "${line:-}" ]]; do
+      parsed="$(rg_dm_mountinfo_ids "$line" || true)"
+      [[ -n "$parsed" ]] || continue
+      IFS=$'\037' read -r dev point shared master <<<"$parsed"
+      [[ "$dev" == "$majmin" ]] || continue
+      saw=true
+      if [[ -n "$host_shared" && "$master" == "$host_shared" && ( "$point" == "$host_path" || "$point" == "$host_path"/* ) ]]; then
+        continue
+      fi
+      slave_only=false
+      break
+    done <"${pid_dir}/mountinfo"
+    [[ "$saw" == true ]] || continue
+    # Only propagated slaves remain. An unreadable cgroup cannot prove the
+    # process is outside kubepods, so it stays a holder.
+    if [[ "$slave_only" == false ]] || [[ ! -r "${pid_dir}/cgroup" ]] || grep -q kubepods "${pid_dir}/cgroup"; then
       echo "device ${majmin} is mounted in mount namespace ${ns} (pid ${pid})" >&2
       return 0
     fi
   done
   return 1
+}
+
+# Stdout is in-use, clear, or error. The exit status is always 0 so a clear
+# scan is not reported as "command terminated with exit code 1".
+rg_dm_foreign_scan_token() {
+  local rc=0
+  rg_dm_proc_has_foreign_mount "$@" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    printf '%s\n' in-use
+  elif [[ "$rc" -eq 1 ]]; then
+    printf '%s\n' clear
+  else
+    printf '%s\n' error
+  fi
 }
 
 rg_dm_majmin() {
@@ -481,13 +566,27 @@ rg_dm_majmin() {
 # share the superblock, so the host open count stays 1 and findmnt -S on
 # the host does not list them.
 rg_dm_foreign_mount() {
-  local majmin="$1" bash_bin body rc
+  local majmin="$1" bash_bin body line rc=0
   bash_bin="$(rg_dm_resolve_optional bash)" || bash_bin="$(rg_dm_resolve_optional sh)" || return 2
-  body="$(declare -f rg_dm_proc_has_foreign_mount)"
-  # set -e is global. Leave it to the caller so a "not found" exit can be read.
-  rg_dm_host_exec "$bash_bin" -c "${body}
-rg_dm_proc_has_foreign_mount \"\$1\" /proc" _ "$majmin" && rc=0 || rc=$?
-  return "$rc"
+  body="$(declare -f rg_dm_mountinfo_ids rg_dm_proc_has_foreign_mount rg_dm_foreign_scan_token)"
+  # The host command exits 0. clear used to be exit 1, and kubectl then
+  # printed "command terminated with exit code 1" twice per dm-error run.
+  line="$(
+    rg_dm_host_exec "$bash_bin" -c "${body}
+rg_dm_foreign_scan_token \"\$1\" /proc \"\$2\"" _ "$majmin" "$mount_path"
+  )" || rc=$?
+  if [[ "$rc" != 0 ]]; then
+    echo "mount namespace scan failed" >&2
+    return 2
+  fi
+  case "$line" in
+    in-use) return 0 ;;
+    clear) return 1 ;;
+    *)
+      echo "mount namespace scan returned ${line:-empty}" >&2
+      return 2
+      ;;
+  esac
 }
 
 # The host fixture mount accounts for one open. A pod mount, a foreign
@@ -1016,7 +1115,7 @@ EOF
 
   dm-mountinfo-foreign)
     set +e
-    rg_dm_proc_has_foreign_mount "${2-}" "${3-}"
+    rg_dm_proc_has_foreign_mount "${2-}" "${3-}" "${4-}"
     rc=$?
     set -e
     if [[ "$rc" == 0 ]]; then
@@ -1027,6 +1126,10 @@ EOF
       printf 'error\n'
       exit 1
     fi
+    ;;
+
+  dm-mountinfo-status)
+    rg_dm_foreign_scan_token "${2-}" "${3-}" "${4-}"
     ;;
 
   dm-ext-state)

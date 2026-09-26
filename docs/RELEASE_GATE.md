@@ -203,7 +203,13 @@ re-running it. They are the contract the Mac Mini campaign already produced.
   mount of the device, an open count above 1 (the host mount is one), or
   the device's major:minor in a mount namespace other than PID 1
   (`/proc/*/mountinfo`, including a hostPath pod) is `SKIP-dm-in-use` and
-  does not pass. The producer does not unmount that volume. Before and
+  does not pass. A slave whose `master:N` equals the host mount's
+  `shared:N`, and whose mount point is that path or a directory under it,
+  is not a holder: systemd services receive those copies and they disappear
+  when the host unmounts. A process in a `kubepods` cgroup is still a
+  holder, including a hostPath mount that propagates with the same
+  `master:N`. The scan prints `in-use`, `clear`, or `error` and exits 0.
+  The producer does not unmount that volume. Before and
   after the selected `dm-run`, the gate deletes
   the fault Tenant when that Tenant's pool or its PVCs use
   `RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS`, deletes only the fault-namespace

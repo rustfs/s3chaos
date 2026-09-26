@@ -3646,6 +3646,7 @@ mod tests {
                 .arg("dm-mountinfo-foreign")
                 .arg(majmin)
                 .arg(&proc_root)
+                .arg("/data")
                 .env("RELEASE_GATE_ARTIFACT_DIR", dir.path())
                 .output()
                 .expect("scan");
@@ -3665,6 +3666,105 @@ mod tests {
         assert_eq!(scan("252:4"), (true, "in-use".to_string()));
         fs::remove_file(proc_root.join("1").join("ns").join("mnt")).expect("unlink");
         assert!(!scan("252:4").0);
+    }
+
+    #[test]
+    fn dm_error_systemd_slave_mount_is_not_a_holder() {
+        let dir = tempfile::tempdir().expect("temp");
+        let proc_root = dir.path().join("proc");
+        let host_path = "/data/rustfs/rustfs-fault-lab/volume0";
+        let write_pid = |pid: &str, ns: &str, mountinfo: &str, cgroup: Option<&str>| {
+            let pid_dir = proc_root.join(pid);
+            fs::create_dir_all(pid_dir.join("ns")).expect("ns");
+            std::os::unix::fs::symlink(ns, pid_dir.join("ns").join("mnt")).expect("symlink");
+            fs::write(pid_dir.join("mountinfo"), mountinfo).expect("mountinfo");
+            if let Some(text) = cgroup {
+                fs::write(pid_dir.join("cgroup"), text).expect("cgroup");
+            }
+        };
+        let host = "1763 32 252:4 / /data/rustfs/rustfs-fault-lab/volume0 rw,relatime shared:1000 - ext4 /dev/mapper/rustfs-fault-dm rw\n";
+        write_pid("1", "mnt:[111]", host, None);
+        // systemd-udevd: slave of the host peer group, plus a later field that
+        // only looks like the device. Same shape as logind/resolved/timesyncd.
+        write_pid(
+            "133421",
+            "mnt:[4026532372]",
+            "1800 2577 8:1 / /var rw,relatime shared:12 - ext4 /dev/mapper/252:4 rw\n\
+             1804 2577 252:4 / /data/rustfs/rustfs-fault-lab/volume0 rw,relatime shared:1006 master:1000 - ext4 /dev/mapper/rustfs-fault-dm rw\n",
+            Some("0::/system.slice/systemd-udevd.service\n"),
+        );
+        write_pid(
+            "900",
+            "mnt:[4026532400]",
+            "1810 2577 252:4 / /data/rustfs/rustfs-fault-lab/volume0/nested rw,relatime master:1000 - ext4 /dev/mapper/rustfs-fault-dm rw\n",
+            Some("0::/system.slice/systemd-logind.service\n"),
+        );
+        let run = |mode: &str| {
+            let output = Command::new("bash")
+                .arg("scripts/release-gate-evidence.sh")
+                .arg(mode)
+                .arg("252:4")
+                .arg(&proc_root)
+                .arg(host_path)
+                .env("RELEASE_GATE_ARTIFACT_DIR", dir.path())
+                .output()
+                .expect("scan");
+            (
+                output.status.success(),
+                String::from_utf8_lossy(&output.stdout).trim().to_string(),
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            )
+        };
+        let idle = run("dm-mountinfo-foreign");
+        assert_eq!((idle.0, idle.1.as_str()), (true, "clear"), "{}", idle.2);
+        let status = run("dm-mountinfo-status");
+        assert!(status.0, "clear scan must exit 0: {}", status.2);
+        assert_eq!(status.1, "clear");
+
+        // Round-6 hostPath: a private bind at the container path, no master tag.
+        write_pid(
+            "1729546",
+            "mnt:[4026533734]",
+            "2401 88 252:4 / /volume0 rw,relatime - ext4 /dev/mapper/rustfs-fault-dm rw\n",
+            Some(
+                "0::/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podabc.slice/cri-containerd-xyz.scope\n",
+            ),
+        );
+        let held = run("dm-mountinfo-foreign");
+        assert_eq!((held.0, held.1.as_str()), (true, "in-use"), "{}", held.2);
+        assert!(held.2.contains("pid 1729546"), "{}", held.2);
+        fs::remove_dir_all(proc_root.join("1729546")).expect("rm hostpath");
+
+        // HostToContainer can copy master:1000 onto the host path. kubepods stays a holder.
+        write_pid(
+            "1729547",
+            "mnt:[4026533735]",
+            "2402 88 252:4 / /data/rustfs/rustfs-fault-lab/volume0 rw,relatime master:1000 shared:1009 - ext4 /dev/mapper/rustfs-fault-dm rw\n",
+            Some("1:name=systemd:/kubepods/burstable/podabc/containerxyz\n"),
+        );
+        let propagated = run("dm-mountinfo-foreign");
+        assert_eq!(
+            (propagated.0, propagated.1.as_str()),
+            (true, "in-use"),
+            "{}",
+            propagated.2
+        );
+        assert!(propagated.2.contains("pid 1729547"), "{}", propagated.2);
+        fs::remove_dir_all(proc_root.join("1729547")).expect("rm propagated");
+
+        // master:1000 at an unrelated path is not the host mount's slave copy.
+        write_pid(
+            "901",
+            "mnt:[4026532501]",
+            "1900 70 252:4 / /mnt/other rw,relatime master:1000 - ext4 /dev/mapper/rustfs-fault-dm rw\n",
+            Some("0::/system.slice/systemd-resolved.service\n"),
+        );
+        let other = run("dm-mountinfo-foreign");
+        assert_eq!((other.0, other.1.as_str()), (true, "in-use"), "{}", other.2);
+        fs::remove_dir_all(proc_root.join("901")).expect("rm other");
+
+        // Same slave shape outside kubepods is still not a holder.
+        assert_eq!(run("dm-mountinfo-status").1, "clear");
     }
 
     #[test]
