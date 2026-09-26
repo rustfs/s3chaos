@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -599,10 +600,40 @@ fn run_fault_scenario(request: &ReleaseGateRequest, scenario: &str) -> Outcome {
             ),
         };
     }
+    if device_mapper {
+        if let Some(reason) = dm_preflight_topology_skip() {
+            return Outcome {
+                status: CaseStatus::Skip,
+                reason,
+            };
+        }
+        if let Err(error) = reset_dm_static_pvs() {
+            return Outcome {
+                status: CaseStatus::Fail,
+                reason: error,
+            };
+        }
+    }
     let script = PathBuf::from("scripts/fault-test.sh");
     let mut command = Command::new("bash");
     let entry = if device_mapper { "dm-run" } else { "run" };
-    command.arg(&script).arg(entry).arg(scenario);
+    let dm_log = request.artifact_dir.join("dm-run.log");
+    if device_mapper {
+        // A previous run's log must not turn this failure into SKIP-dm-topology.
+        let _ = fs::remove_file(&dm_log);
+        command
+            .arg("-o")
+            .arg("pipefail")
+            .arg("-c")
+            .arg(r#"bash "$1" "$2" "$3" 2>&1 | tee "$4""#)
+            .arg("release-gate-dm")
+            .arg(&script)
+            .arg(entry)
+            .arg(scenario)
+            .arg(&dm_log);
+    } else {
+        command.arg(&script).arg(entry).arg(scenario);
+    }
     if let Some(image) = &request.image {
         command.env("RUSTFS_FAULT_TEST_SERVER_IMAGE", image);
     }
@@ -622,15 +653,130 @@ fn run_fault_scenario(request: &ReleaseGateRequest, scenario: &str) -> Outcome {
             status: CaseStatus::Pass,
             reason: format!("fault scenario {scenario} passed"),
         },
-        Ok(status) => Outcome {
-            status: CaseStatus::Fail,
-            reason: format!("fault scenario {scenario} exited {status}"),
-        },
+        Ok(status) => {
+            if device_mapper {
+                let text = fs::read_to_string(&dm_log).unwrap_or_default();
+                if let Some(reason) = dm_topology_skip_from_output(&text) {
+                    return Outcome {
+                        status: CaseStatus::Skip,
+                        reason,
+                    };
+                }
+            }
+            Outcome {
+                status: CaseStatus::Fail,
+                reason: format!("fault scenario {scenario} exited {status}"),
+            }
+        }
         Err(error) => Outcome {
             status: CaseStatus::Fail,
             reason: format!("failed to start fault scenario {scenario}: {error}"),
         },
     }
+}
+
+fn reset_dm_static_pvs() -> Result<(), String> {
+    let output = Command::new("bash")
+        .arg("scripts/release-gate-evidence.sh")
+        .arg("reset-dm-pvs")
+        .output()
+        .map_err(|error| format!("failed to start reset-dm-pvs: {error}"))?;
+    let _ = std::io::stderr().write_all(&output.stderr);
+    let _ = std::io::stdout().write_all(&output.stdout);
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "reset-dm-pvs exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+/// Colocated pods share one node. dm-flakey requires that node to host exactly
+/// one RustFS pod, which a single-node cluster or an unspread tenant cannot do
+/// when the pod count is not 1.
+fn dm_pods_cannot_be_isolated(
+    ready_nodes: usize,
+    spread_across_hosts: bool,
+    pod_count: usize,
+) -> bool {
+    // Zero ready nodes is a dead cluster, not this topology limit.
+    ready_nodes > 0 && pod_count != 1 && (ready_nodes < 2 || !spread_across_hosts)
+}
+
+fn dm_preflight_topology_skip() -> Option<String> {
+    let pod_count = std::env::var("RUSTFS_FAULT_TEST_RUSTFS_POD_COUNT")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or(4);
+    let spread_across_hosts = std::env::var("RUSTFS_FAULT_TEST_TENANT_SPREAD_ACROSS_HOSTS")
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "false" | "0" | "no")
+        })
+        .unwrap_or(true);
+    let ready_nodes = ready_node_count()?;
+    if dm_pods_cannot_be_isolated(ready_nodes, spread_across_hosts, pod_count) {
+        Some(format!(
+            "SKIP-dm-topology: device-mapper needs exactly one RustFS pod on the DM node; ready nodes={ready_nodes}, spread_across_hosts={spread_across_hosts}, pod count={pod_count}"
+        ))
+    } else {
+        None
+    }
+}
+
+fn ready_node_count() -> Option<usize> {
+    let output = Command::new("kubectl")
+        .args(["get", "nodes", "-o", "json", "--request-timeout=10s"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let ready = value
+        .get("items")?
+        .as_array()?
+        .iter()
+        .filter(|node| {
+            node.pointer("/spec/unschedulable") != Some(&serde_json::Value::Bool(true))
+                && node
+                    .pointer("/status/conditions")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|conditions| {
+                        conditions.iter().any(|condition| {
+                            condition.get("type").and_then(serde_json::Value::as_str)
+                                == Some("Ready")
+                                && condition.get("status").and_then(serde_json::Value::as_str)
+                                    == Some("True")
+                        })
+                    })
+        })
+        .count();
+    Some(ready)
+}
+
+fn dm_topology_skip_from_output(output: &str) -> Option<String> {
+    const NEEDLE: &str = "must host exactly one RustFS fault-test Pod, found ";
+    for line in output.lines() {
+        let Some(index) = line.find(NEEDLE) else {
+            continue;
+        };
+        let count: String = line[index + NEEDLE.len()..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect();
+        if count.is_empty() || count == "1" {
+            continue;
+        }
+        return Some(format!(
+            "SKIP-dm-topology: device-mapper target node must host exactly one RustFS fault-test Pod, found {count}"
+        ));
+    }
+    None
 }
 
 fn run_protocol_suite(request: &ReleaseGateRequest, suite: &str) -> Outcome {
@@ -2579,17 +2725,15 @@ fn capture_release_binary(dir: &Path, arch: &str) -> Result<()> {
             dir.join("rustfs-image-libc.txt"),
             format!("{}\n", libc_of_zip(zip_path)),
         )?;
-        let mut version_error = None;
-        if capture_version(&binary, dir).is_err() {
-            if let Some(macos_zip) = macos_release_zip(dir, arch) {
-                let staged = dir.join("rustfs-version-bin");
-                extract_rustfs_binary(&macos_zip, &staged)?;
-                // otool must be captured even when dyld cannot execute the binary.
-                capture_otool(&staged, &dir.join("rustfs-otool.txt"))?;
-                version_error = capture_version(&staged, dir).err();
-                let _ = fs::remove_file(&staged);
-            } else {
-                capture_version(&binary, dir)?;
+        let macos_zip = macos_release_zip(dir, arch);
+        if version_binary_prefers_host_zip(std::env::consts::OS, macos_zip.is_some()) {
+            let macos_zip = macos_zip.ok_or_else(|| anyhow::anyhow!("missing host zip"))?;
+            record_host_version(&macos_zip, dir)?;
+        } else if let Err(error) = capture_version(&binary, dir) {
+            if let Some(macos_zip) = macos_zip {
+                record_host_version(&macos_zip, dir)?;
+            } else if !dir.join("rustfs-version.txt").is_file() {
+                return Err(error);
             }
         }
         for zip_path in &linux {
@@ -2598,14 +2742,15 @@ fn capture_release_binary(dir: &Path, arch: &str) -> Result<()> {
             capture_ldd(&staged, &dir.join(ldd_report_name(zip_path)))?;
             let _ = fs::remove_file(&staged);
         }
-        if let Some(error) = version_error {
-            return Err(error);
-        }
     } else if let Some(zip_path) = macos_release_zip(dir, arch) {
         let binary = dir.join("rustfs");
         extract_rustfs_binary(&zip_path, &binary)?;
         capture_otool(&binary, &dir.join("rustfs-otool.txt"))?;
-        capture_version(&binary, dir)?;
+        if let Err(error) = capture_version(&binary, dir)
+            && !dir.join("rustfs-version.txt").is_file()
+        {
+            return Err(error);
+        }
     }
     if let Some(zip_path) = macos_release_zip(dir, arch)
         && !dir.join("rustfs-otool.txt").is_file()
@@ -2651,6 +2796,25 @@ fn extract_rustfs_binary(zip_path: &Path, dest: &Path) -> Result<()> {
     bail!("{} has no rustfs binary", zip_path.display());
 }
 
+fn version_binary_prefers_host_zip(os: &str, has_host_zip: bool) -> bool {
+    os == "macos" && has_host_zip
+}
+
+fn record_host_version(zip_path: &Path, dir: &Path) -> Result<()> {
+    let staged = dir.join("rustfs-version-bin");
+    extract_rustfs_binary(zip_path, &staged)?;
+    // otool must be captured even when dyld cannot execute the binary.
+    capture_otool(&staged, &dir.join("rustfs-otool.txt"))?;
+    let version_result = capture_version(&staged, dir);
+    let _ = fs::remove_file(&staged);
+    if let Err(error) = version_result
+        && !dir.join("rustfs-version.txt").is_file()
+    {
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn capture_version(binary: &Path, dir: &Path) -> Result<()> {
     let version = Command::new(binary)
         .arg("--version")
@@ -2663,8 +2827,16 @@ fn capture_version(binary: &Path, dir: &Path) -> Result<()> {
         }
         text.push_str(&String::from_utf8_lossy(&version.stderr));
     }
-    fs::write(dir.join("rustfs-version.txt"), text)
+    fs::write(dir.join("rustfs-version.txt"), &text)
         .with_context(|| format!("write {}", dir.join("rustfs-version.txt").display()))?;
+    if !version.status.success() {
+        bail!(
+            "{} --version exited {}: {}",
+            binary.display(),
+            version.status,
+            text.trim()
+        );
+    }
     Ok(())
 }
 
@@ -3119,6 +3291,7 @@ mod tests {
             "SKIP-no-privileged: cannot remount",
             "SKIP-unsafe-shared-fs: local-path",
             "SKIP-no-dm-device: env missing",
+            "SKIP-dm-topology: four pods on one node",
             "SKIP-no-unzip: no extractor",
         ] {
             assert!(!skip_is_passing(reason, &request), "{reason}");
@@ -3217,6 +3390,60 @@ mod tests {
         )
         .expect("static");
         assert_eq!(dynamic_dep_outcome(dir.path()).status, CaseStatus::Pass);
+    }
+
+    #[test]
+    fn capture_version_records_a_failed_exit() {
+        let dir = tempfile::tempdir().expect("temp");
+        let script = dir.path().join("fail.sh");
+        fs::write(&script, "#!/bin/sh\necho cannot-exec >&2\nexit 1\n").expect("script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("mode");
+        }
+        let error = capture_version(&script, dir.path()).expect_err("nonzero");
+        let text = fs::read_to_string(dir.path().join("rustfs-version.txt")).expect("version");
+        assert!(text.contains("cannot-exec"), "{text}");
+        assert!(error.to_string().contains("exited"), "{error}");
+        let ok = dir.path().join("ok.sh");
+        fs::write(&ok, "#!/bin/sh\necho rustfs 1.0.1-preview.11\n").expect("script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&ok, fs::Permissions::from_mode(0o755)).expect("mode");
+        }
+        capture_version(&ok, dir.path()).expect("zero exit");
+        let text = fs::read_to_string(dir.path().join("rustfs-version.txt")).expect("version");
+        assert!(text.contains("1.0.1-preview.11"), "{text}");
+    }
+
+    #[test]
+    fn macos_version_uses_the_host_zip() {
+        assert!(version_binary_prefers_host_zip("macos", true));
+        assert!(!version_binary_prefers_host_zip("macos", false));
+        assert!(!version_binary_prefers_host_zip("linux", true));
+    }
+
+    #[test]
+    fn single_node_dm_topology_is_not_a_passing_skip() {
+        assert!(dm_pods_cannot_be_isolated(1, false, 4));
+        assert!(dm_pods_cannot_be_isolated(3, false, 4));
+        assert!(dm_pods_cannot_be_isolated(1, true, 4));
+        assert!(!dm_pods_cannot_be_isolated(4, true, 4));
+        assert!(!dm_pods_cannot_be_isolated(1, false, 1));
+        assert!(!dm_pods_cannot_be_isolated(0, true, 4));
+        let log = "Error: device-mapper target node \"lima-rustfs-lima\" must host exactly one RustFS fault-test Pod, found 4\n";
+        let reason = dm_topology_skip_from_output(log).expect("topology");
+        assert!(reason.starts_with("SKIP-dm-topology"), "{reason}");
+        assert!(reason.contains("found 4"), "{reason}");
+        let request = request("full", false);
+        assert!(!skip_is_passing(&reason, &request));
+        assert!(dm_topology_skip_from_output(
+            "fault-test: dm-flakey requires pod-security.kubernetes.io/enforce=privileged on rustfs-fault-lima"
+        )
+        .is_none());
+        assert!(dm_topology_skip_from_output("found 1").is_none());
     }
 
     #[test]

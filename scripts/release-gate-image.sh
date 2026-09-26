@@ -155,28 +155,28 @@ smoke_buildah() {
 }
 
 if command -v docker >/dev/null 2>&1; then
-  docker build -t "$image" "$work" >&2
+  docker build --network=host -t "$image" "$work" >&2
   docker save -o "$work/image.tar" "$image"
   import_tar "$work/image.tar"
   RUNNER=(docker)
 elif command -v nerdctl >/dev/null 2>&1; then
   if [[ -S "$K3S_SOCK" ]]; then
-    if nerdctl --address "$K3S_SOCK" --namespace k8s.io build -t "$image" "$work" >&2; then
+    if nerdctl --address "$K3S_SOCK" --namespace k8s.io build --network=host -t "$image" "$work" >&2; then
       BUILT_INTO_K3S=true
       RUNNER=(nerdctl --address "$K3S_SOCK" --namespace k8s.io)
-    elif sudo -n nerdctl --address "$K3S_SOCK" --namespace k8s.io build -t "$image" "$work" >&2; then
+    elif sudo -n nerdctl --address "$K3S_SOCK" --namespace k8s.io build --network=host -t "$image" "$work" >&2; then
       BUILT_INTO_K3S=true
       RUNNER=(sudo -n nerdctl --address "$K3S_SOCK" --namespace k8s.io)
     fi
   fi
   if [[ "$BUILT_INTO_K3S" != true ]]; then
-    nerdctl build -t "$image" "$work" >&2
+    nerdctl build --network=host -t "$image" "$work" >&2
     nerdctl save -o "$work/image.tar" "$image"
     import_tar "$work/image.tar"
     RUNNER=(nerdctl)
   fi
 elif command -v buildah >/dev/null 2>&1; then
-  buildah bud -t "$image" "$work" >&2
+  buildah bud --network=host -t "$image" "$work" >&2
   buildah push "$image" "oci-archive:$work/image.tar" >&2
   import_tar "$work/image.tar"
 else

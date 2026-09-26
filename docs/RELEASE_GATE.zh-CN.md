@@ -27,8 +27,9 @@
 | `SKIP-no-cluster` | 仅限 dry-run；实跑把这项当成门禁失败 |
 
 这些状态不算通过：`SKIP-no-mc`、`SKIP-no-privileged`、
-`SKIP-unsafe-shared-fs`、`SKIP-no-dm-device`、`SKIP-no-unzip`、
-`SKIP-no-otool`、`SKIP-aborted`，以及任何其他代码。开启 fetch 的实跑在
+`SKIP-unsafe-shared-fs`、`SKIP-no-dm-device`、`SKIP-dm-topology`、
+`SKIP-no-unzip`、`SKIP-no-otool`、`SKIP-aborted`，以及任何其他代码。
+开启 fetch 的实跑在
 缺少校验和、`--version` 或 `ldd`/`otool` 输入时失败。
 `volume-remount-ro` 先检查能力，再检查是否共享文件系统。operator Pod
 丢掉全部 capability 时（包括 local-path）记为 `SKIP-no-privileged`，
@@ -69,9 +70,11 @@ make release-gate RUSTFS_VERSION=1.0.1-preview.11 RUSTFS_PREV_VERSION=1.0.0 RELE
 zip 单独记录 `ldd`（gnu 写入 `rustfs-ldd.txt`，musl 写入
 `rustfs-ldd-musl.txt`）。静态 musl 二进制不会掩盖 gnu 二进制里的非系统库。
 存在 gnu zip 时，容器镜像用它来构建；`rustfs-image-libc.txt` 记录 `gnu`
-或 `musl`。`--version` 取自该二进制。在 macOS 上，`otool -L` 取自 macOS
-zip（`rustfs-otool.txt`）。Homebrew 装在 `/opt/homebrew` 下的 `liblzma`
-会使 dynamic-deps 失败。git SHA 来自 `git commit` 行；当
+或 `musl`。在 Linux 上，`--version` 取自该二进制，非零退出会被记录，
+不会当成成功。在 macOS 上，`--version` 和 `otool -L` 都取自 macOS zip
+（`rustfs-version.txt`、`rustfs-otool.txt`）。dyld 无法加载时仍然采集
+`otool -L`。Homebrew 装在 `/opt/homebrew` 下的 `liblzma` 会使
+dynamic-deps 失败。git SHA 来自 `git commit` 行；当
 `target_commitish` 是分支名时，来自 tag 对象。
 
 实跑集群上若未设置 `RUSTFS_IMAGE` 或 `RUSTFS_PREV_IMAGE`，门禁用 gnu
@@ -81,7 +84,13 @@ zip（`rustfs-otool.txt`）。Homebrew 装在 `/opt/homebrew` 下的 `liblzma`
 `/etc/ssl/certs/ca-certificates.crt`。`RUSTFS_RELEASE_GATE_BINARY_PATH`
 默认为 `/usr/bin/rustfs`。
 
-docker、nerdctl 和 buildah 都可以构建。安装了 `k3s` 时，镜像导入
+docker、nerdctl 和 buildah 使用 `--network=host` 构建，因此安装
+`ca-certificates` 不依赖容器 bridge。虚拟机访问不了 Docker Hub 时，先把
+基础镜像载入：在能拉取的机器上执行
+`docker pull --platform linux/arm64 debian:bookworm-slim`（平台换成虚拟机
+的架构），再在虚拟机上执行
+`docker save debian:bookworm-slim | docker load`。门禁仍使用默认基础镜像
+名。安装了 `k3s` 时，镜像导入
 containerd 命名空间 `k8s.io`，并按 `docker.io/library/<name>:<tag>` 打上
 `io.cri-containerd.pinned=pinned`。pin 失败不会被忽略。`k3s ctr` 需要
 containerd 套接字。套接字仅 root 可写时，脚本使用 `sudo -n`，失败时给出
@@ -144,16 +153,30 @@ containerd 套接字。套接字仅 root 可写时，脚本使用 `sudo -n`，�
 - `volume-remount-ro.json` — `remounted_ro`、`writes_rejected`、`reads_ok`、
   `restored`。
 - `dm-error.json` — `table_has_error_target`、`read_failed_during_fault`、
-  `recovered`。生产者用 `nsenter` 跑宿主机 `dmsetup`，先写一个普通文件，
-  在 error target 仍然生效时读它（这次读必须失败），再恢复表并再读一次。
-  必须已有一个 Bound PV，其 `spec.local.path` 等于
-  `RUSTFS_FAULT_TEST_DM_MOUNT_PATH`，并且 claim 在故障命名空间。未选择
-  device-mapper 时是 `SKIP-no-dm`。选中的场景缺少 dm-run 环境或
-  `RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS` 时是 `SKIP-no-dm-device`
+  `recovered`。生产者用 `nsenter` 跑宿主机 `dmsetup`。它写入并 fsync
+  一个 4096 字节的 marker，用 `dmsetup suspend --nolockfs`、`load`、
+  `resume` 切换表（每一步都检查退出码，resume 的错误不会被忽略），丢掉
+  宿主机页缓存，再用 `dd iflag=direct` 读取。这次读必须失败。恢复是同样的
+  suspend/load/resume，回到保存的原表。在 `dmsetup table` 与原表一致且
+  直接读成功之前，EXIT trap 保持武装。如果文件系统拒绝这次读，生产者会
+  卸载，对 ext2/3/4 执行 `e2fsck -fy`，对 XFS 执行 `xfs_repair`，然后重新
+  挂载。门禁自己创建并删除 1Gi 的 PV `rg-dm-error-pv` 和 PVC
+  `rg-dm-error-claim`（`volumeName` 把 claim 钉在这个 PV 上）。它不会绑定
+  四个 100Gi 静态 PV 中的任何一个。在 `dm-error` 之前，以及在选中的
+  `dm-run` 之前，`RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS` 上处于 Released
+  的 100Gi PV 会被去掉 `claimRef`，本地路径会被清空，这样 Retain 卷下一次
+  还能绑定。未选择 device-mapper 时是 `SKIP-no-dm`。选中的场景缺少 dm-run
+  环境或 `RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS` 时是 `SKIP-no-dm-device`
   （不算通过）。该存储类的 provisioner 必须是
   `kubernetes.io/no-provisioner`，并且只传给这一次 `dm-run`。其他场景
   继续使用 `RUSTFS_FAULT_TEST_STORAGE_CLASS` 里的动态存储类。其余 DM
   场景是 `SKIP-dm-not-selected`。不要把 8 个 DM 场景背靠背跑完。
+  `dm-flakey` 要求 DM 节点上恰好有一个 RustFS Pod。只有一台 Ready 节点，
+  或者 `RUSTFS_FAULT_TEST_TENANT_SPREAD_ACROSS_HOSTS=false` 且 Pod 数不是
+  1 时，结果是 `SKIP-dm-topology`，不算通过。故障命名空间缺少
+  `pod-security.kubernetes.io/enforce=privileged` 仍然是失败。
+  `docs/DM_FLAKEY.md` 还要求标签 `app.kubernetes.io/managed-by=s3chaos`
+  和注解 `rustfs.com/fault-test-tenant`。
 - `fresh-install.json` — `health` 和 `live` 为 200。`image_matches`
   出现且为 false 时该用例失败。实跑时这个文件在发布镜像部署之后写出。
 - `rustfs-version.txt`、`rustfs-image-libc.txt`、`rustfs-ldd.txt`、
@@ -216,6 +239,23 @@ make release-gate \
 节点。只有这个默认值不对时才设置 `RUSTFS_FAULT_TEST_MIN_NODES`。
 未设置 `RUSTFS_RELEASE_GATE_HAS_DM=1` 时，device-mapper 行保持
 `SKIP-no-dm`。设置之后，缺少 dm-run 环境是 `SKIP-no-dm-device`，不算通过。
+单节点 Mini，或者未打散且 Pod 数不是 1 的 Tenant，无法让 DM 节点上恰好
+有一个 RustFS Pod。选中的 DM 场景此时是 `SKIP-dm-topology`，门禁仍然失败。
+要通过 `dm-flakey`，需要多于一台 Ready 节点并保持 Pod 打散的默认值，或者
+使用只有一个 Pod 的 Tenant。跑之前按 `docs/DM_FLAKEY.md` 给故障命名空间
+打标签：
+
+```bash
+kubectl label namespace "$RUSTFS_FAULT_TEST_NAMESPACE" \
+  app.kubernetes.io/managed-by=s3chaos \
+  pod-security.kubernetes.io/enforce=privileged \
+  --overwrite
+kubectl annotate namespace "$RUSTFS_FAULT_TEST_NAMESPACE" \
+  "rustfs.com/fault-test-tenant=${RUSTFS_FAULT_TEST_TENANT}" \
+  --overwrite
+```
+
+缺少 privileged 标签是检查失败，不是 `SKIP-dm-topology`。
 直接的 `network-loss` 使用 80% 丢包。发布门禁还会设置
 `RUSTFS_RELEASE_GATE_NETWORK_LOSS_SCOPE=all`（源选择器为 Chaos Mesh
 `mode: all`）和 `RUSTFS_FAULT_TEST_NETWORK_LOSS_MIN_PERCENT=10`。

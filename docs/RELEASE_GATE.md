@@ -30,8 +30,9 @@ not fail the gate:
 | `SKIP-no-cluster` | dry-run only; a live run treats this as a gate failure |
 
 These statuses do not pass: `SKIP-no-mc`, `SKIP-no-privileged`,
-`SKIP-unsafe-shared-fs`, `SKIP-no-dm-device`, `SKIP-no-unzip`,
-`SKIP-no-otool`, `SKIP-aborted`, and any other code. A live run with fetch
+`SKIP-unsafe-shared-fs`, `SKIP-no-dm-device`, `SKIP-dm-topology`,
+`SKIP-no-unzip`, `SKIP-no-otool`, `SKIP-aborted`, and any other code.
+A live run with fetch
 enabled fails when checksum, `--version`, or `ldd`/`otool` input is missing.
 `volume-remount-ro` checks capabilities before the shared-filesystem test
 and is `SKIP-no-privileged` on operator pods that drop every capability,
@@ -75,9 +76,12 @@ directory entry. `ldd` is recorded per zip (`rustfs-ldd.txt` for gnu,
 `rustfs-ldd-musl.txt` for musl). A static musl binary does not hide a
 foreign library in the gnu binary. The container image is built from the gnu
 zip when one exists; `rustfs-image-libc.txt` records `gnu` or `musl`.
-`--version` is taken from that binary. On macOS, `otool -L` is taken from
-the macOS zip (`rustfs-otool.txt`). Homebrew `liblzma` under
-`/opt/homebrew` fails dynamic-deps. The git SHA comes from the `git commit`
+On Linux, `--version` is taken from that binary and a non-zero exit is
+recorded instead of treated as success. On macOS, `--version` and
+`otool -L` both use the macOS zip (`rustfs-version.txt`,
+`rustfs-otool.txt`). `otool -L` is still captured when dyld cannot load
+the binary. Homebrew `liblzma` under `/opt/homebrew` fails dynamic-deps.
+The git SHA comes from the `git commit`
 line, or from the tag object when `target_commitish` is a branch name.
 
 When `RUSTFS_IMAGE` or `RUSTFS_PREV_IMAGE` is unset on a live cluster, the
@@ -88,7 +92,12 @@ smoke-tests `--version` and a non-empty `/etc/ssl/certs/ca-certificates.crt`
 before the image is used. `RUSTFS_RELEASE_GATE_BINARY_PATH` defaults to
 `/usr/bin/rustfs`.
 
-docker, nerdctl, and buildah can build the image. When `k3s` is installed
+docker, nerdctl, and buildah build with `--network=host`, so the
+`ca-certificates` install does not depend on the container bridge. If the
+VM cannot reach Docker Hub, load the base image before the gate: on a
+machine that can pull, `docker pull --platform linux/arm64 debian:bookworm-slim`
+(use the architecture the VM runs), then `docker save debian:bookworm-slim | docker load`
+on the VM. The gate still uses the default base name. When `k3s` is installed
 the image is imported into containerd namespace `k8s.io` and pinned as
 `docker.io/library/<name>:<tag>` (`io.cri-containerd.pinned=pinned`). The
 script does not ignore a failed pin. `k3s ctr` needs the containerd socket.
@@ -161,17 +170,35 @@ re-running it. They are the contract the Mac Mini campaign already produced.
 - `volume-remount-ro.json` — `remounted_ro`, `writes_rejected`, `reads_ok`,
   `restored`.
 - `dm-error.json` — `table_has_error_target`, `read_failed_during_fault`,
-  `recovered`. The producer uses `nsenter` to run host `dmsetup`, writes a
-  regular file, reads it while the error target is active (that read must
-  fail), then restores the table and reads again. A Bound PV whose
-  `spec.local.path` is `RUSTFS_FAULT_TEST_DM_MOUNT_PATH` must already be
-  claimed by the fault namespace. `SKIP-no-dm` when device-mapper is not
-  selected. `SKIP-no-dm-device` (not a pass) when the selected scenario
-  lacks the dm-run env or `RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS`. That
-  class is a `kubernetes.io/no-provisioner` class and is passed only to the
-  one `dm-run`. The dynamic class used by every other scenario stays in
+  `recovered`. The producer uses `nsenter` to run host `dmsetup`. It writes
+  a 4096-byte marker, fsyncs it, switches the table with
+  `dmsetup suspend --nolockfs` then `load` and `resume` (each step is
+  checked; a resume error is not ignored), drops the host page cache, and
+  reads the marker with `dd iflag=direct`. That read must fail. Restore is
+  the same suspend/load/resume back to the saved table. The trap stays
+  armed until `dmsetup table` matches the saved table and the direct read
+  succeeds. If the filesystem rejects that read, the producer unmounts,
+  runs `e2fsck -fy` for ext2/3/4 or `xfs_repair` for XFS, and mounts again.
+  The gate creates and deletes its own 1Gi PV `rg-dm-error-pv` and PVC
+  `rg-dm-error-claim` (`volumeName` pins the claim to that PV). It does not
+  bind one of the four 100Gi static PVs. Before `dm-error` and before the
+  selected `dm-run`, Released 100Gi PVs of
+  `RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS` have `claimRef` removed and their
+  local paths emptied, so a Retain volume can bind on the next run.
+  `SKIP-no-dm` when device-mapper is not selected. `SKIP-no-dm-device`
+  (not a pass) when the selected scenario lacks the dm-run env or
+  `RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS`. That class is a
+  `kubernetes.io/no-provisioner` class and is passed only to the one
+  `dm-run`. The dynamic class used by every other scenario stays in
   `RUSTFS_FAULT_TEST_STORAGE_CLASS`. Other DM scenarios are
   `SKIP-dm-not-selected`. Do not run the eight DM scenarios back to back.
+  `dm-flakey` needs exactly one RustFS pod on the DM node. A single ready
+  node, or `RUSTFS_FAULT_TEST_TENANT_SPREAD_ACROSS_HOSTS=false` with any
+  other pod count, is `SKIP-dm-topology` and does not pass. A missing
+  `pod-security.kubernetes.io/enforce=privileged` label on the fault
+  namespace stays a failure. `docs/DM_FLAKEY.md` also requires
+  `app.kubernetes.io/managed-by=s3chaos` and the annotation
+  `rustfs.com/fault-test-tenant`.
 - `fresh-install.json` — `health` and `live` are 200. `image_matches`
   fails the case when it is present and false. On a live run this file is
   written after the release image is deployed.
@@ -238,6 +265,23 @@ make release-gate \
 Ready node. Set `RUSTFS_FAULT_TEST_MIN_NODES` only when that default is wrong.
 Device-mapper rows stay `SKIP-no-dm` unless `RUSTFS_RELEASE_GATE_HAS_DM=1`.
 With that set, a missing dm-run env is `SKIP-no-dm-device` and does not pass.
+A single-node Mini, or any unspread tenant whose pod count is not 1, cannot
+host exactly one RustFS pod on the DM node. The selected DM scenario is then
+`SKIP-dm-topology` and the gate still fails. Passing `dm-flakey` needs more
+than one ready node with pod spread left at its default, or a one-pod tenant.
+Before that run, label the fault namespace as `docs/DM_FLAKEY.md` describes:
+
+```bash
+kubectl label namespace "$RUSTFS_FAULT_TEST_NAMESPACE" \
+  app.kubernetes.io/managed-by=s3chaos \
+  pod-security.kubernetes.io/enforce=privileged \
+  --overwrite
+kubectl annotate namespace "$RUSTFS_FAULT_TEST_NAMESPACE" \
+  "rustfs.com/fault-test-tenant=${RUSTFS_FAULT_TEST_TENANT}" \
+  --overwrite
+```
+
+A missing privileged label is a failed check, not `SKIP-dm-topology`.
 Direct `network-loss` uses 80% loss. The release gate also sets
 `RUSTFS_RELEASE_GATE_NETWORK_LOSS_SCOPE=all` (Chaos Mesh `mode: all` on the
 source selector) and `RUSTFS_FAULT_TEST_NETWORK_LOSS_MIN_PERCENT=10`. The
