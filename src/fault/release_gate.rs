@@ -3555,6 +3555,218 @@ mod tests {
     }
 
     #[test]
+    fn dm_error_recovery_requires_a_clean_writable_filesystem() {
+        let dir = tempfile::tempdir().expect("temp");
+        let script = "scripts/release-gate-evidence.sh";
+        let rw = |opts: &str| {
+            let output = Command::new("bash")
+                .arg(script)
+                .arg("dm-mount-rw")
+                .arg(opts)
+                .env("RELEASE_GATE_ARTIFACT_DIR", dir.path())
+                .output()
+                .expect("dm-mount-rw");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        assert_eq!(rw("rw,relatime"), "rw");
+        assert_eq!(rw("rw,relatime errors=remount-ro"), "rw");
+        assert_eq!(rw("ro,relatime"), "not-rw");
+        assert_eq!(rw("rw,relatime ro"), "not-rw");
+        assert_eq!(rw(""), "not-rw");
+
+        let state = |text: &str| {
+            let mut child = Command::new("bash")
+                .arg(script)
+                .arg("dm-ext-state")
+                .env("RELEASE_GATE_ARTIFACT_DIR", dir.path())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("dm-ext-state");
+            child
+                .stdin
+                .as_mut()
+                .expect("stdin")
+                .write_all(text.as_bytes())
+                .expect("write");
+            let output = child.wait_with_output().expect("wait");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        assert_eq!(
+            state(
+                "Filesystem volume name: <none>\nFilesystem state:         clean\nFilesystem features:      has_journal ext_attr resize_inode\n"
+            ),
+            "clean"
+        );
+        assert_eq!(
+            state(
+                "Filesystem state:         clean with errors\nFilesystem features:      has_journal\n"
+            ),
+            "dirty"
+        );
+        assert_eq!(
+            state(
+                "Filesystem state:         clean\nFilesystem features:      has_journal needs_recovery\n"
+            ),
+            "dirty"
+        );
+        assert_eq!(
+            state("Filesystem state:         not clean\nFilesystem features:      has_journal\n"),
+            "dirty"
+        );
+    }
+
+    #[test]
+    fn dm_error_foreign_mount_namespace_is_in_use() {
+        let dir = tempfile::tempdir().expect("temp");
+        let proc_root = dir.path().join("proc");
+        let write_pid = |pid: &str, ns: &str, mountinfo: &str| {
+            let pid_dir = proc_root.join(pid);
+            fs::create_dir_all(pid_dir.join("ns")).expect("ns");
+            std::os::unix::fs::symlink(ns, pid_dir.join("ns").join("mnt")).expect("symlink");
+            fs::write(pid_dir.join("mountinfo"), mountinfo).expect("mountinfo");
+        };
+        let host = "36 35 252:4 / /data rw,relatime - ext4 /dev/mapper/rustfs-fault-dm rw\n";
+        write_pid("1", "mnt:[111]", host);
+        write_pid("40", "mnt:[111]", host);
+        let scan = |majmin: &str| {
+            let output = Command::new("bash")
+                .arg("scripts/release-gate-evidence.sh")
+                .arg("dm-mountinfo-foreign")
+                .arg(majmin)
+                .arg(&proc_root)
+                .env("RELEASE_GATE_ARTIFACT_DIR", dir.path())
+                .output()
+                .expect("scan");
+            (
+                output.status.success(),
+                String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            )
+        };
+        assert_eq!(scan("252:4"), (true, "clear".to_string()));
+        write_pid(
+            "50",
+            "mnt:[222]",
+            "12 11 8:1 / /var rw - ext4 /dev/mapper/252:4 rw\n",
+        );
+        assert_eq!(scan("252:4"), (true, "clear".to_string()));
+        write_pid("51", "mnt:[333]", host);
+        assert_eq!(scan("252:4"), (true, "in-use".to_string()));
+        fs::remove_file(proc_root.join("1").join("ns").join("mnt")).expect("unlink");
+        assert!(!scan("252:4").0);
+    }
+
+    #[test]
+    fn dm_error_pv_reset_continues_after_one_volume_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp");
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).expect("bin");
+        let kubectl = bin.join("kubectl");
+        let log = dir.path().join("kubectl.log");
+        let pv_json = dir.path().join("pvs.json");
+        fs::write(
+            &pv_json,
+            r#"{"items":[
+              {"metadata":{"name":"rustfs-fault-dm-pv-0"},"spec":{"storageClassName":"rustfs-fault-dm","capacity":{"storage":"100Gi"},"local":{"path":"/data/rustfs/volume0"}},"status":{"phase":"Released"}},
+              {"metadata":{"name":"rustfs-fault-dm-pv-1"},"spec":{"storageClassName":"rustfs-fault-dm","capacity":{"storage":"100Gi"},"local":{"path":"/data/rustfs/volume1"}},"status":{"phase":"Released"}}
+            ]}"#,
+        )
+        .expect("pvs");
+        fs::write(
+            &kubectl,
+            r#"#!/bin/bash
+printf '%s\n' "$*" >> "$KUBECTL_FAKE_LOG"
+args="$*"
+if [[ "$args" == *" test -x "* ]]; then exit 0; fi
+if [[ "$args" == *" test -d "* ]]; then
+  if [[ "$args" == *rg-dm-error* ]]; then exit 1; fi
+  exit 0
+fi
+if [[ "$args" == *"/find "* ]]; then
+  if [[ "$args" == *volume0* ]]; then
+    echo "find: Input/output error" >&2
+    exit 1
+  fi
+  exit 0
+fi
+if [[ "$args" == *" rm -rf "* ]]; then exit 0; fi
+if [[ "$args" == *"get pv -o json"* ]]; then cat "$KUBECTL_FAKE_PV_JSON"; exit 0; fi
+if [[ "$args" == patch\ pv\ * ]]; then exit 0; fi
+if [[ "$args" == *"delete "* ]]; then exit 0; fi
+echo "unexpected kubectl: $args" >&2
+exit 99
+"#,
+        )
+        .expect("kubectl");
+        let mut perms = fs::metadata(&kubectl).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&kubectl, perms).expect("chmod");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = Command::new("bash")
+            .arg("scripts/release-gate-evidence.sh")
+            .arg("reset-dm-pvs")
+            .env("PATH", path)
+            .env("RELEASE_GATE_ARTIFACT_DIR", dir.path())
+            .env("KUBECTL_FAKE_LOG", &log)
+            .env("KUBECTL_FAKE_PV_JSON", &pv_json)
+            .env("RUSTFS_FAULT_TEST_NAMESPACE", "rustfs-fault-lima")
+            .env("RUSTFS_FAULT_TEST_DM_NAME", "rustfs-fault-dm")
+            .env("RUSTFS_FAULT_TEST_DM_NODE", "lima-host")
+            .env(
+                "RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE",
+                "rustfs-fault-observers",
+            )
+            .env("RUSTFS_FAULT_TEST_DM_OBSERVER_POD", "dm-observer")
+            .env("RUSTFS_FAULT_TEST_DM_MOUNT_PATH", "/data/rustfs/volume0")
+            .env("RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS", "rustfs-fault-dm")
+            .env(
+                "RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST",
+                "/dev/mapper/rustfs-fault-dm",
+            )
+            .output()
+            .expect("reset-dm-pvs");
+        let trace = fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !output.status.success(),
+            "reset should fail closed\nstdout {}\nstderr {}\nlog {trace}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            trace.contains("patch pv rustfs-fault-dm-pv-1 "),
+            "later PV was not reset\n{trace}\nstderr {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !trace.contains("patch pv rustfs-fault-dm-pv-0 "),
+            "failed PV must keep claimRef\n{trace}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("failed to empty /data/rustfs/volume0"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn unselected_dm_scenarios_are_a_passing_skip() {
         let mut request = request("full", false);
         request.cluster = true;

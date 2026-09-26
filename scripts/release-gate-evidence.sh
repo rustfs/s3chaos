@@ -70,17 +70,24 @@ rg_dm_host_exec() {
   kubectl -n "$observer_ns" exec "$observer_pod" -- nsenter -t 1 -m -i -- "$@"
 }
 
-rg_dm_resolve() {
+rg_dm_resolve_optional() {
   local tool="$1" candidate
   for candidate in "/usr/sbin/$tool" "/sbin/$tool" "/usr/bin/$tool" "/bin/$tool"; do
-    # A missing candidate makes kubectl exec exit 1. Hide that probe noise;
-    # the real failure is the message below when every candidate misses.
     if rg_dm_host_exec test -x "$candidate" >/dev/null 2>&1; then
       printf '%s\n' "$candidate"
       return 0
     fi
   done
-  echo "host nsenter cannot find ${tool}" >&2
+  return 1
+}
+
+rg_dm_resolve() {
+  local path
+  if path="$(rg_dm_resolve_optional "$1")"; then
+    printf '%s\n' "$path"
+    return 0
+  fi
+  echo "host nsenter cannot find ${1}" >&2
   return 1
 }
 
@@ -120,9 +127,18 @@ rg_dm_setup() {
   fi
 }
 
+# sync here is only safe after the original table is back. Calling it while
+# the error target is loaded writes dirty metadata into that target and
+# aborts the ext4 journal.
 rg_dm_drop_caches() {
   if ! rg_dm_host_exec "$sh_bin" -c 'sync; echo 3 > /proc/sys/vm/drop_caches'; then
     echo "drop_caches failed; reads still use O_DIRECT" >&2
+  fi
+}
+
+rg_dm_drop_page_cache() {
+  if ! rg_dm_host_exec "$sh_bin" -c 'echo 3 > /proc/sys/vm/drop_caches'; then
+    echo "drop_caches failed; the direct read still uses O_DIRECT" >&2
   fi
 }
 
@@ -169,7 +185,8 @@ rg_dm_remove_dedicated_dir() {
     echo "refusing to remove ${dedicated_path}; a PersistentVolume still uses it" >&2
     return 1
   fi
-  if rg_dm_host_exec test -d "$dedicated_path"; then
+  # A missing directory makes kubectl exec exit 1. That is not a failure.
+  if rg_dm_host_exec test -d "$dedicated_path" >/dev/null 2>&1; then
     rg_dm_host_exec rm -rf -- "$dedicated_path"
   fi
 }
@@ -213,28 +230,44 @@ rg_dm_reset_released() {
     | [.metadata.name, .spec.local.path]
     | @tsv
   ')"
+  local failed=0
   while IFS=$'\t' read -r pv path; do
     [[ -z "${pv:-}" ]] && continue
-    rg_dm_safe_token "$pv" || {
+    if ! rg_dm_safe_token "$pv"; then
       echo "refusing to reset PV ${pv}" >&2
-      return 1
-    }
-    rg_dm_safe_path "$path" || {
+      failed=1
+      continue
+    fi
+    if ! rg_dm_safe_path "$path"; then
       echo "refusing to empty ${path}" >&2
-      return 1
-    }
+      failed=1
+      continue
+    fi
     parts="$(awk -F/ '{print NF-1}' <<<"$path")"
     if [[ "$parts" -lt 3 ]]; then
       echo "refusing to empty short path ${path}" >&2
-      return 1
+      failed=1
+      continue
     fi
-    if rg_dm_host_exec test -d "$path"; then
-      # Keep lost+found. Deleting it makes the next e2fsck offer to create it.
-      rg_dm_host_exec "$find_bin" "$path" -mindepth 1 -xdev ! -name lost+found -delete
+    # Keep lost+found. Deleting it makes the next e2fsck offer to create it.
+    # One volume returning EIO must not skip the remaining PVs. Leave its
+    # claimRef in place so a half-emptied device is not marked Available.
+    if rg_dm_host_exec test -d "$path" >/dev/null 2>&1; then
+      if ! rg_dm_host_exec "$find_bin" "$path" -mindepth 1 -xdev ! -name lost+found -delete; then
+        echo "failed to empty ${path}" >&2
+        failed=1
+        continue
+      fi
     fi
-    kubectl patch pv "$pv" --type=json -p='[{"op":"remove","path":"/spec/claimRef"}]'
+    if ! kubectl patch pv "$pv" --type=json -p='[{"op":"remove","path":"/spec/claimRef"}]'; then
+      echo "failed to clear claimRef on ${pv}" >&2
+      failed=1
+    fi
   done <<<"$rows"
-  rg_dm_remove_dedicated_dir
+  if ! rg_dm_remove_dedicated_dir; then
+    failed=1
+  fi
+  [[ "$failed" == 0 ]]
 }
 
 # A dm-run tenant that still holds the 100Gi static PVs must be removed before
@@ -413,10 +446,55 @@ rg_dm_open_count() {
   return 1
 }
 
-# The host fixture mount accounts for one open. A pod mount or a second
-# holder means the volume is in use. Returns 0 when the caller must skip.
+# Returns 0 when some mount namespace other than PID 1 has this major:minor.
+# Returns 1 when the scan finishes and only the host namespace has it.
+# Returns 2 when the scan cannot be trusted.
+rg_dm_proc_has_foreign_mount() {
+  local majmin="$1" proc_root="$2" host_ns pid_dir pid ns
+  [[ "$majmin" =~ ^[0-9]+:[0-9]+$ ]] || return 2
+  host_ns="$(readlink "${proc_root}/1/ns/mnt" 2>/dev/null || true)"
+  [[ -n "$host_ns" ]] || return 2
+  for pid_dir in "${proc_root}"/*; do
+    pid="${pid_dir##*/}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    [[ "$pid" == 1 ]] && continue
+    ns="$(readlink "${pid_dir}/ns/mnt" 2>/dev/null || true)"
+    [[ -n "$ns" && "$ns" != "$host_ns" ]] || continue
+    if awk -v dev="$majmin" '$3 == dev { found=1; exit } END { exit !found }' "${pid_dir}/mountinfo" 2>/dev/null; then
+      echo "device ${majmin} is mounted in mount namespace ${ns} (pid ${pid})" >&2
+      return 0
+    fi
+  done
+  return 1
+}
+
+rg_dm_majmin() {
+  local findmnt majmin
+  findmnt="$(rg_dm_resolve findmnt)" || return 1
+  majmin="$(rg_dm_host_exec "$findmnt" -n -o MAJ:MIN --mountpoint "$mount_path" 2>/dev/null || true)"
+  majmin="${majmin//[[:space:]]/}"
+  [[ "$majmin" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+  printf '%s\n' "$majmin"
+}
+
+# hostPath and other bind mounts live in a different mount namespace. They
+# share the superblock, so the host open count stays 1 and findmnt -S on
+# the host does not list them.
+rg_dm_foreign_mount() {
+  local majmin="$1" bash_bin body rc
+  bash_bin="$(rg_dm_resolve_optional bash)" || bash_bin="$(rg_dm_resolve_optional sh)" || return 2
+  body="$(declare -f rg_dm_proc_has_foreign_mount)"
+  # set -e is global. Leave it to the caller so a "not found" exit can be read.
+  rg_dm_host_exec "$bash_bin" -c "${body}
+rg_dm_proc_has_foreign_mount \"\$1\" /proc" _ "$majmin" && rc=0 || rc=$?
+  return "$rc"
+}
+
+# The host fixture mount accounts for one open. A pod mount, a foreign
+# mount namespace, or a second holder means the volume is in use.
+# Returns 0 when the caller must skip.
 rg_dm_target_in_use() {
-  local bound opens findmnt target extra=false
+  local bound opens findmnt target extra=false majmin foreign
   bound="$(kubectl get pv -o json | jq -r --arg path "$mount_path" --arg class "$dm_class" '
     [.items[]
       | select(.spec.storageClassName == $class)
@@ -445,11 +523,88 @@ rg_dm_target_in_use() {
     echo "device-mapper ${name} open count is ${opens}" >&2
     return 0
   fi
+  if ! majmin="$(rg_dm_majmin)"; then
+    echo "cannot read major:minor for ${mount_path}" >&2
+    return 0
+  fi
+  set +e
+  rg_dm_foreign_mount "$majmin"
+  foreign=$?
+  set -e
+  if [[ "$foreign" != 1 ]]; then
+    return 0
+  fi
   return 1
 }
 
+# Commit dirty metadata before the error target exists. A sync after that
+# load writes the journal onto the error target and the filesystem goes
+# read-only while the marker blocks can still be read.
+rg_dm_flush_before_fault() {
+  local dev="/dev/mapper/${name}" freeze blockdev err
+  rg_dm_host_exec "$sh_bin" -c 'sync' || return 1
+  if freeze="$(rg_dm_resolve_optional fsfreeze)"; then
+    if ! err="$(rg_dm_host_exec "$freeze" --freeze "$mount_path" 2>&1)"; then
+      echo "fsfreeze --freeze ${mount_path} failed: ${err}" >&2
+      return 1
+    fi
+    fs_frozen=true
+    if ! err="$(rg_dm_host_exec "$freeze" --unfreeze "$mount_path" 2>&1)"; then
+      echo "fsfreeze --unfreeze ${mount_path} failed: ${err}" >&2
+      if rg_dm_host_exec "$freeze" --unfreeze "$mount_path" >/dev/null 2>&1; then
+        fs_frozen=false
+      fi
+      return 1
+    fi
+    fs_frozen=false
+  fi
+  if blockdev="$(rg_dm_resolve_optional blockdev)"; then
+    if ! err="$(rg_dm_host_exec "$blockdev" --flushbufs "$dev" 2>&1)"; then
+      echo "blockdev --flushbufs ${dev} failed: ${err}" >&2
+      return 1
+    fi
+  elif [[ -z "${freeze:-}" ]]; then
+    echo "neither fsfreeze nor blockdev is available to flush ${dev}" >&2
+    return 1
+  fi
+  rg_dm_host_exec "$sh_bin" -c 'sync' || return 1
+}
+
+rg_dm_unfreeze() {
+  local freeze err
+  [[ "${fs_frozen:-false}" == true ]] || return 0
+  freeze="$(rg_dm_resolve_optional fsfreeze)" || return 1
+  if ! err="$(rg_dm_host_exec "$freeze" --unfreeze "$mount_path" 2>&1)"; then
+    echo "fsfreeze --unfreeze ${mount_path} failed: ${err}" >&2
+    return 1
+  fi
+  fs_frozen=false
+}
+
+# $1 is mount options. A bare "ro" token means read-only. errors=remount-ro
+# does not. Columns from findmnt may be separated by spaces.
+rg_dm_options_rw() {
+  local opts="$1" tok rw=false ro=false
+  [[ -n "$opts" ]] || return 1
+  while IFS= read -r tok; do
+    [[ -z "$tok" ]] && continue
+    [[ "$tok" == rw ]] && rw=true
+    [[ "$tok" == ro ]] && ro=true
+  done < <(printf '%s\n' "$opts" | tr ', ' '\n')
+  [[ "$rw" == true && "$ro" == false ]]
+}
+
+# dumpe2fs -h text from an unmounted filesystem after e2fsck.
+rg_dm_ext_superblock_clean() {
+  local text="$1" state features
+  state="$(awk -F: '/^Filesystem state:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }' <<<"$text")"
+  features="$(awk -F: '/^Filesystem features:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }' <<<"$text")"
+  [[ "$state" == "clean" ]] || return 1
+  [[ "$features" != *needs_recovery* ]] || return 1
+}
+
 rg_dm_fsck_device() {
-  local dev="$1" fstype e2fsck repair blkid rc
+  local dev="$1" fstype e2fsck repair blkid rc dump text
   blkid="$(rg_dm_resolve blkid)" || return 1
   fstype="$(rg_dm_host_exec "$blkid" -o value -s TYPE "$dev" || true)"
   if [[ "$fstype" == ext2 || "$fstype" == ext3 || "$fstype" == ext4 ]]; then
@@ -461,9 +616,18 @@ rg_dm_fsck_device() {
       echo "e2fsck ${dev} exited ${rc}" >&2
       return 1
     fi
+    dump="$(rg_dm_resolve dumpe2fs)" || return 1
+    text="$(rg_dm_host_exec "$dump" -h "$dev" 2>/dev/null || true)"
+    if ! rg_dm_ext_superblock_clean "$text"; then
+      echo "ext superblock on ${dev} is not clean after e2fsck" >&2
+      printf '%s\n' "$text" >&2
+      return 1
+    fi
+    superblock_clean=true
   elif [[ "$fstype" == "xfs" ]]; then
     repair="$(rg_dm_resolve xfs_repair)" || return 1
     rg_dm_host_exec "$repair" "$dev" || return 1
+    superblock_clean=true
   else
     echo "refusing to repair filesystem type ${fstype:-unknown} on ${dev}" >&2
     return 1
@@ -526,6 +690,59 @@ rg_dm_restore_mount() {
     echo "mount ${dev} ${mount_path} failed" >&2
     return 1
   fi
+}
+
+# Open count 0 or 1 is the host mount (or an already-unmounted device).
+# A foreign mount namespace still counts as a holder.
+rg_dm_holders_absent() {
+  local opens majmin foreign
+  opens="$(rg_dm_open_count)" || return 1
+  [[ "$opens" -le 1 ]] || return 1
+  majmin="$(rg_dm_majmin)" || return 1
+  set +e
+  rg_dm_foreign_mount "$majmin"
+  foreign=$?
+  set -e
+  [[ "$foreign" == 1 ]]
+}
+
+rg_dm_mount_options() {
+  local findmnt
+  findmnt="$(rg_dm_resolve findmnt)" || return 1
+  rg_dm_host_exec "$findmnt" -n -o OPTIONS,FS-OPTIONS --mountpoint "$mount_path" 2>/dev/null || true
+}
+
+# A marker read is not enough: the journal can be aborted and the mount
+# still serve those blocks. Require a read-write mount and a new file.
+rg_dm_confirm_recovered() {
+  local opts probe got
+  if ! rg_dm_exact_mount; then
+    echo "refusing recovery probe; ${mount_path} is not an exact mount of /dev/mapper/${name}" >&2
+    return 1
+  fi
+  opts="$(rg_dm_mount_options)"
+  if ! rg_dm_options_rw "$opts"; then
+    echo "mount ${mount_path} is not read-write (${opts:-missing})" >&2
+    return 1
+  fi
+  if [[ "${superblock_clean:-false}" != true ]]; then
+    echo "filesystem superblock was not checked clean" >&2
+    return 1
+  fi
+  probe="${mount_path}/rg-dm-error-probe"
+  if ! rg_dm_write_marker "$probe"; then
+    echo "recovery write failed on ${mount_path}" >&2
+    rg_dm_host_exec rm -f "$probe" >/dev/null 2>&1 || true
+    return 1
+  fi
+  probe_written=true
+  got="$(rg_dm_direct_header "$probe" || true)"
+  if ! rg_dm_host_exec rm -f "$probe"; then
+    echo "failed to remove recovery probe ${probe}" >&2
+    return 1
+  fi
+  probe_written=false
+  [[ "$got" == "dm-error-marker" ]]
 }
 
 rg_dm_write_error_json() {
@@ -797,6 +1014,38 @@ EOF
     rg_dm_table_field "${2-}" 3
     ;;
 
+  dm-mountinfo-foreign)
+    set +e
+    rg_dm_proc_has_foreign_mount "${2-}" "${3-}"
+    rc=$?
+    set -e
+    if [[ "$rc" == 0 ]]; then
+      printf 'in-use\n'
+    elif [[ "$rc" == 1 ]]; then
+      printf 'clear\n'
+    else
+      printf 'error\n'
+      exit 1
+    fi
+    ;;
+
+  dm-ext-state)
+    text="$(cat)"
+    if rg_dm_ext_superblock_clean "$text"; then
+      printf 'clean\n'
+    else
+      printf 'dirty\n'
+    fi
+    ;;
+
+  dm-mount-rw)
+    if rg_dm_options_rw "${2-}"; then
+      printf 'rw\n'
+    else
+      printf 'not-rw\n'
+    fi
+    ;;
+
   reset-dm-pvs)
     rg_dm_setup
     rg_dm_reset_released
@@ -816,6 +1065,9 @@ EOF
     skip_reason=""
     mount_was_exact=false
     marker_written=false
+    probe_written=false
+    fs_frozen=false
+    superblock_clean=false
     original=""
     marker="${mount_path}/rg-dm-error-marker"
     cleanup_dm() {
@@ -837,13 +1089,32 @@ EOF
           fi
         fi
       fi
+      if ! rg_dm_unfreeze; then
+        status=1
+        recovered=false
+      fi
       # Remount even when the table restore failed. An unmounted lab path
       # makes later writes land on the parent filesystem.
       if [[ "$mount_was_exact" == true ]] && ! rg_dm_exact_mount; then
         rg_dm_restore_mount || status=1
       fi
       if [[ "$marker_written" == true ]]; then
-        rg_dm_host_exec rm -f "$marker" || true
+        if ! rg_dm_host_exec rm -f "$marker"; then
+          echo "failed to delete ${marker}" >&2
+          recovered=false
+          status=1
+        else
+          marker_written=false
+        fi
+      fi
+      if [[ "$probe_written" == true ]]; then
+        if ! rg_dm_host_exec rm -f "${mount_path}/rg-dm-error-probe"; then
+          echo "failed to delete recovery probe" >&2
+          recovered=false
+          status=1
+        else
+          probe_written=false
+        fi
       fi
       if ! rg_dm_delete_gate_volume; then
         status=1
@@ -868,7 +1139,7 @@ EOF
       exit 1
     fi
     if rg_dm_target_in_use; then
-      skip_reason="SKIP-dm-in-use: ${mount_path} has another mount, an open holder, or a Bound PersistentVolume"
+      skip_reason="SKIP-dm-in-use: ${mount_path} has another mount, a foreign mount namespace, an open holder, or a Bound PersistentVolume"
       exit 0
     fi
     rg_dm_reset_released
@@ -888,6 +1159,10 @@ EOF
       exit 1
     fi
     marker_written=true
+    if ! rg_dm_flush_before_fault; then
+      echo "failed to flush ${mount_path} before the error target" >&2
+      exit 1
+    fi
     if ! rg_dm_transition "0 ${sectors} error"; then
       echo "failed to install the error target on ${name}" >&2
       exit 1
@@ -899,23 +1174,30 @@ EOF
     fi
     # O_DIRECT does not satisfy the read from the page cache. A cached read
     # of a marker that was just written succeeds even when the error target
-    # is active.
-    rg_dm_drop_caches
+    # is active. Do not sync here: that writeback hits the error target.
+    rg_dm_drop_page_cache
     read_failed_during_fault=false
     if ! rg_dm_host_exec "$dd_bin" if="$marker" of=/dev/null bs=4096 count=1 iflag=direct status=none; then
       read_failed_during_fault=true
     fi
     recovered=false
     if rg_dm_transition "$original" && rg_dm_table_is "$original"; then
-      got="$(rg_dm_direct_header "$marker" || true)"
-      if [[ "$got" != "dm-error-marker" ]]; then
+      if ! rg_dm_unfreeze; then
+        echo "filesystem stayed frozen after restore" >&2
+      elif rg_dm_holders_absent; then
+        # The marker can still be read after the journal aborts. Check the
+        # filesystem whenever nobody else holds the device.
         rg_dm_repair_mount || true
-        got="$(rg_dm_direct_header "$marker" || true)"
+      else
+        echo "not checking the filesystem; another holder is present" >&2
       fi
-      if [[ "$got" == "dm-error-marker" ]]; then
-        recovered=true
+      got="$(rg_dm_direct_header "$marker" || true)"
+      if [[ "$got" == "dm-error-marker" ]] && rg_dm_confirm_recovered; then
         if rg_dm_host_exec rm -f "$marker"; then
           marker_written=false
+          recovered=true
+        else
+          echo "failed to delete ${marker}" >&2
         fi
       fi
     else

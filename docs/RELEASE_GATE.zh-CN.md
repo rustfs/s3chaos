@@ -158,25 +158,33 @@ containerd 套接字。套接字仅 root 可写时，脚本使用 `sudo -n`，�
   `dmsetup`。它写入并 fsync 一个 4096 字节的 marker，用
   `dmsetup suspend --nolockfs`、`load`、`resume` 切换表（每一步都检查
   退出码，resume 的错误不会被忽略），丢掉宿主机页缓存，再用
-  `dd iflag=direct` 读取。这次读必须失败。恢复是同样的
-  suspend/load/resume，回到保存的原表。error target 看的是 `dmsetup table`
-  的目标类型字段，行尾空格不会把它判成未注入。EXIT trap 总会写出
+  `dd iflag=direct` 读取。这次读必须失败。装上 error target 之前，生产者
+  会 `sync`；有 `fsfreeze` 时冻结再解冻该挂载，有 `blockdev` 时执行
+  `--flushbufs`。两者都不存在时不装入 error target。故障期间丢掉页缓存，
+  但不再 `sync`，避免把未提交的日志写到 error target 上。恢复是同样的 suspend/load/resume，回到保存的原表。
+  error target 看的是 `dmsetup table` 的目标类型字段，行尾空格不会把它
+  判成未注入。只有 marker 能读回、删除 marker 成功、挂载选项是读写
+  （`errors=remount-ro` 不算只读）、新文件能写入并 fsync 再用 `O_DIRECT`
+  读回，并且文件系统检查为干净时，`recovered` 才为 true。没有其他持有者
+  时总会卸载，对 ext 执行 `e2fsck -fy`（`dumpe2fs -h` 必须是
+  `Filesystem state: clean` 且没有 `needs_recovery`），对 XFS 执行
+  `xfs_repair`，然后重新挂载。检查失败也会重新挂载。EXIT trap 总会写出
   `dm-error.json`。如果开始时实验路径是该 dm 设备的精确挂载，trap 在退出
-  前会把它重新挂上，表恢复失败时也一样。挂载检查用
-  `findmnt --mountpoint`，不会向上走到父文件系统。如果文件系统拒绝恢复后
-  的读，生产者只卸载这个精确挂载点；设备 open count 为 0 时才对 ext2/3/4
-  执行 `e2fsck -fy`、对 XFS 执行 `xfs_repair`，然后重新挂载。检查失败也
-  会重新挂载。门禁自己创建并删除 1Gi 的 PV `rg-dm-error-pv` 和 PVC
+  前会把它重新挂上，表恢复失败时也一样；如果 `fsfreeze` 还冻着，会先解冻。
+  挂载检查用 `findmnt --mountpoint`，不会向上走到父文件系统。门禁自己创建并删除 1Gi 的 PV `rg-dm-error-pv` 和 PVC
   `rg-dm-error-claim`（`volumeName` 把 claim 钉在这个 PV 上）。它不会绑定
   四个 100Gi 静态 PV 中的任何一个。写 marker 之前，该路径必须是
   `/dev/mapper/$DM_NAME` 的精确挂载。该路径的 PV 处于 Bound、设备还有别的
-  挂载，或者 open count 大于 1（宿主机挂载本身算 1）时，结果是
-  `SKIP-dm-in-use`，不算通过，也不会卸载这个卷。在选中的 `dm-run` 之前和
+  挂载、open count 大于 1（宿主机挂载本身算 1），或者该设备的
+  major:minor 出现在 PID 1 以外的挂载命名空间（`/proc/*/mountinfo`，包括
+  hostPath Pod）时，结果是 `SKIP-dm-in-use`，不算通过，也不会卸载这个卷。
+  在选中的 `dm-run` 之前和
   之后，如果故障 Tenant 的 pool 或其 PVC 使用
   `RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS`，门禁会删除这个 Tenant，只删除
   故障命名空间里认领该类 100Gi PV 的 PVC，等到这些 PV 不再 Bound，再去掉
-  Released PV 的 `claimRef`，并清空本地路径，但保留 `lost+found`。它不删除
-  命名空间。`dm-run` 启动前就判定的 `SKIP-dm-topology` 不会删除 Tenant。
+  Released PV 的 `claimRef`，并清空本地路径，但保留 `lost+found`。清空某一个
+  PV 失败不会跳过其余 PV，也不会清掉该 PV 的 `claimRef`；循环结束后
+  命令仍以非零退出。它不删除命名空间。`dm-run` 启动前就判定的 `SKIP-dm-topology` 不会删除 Tenant。
   未选择 device-mapper 时是 `SKIP-no-dm`。选中的场景缺少 dm-run 环境或
   `RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS` 时是 `SKIP-no-dm-device`
   （不算通过）。该存储类的 provisioner 必须是
