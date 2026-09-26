@@ -33,16 +33,30 @@ mc_bin="${MC_BIN:-mc}"
 rollout_error_threshold="${RUSTFS_UPGRADE_ROLLOUT_ERROR_THRESHOLD:-10}"
 probe_pid=""
 
-if ! command -v "$mc_bin" >/dev/null 2>&1 || ! command -v kubectl >/dev/null 2>&1; then
-  echo "mc and kubectl must be installed for the upgrade script" >&2
+if ! command -v kubectl >/dev/null 2>&1; then
+  echo "kubectl must be installed" >&2
   exit 2
 fi
-if [[ -z "$endpoint" || -z "$new_image" || -z "$prev_image" ]]; then
-  echo "RUSTFS_ENDPOINT, RUSTFS_IMAGE, and RUSTFS_PREV_IMAGE are required" >&2
+if [[ "$mode" != "deploy" ]]; then
+  if ! command -v "$mc_bin" >/dev/null 2>&1; then
+    echo "mc and kubectl must be installed for the upgrade script" >&2
+    exit 2
+  fi
+  if [[ -z "$prev_image" ]]; then
+    echo "RUSTFS_PREV_IMAGE is required" >&2
+    exit 1
+  fi
+fi
+if [[ -z "$endpoint" || -z "$new_image" ]]; then
+  echo "RUSTFS_ENDPOINT and RUSTFS_IMAGE are required" >&2
   exit 1
 fi
-if [[ ! "$new_image" =~ ^[A-Za-z0-9._+:/@-]+$ || ! "$prev_image" =~ ^[A-Za-z0-9._+:/@-]+$ ]]; then
-  echo "RUSTFS_IMAGE and RUSTFS_PREV_IMAGE must be image references" >&2
+if [[ ! "$new_image" =~ ^[A-Za-z0-9._+:/@-]+$ ]]; then
+  echo "RUSTFS_IMAGE must be an image reference" >&2
+  exit 1
+fi
+if [[ "$mode" != "deploy" && ! "$prev_image" =~ ^[A-Za-z0-9._+:/@-]+$ ]]; then
+  echo "RUSTFS_PREV_IMAGE must be an image reference" >&2
   exit 1
 fi
 if [[ ! "$rollout_error_threshold" =~ ^[0-9]+$ ]]; then
@@ -50,10 +64,12 @@ if [[ ! "$rollout_error_threshold" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 mkdir -p "$artifact_dir"
-rm -f "$artifact_dir/warp-baseline-ops.txt" "$artifact_dir/warp-current-ops.txt" \
-  "$artifact_dir/warp-compare.json" "$artifact_dir/probe.fail"
-alias_name="rg-upgrade"
-"$mc_bin" alias set "$alias_name" "$endpoint" "${AWS_ACCESS_KEY_ID:-rustfsadmin}" "${AWS_SECRET_ACCESS_KEY:-rustfsadmin}" >/dev/null
+if [[ "$mode" != "deploy" ]]; then
+  rm -f "$artifact_dir/warp-baseline-ops.txt" "$artifact_dir/warp-current-ops.txt" \
+    "$artifact_dir/warp-compare.json" "$artifact_dir/probe.fail"
+  alias_name="rg-upgrade"
+  "$mc_bin" alias set "$alias_name" "$endpoint" "${AWS_ACCESS_KEY_ID:-rustfsadmin}" "${AWS_SECRET_ACCESS_KEY:-rustfsadmin}" >/dev/null
+fi
 
 stop_probe() {
   if [[ -n "$probe_pid" ]]; then
@@ -172,18 +188,42 @@ record_warp() {
   if ! command -v "$warp_bin" >/dev/null 2>&1; then
     return 0
   fi
-  local log ops
+  local log ops host tls=()
   log="$artifact_dir/warp-${label}.log"
-  "$warp_bin" mixed --host "$endpoint" \
+  host="$endpoint"
+  case "$host" in
+    https://*) tls=(--tls) ;;
+  esac
+  host="${host#http://}"
+  host="${host#https://}"
+  host="${host%%/*}"
+  host="${host%/}"
+  if [[ -z "$host" || "$host" == *"://"* ]]; then
+    echo "warp ${label} host ${endpoint} is not a host:port" >&2
+    return 0
+  fi
+  # A warp failure must not discard the upgrade JSON. Leave the ops file
+  # absent so the warp case fails on its own.
+  if ! "$warp_bin" mixed --host "$host" "${tls[@]}" \
     --access-key "${AWS_ACCESS_KEY_ID:-rustfsadmin}" \
     --secret-key "${AWS_SECRET_ACCESS_KEY:-rustfsadmin}" \
     --duration 20s --concurrent 4 --objects 64 --obj.size 64KiB \
-    >"$log" 2>&1 || true
+    >"$log" 2>&1; then
+    echo "warp ${label} exited non-zero; not writing ${out}" >&2
+    return 0
+  fi
   ops="$(awk '{for (i = 1; i <= NF; i++) if ($i ~ /^obj\/s,?$/) {gsub(/,/, "", $(i-1)); print $(i-1); exit}}' "$log" || true)"
   if [[ "$ops" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     printf '%s\n' "$ops" >"$out"
+  else
+    echo "warp ${label} produced no obj/s result; not writing ${out}" >&2
   fi
 }
+
+if [[ "$mode" == "deploy" ]]; then
+  patch_image "$new_image" "$new_tag"
+  exit 0
+fi
 
 patch_image "$prev_image" "$prev_tag"
 write_dataset

@@ -71,6 +71,18 @@ shared_filesystem() {
   [[ -n "$vol_dev" && "$vol_dev" == "$root_dev" ]]
 }
 
+# Remount can never succeed on operator pods that drop every capability.
+# That is SKIP-no-privileged, including on local-path, and it is checked
+# before the shared-filesystem refusal so the label matches the docs.
+if [[ "$mode" == "remount" ]]; then
+  cap="$(kubectl -n "$namespace" exec "$pod" -- sh -c "awk '/^CapEff:/ {print \$2}' /proc/1/status" 2>/dev/null || true)"
+  cap="$(printf '%s' "$cap" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  if [[ -z "$cap" || "$cap" =~ ^0+$ ]]; then
+    echo "container CapEff is ${cap:-empty}; remount is not permitted and is not coverage" >&2
+    exit 2
+  fi
+fi
+
 if [[ "$mode" == "fill" || "$mode" == "remount" ]]; then
   if shared_filesystem; then
     echo "volume ${volume} shares the node filesystem (storage class or device id); refusing to fill or remount it" >&2

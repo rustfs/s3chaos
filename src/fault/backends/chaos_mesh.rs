@@ -1005,7 +1005,7 @@ fn build_fault_spec(
                 FaultKind::RustfsServerNetworkLoss => {
                     let (loss_percent, correlation_percent) =
                         injection.parameters().network_loss()?;
-                    NetworkChaosSpec::loss_one_rustfs_pod(
+                    let mut spec = NetworkChaosSpec::loss_one_rustfs_pod(
                         cluster,
                         &config.chaos_namespace,
                         run_id,
@@ -1013,7 +1013,15 @@ fn build_fault_spec(
                         injection.duration(),
                         loss_percent,
                         correlation_percent,
-                    )?
+                    )?;
+                    if std::env::var("RUSTFS_RELEASE_GATE_NETWORK_LOSS_SCOPE")
+                        .ok()
+                        .as_deref()
+                        == Some("all")
+                    {
+                        spec = spec.with_all_sources();
+                    }
+                    spec
                 }
                 FaultKind::RustfsServerNetworkFlaky => {
                     let (loss_percent, correlation_percent) =
@@ -1238,6 +1246,9 @@ pub struct NetworkChaosSpec {
     /// N > 1 renders `mode: fixed` + `value: "N"` so the plan-declared blast
     /// radius is honored instead of silently narrowing to a single Pod.
     pub targets: u32,
+    /// When set, the source selector is `mode: all` so every tenant Pod loses
+    /// packets. The default stays `mode: one`.
+    pub all_sources: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1998,6 +2009,7 @@ impl NetworkChaosSpec {
             direction: NetworkChaosDirection::Both,
             duration,
             targets: 1,
+            all_sources: false,
         })
     }
 
@@ -2006,8 +2018,15 @@ impl NetworkChaosSpec {
         self
     }
 
+    pub fn with_all_sources(mut self) -> Self {
+        self.all_sources = true;
+        self
+    }
+
     fn mode_manifest(&self) -> String {
-        if self.targets == 1 {
+        if self.all_sources {
+            "  mode: all".to_string()
+        } else if self.targets == 1 {
             "  mode: one".to_string()
         } else {
             format!("  mode: fixed\n  value: \"{}\"", self.targets)
@@ -2401,6 +2420,36 @@ mod tests {
             percent: 20,
             object_count: 12,
         }
+    }
+
+    #[test]
+    fn network_loss_all_sources_renders_mode_all() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let spec = NetworkChaosSpec::loss_one_rustfs_pod(
+            &config.cluster,
+            "chaos-mesh",
+            "run-1234567890",
+            "network-loss",
+            Duration::from_secs(60),
+            80,
+            0,
+        )
+        .expect("loss spec")
+        .with_all_sources();
+        let manifest = spec.manifest();
+        assert!(manifest.contains("\n  mode: all\n"), "{manifest}");
+        assert!(!manifest.contains("\n  mode: one\n"), "{manifest}");
+        let one = NetworkChaosSpec::loss_one_rustfs_pod(
+            &config.cluster,
+            "chaos-mesh",
+            "run-1234567890",
+            "network-loss",
+            Duration::from_secs(60),
+            80,
+            0,
+        )
+        .expect("default loss spec");
+        assert!(one.manifest().contains("\n  mode: one\n"));
     }
 
     #[test]

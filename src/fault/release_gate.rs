@@ -395,8 +395,20 @@ fn execute_pending(report: &mut ReleaseGateReport, request: &ReleaseGateRequest)
     if report.git_sha.is_none() {
         report.git_sha = version_output.as_deref().and_then(parse_git_sha);
     }
+    let image_missing = !request.dry_run && request.cluster && request.image.is_none();
+    let mut abort_cluster = image_missing;
     for case in &mut report.cases {
         if case.status != CaseStatus::Pending.as_str() {
+            continue;
+        }
+        if abort_cluster && !is_local_artifact_case(&case.id) {
+            case.status = CaseStatus::Skip.as_str().to_string();
+            case.reason = if image_missing {
+                "SKIP-aborted: the release image was not loaded, so this case did not touch the cluster".to_string()
+            } else {
+                "SKIP-aborted: the release image deploy failed, so this case did not run against the previous image".to_string()
+            };
+            case.counts_as_failure = true;
             continue;
         }
         let outcome = execute_case(&case.id, request, &checksums, version_output.as_deref());
@@ -404,9 +416,19 @@ fn execute_pending(report: &mut ReleaseGateReport, request: &ReleaseGateRequest)
         case.reason = outcome.reason;
         case.counts_as_failure = outcome.status == CaseStatus::Fail
             || (outcome.status == CaseStatus::Skip && !skip_is_passing(&case.reason, request));
+        if case.id == "fresh-install" && case.reason.starts_with("release image deploy failed") {
+            abort_cluster = true;
+        }
     }
     score_post_fault_checksums(report, request);
     Ok(())
+}
+
+fn is_local_artifact_case(id: &str) -> bool {
+    matches!(
+        id,
+        "release-artifact-checksums" | "release-artifact-version" | "release-artifact-dynamic-deps"
+    )
 }
 
 fn score_post_fault_checksums(report: &mut ReleaseGateReport, request: &ReleaseGateRequest) {
@@ -554,11 +576,26 @@ fn run_fault_scenario(request: &ReleaseGateRequest, scenario: &str) -> Outcome {
         .iter()
         .find(|spec| spec.scenario == scenario)
         .is_some_and(|spec| spec.backend == FaultBackend::DeviceMapper);
-    if device_mapper && !dm_env_ready(Some(scenario)) {
+    if device_mapper && !request.device_mapper {
+        return Outcome {
+            status: CaseStatus::Skip,
+            reason: format!("SKIP-no-dm: {scenario} needs RUSTFS_RELEASE_GATE_HAS_DM"),
+        };
+    }
+    if device_mapper && scenario != selected_dm_scenario() {
         return Outcome {
             status: CaseStatus::Skip,
             reason: format!(
-                "SKIP-no-dm-device: {scenario} needs the device-mapper env contract (DM_NAME, DM_NODE, mount, observer, and host allowlists)"
+                "SKIP-dm-not-selected: this run executes only {}; set RELEASE_GATE_DM_SCENARIO to choose another",
+                selected_dm_scenario()
+            ),
+        };
+    }
+    if device_mapper && (!dm_env_ready(Some(scenario)) || dm_storage_class().is_none()) {
+        return Outcome {
+            status: CaseStatus::Skip,
+            reason: format!(
+                "SKIP-no-dm-device: {scenario} needs the device-mapper env contract and RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS (a no-provisioner class, separate from the dynamic class)"
             ),
         };
     }
@@ -568,6 +605,17 @@ fn run_fault_scenario(request: &ReleaseGateRequest, scenario: &str) -> Outcome {
     command.arg(&script).arg(entry).arg(scenario);
     if let Some(image) = &request.image {
         command.env("RUSTFS_FAULT_TEST_SERVER_IMAGE", image);
+    }
+    if device_mapper && let Some(class) = dm_storage_class() {
+        command.env("RUSTFS_FAULT_TEST_STORAGE_CLASS", class);
+    }
+    if scenario == scenarios::NETWORK_LOSS_SCENARIO {
+        let scope = std::env::var("RUSTFS_RELEASE_GATE_NETWORK_LOSS_SCOPE")
+            .unwrap_or_else(|_| "all".to_string());
+        let min_percent = std::env::var("RUSTFS_FAULT_TEST_NETWORK_LOSS_MIN_PERCENT")
+            .unwrap_or_else(|_| "10".to_string());
+        command.env("RUSTFS_RELEASE_GATE_NETWORK_LOSS_SCOPE", scope);
+        command.env("RUSTFS_FAULT_TEST_NETWORK_LOSS_MIN_PERCENT", min_percent);
     }
     match command.status() {
         Ok(status) if status.success() => Outcome {
@@ -672,12 +720,58 @@ fn protocol_plan_fingerprint(stdout: &[u8]) -> Result<String> {
 }
 
 fn fresh_install_outcome(request: &ReleaseGateRequest) -> Outcome {
+    if read_optional(&request.artifact_dir.join("fresh-install.json")).is_some() {
+        return evidence_or_produce(
+            request,
+            "fresh-install.json",
+            Some("fresh-install"),
+            classify_fresh_install,
+        );
+    }
+    if request.dry_run || !request.cluster {
+        return evidence_or_produce(
+            request,
+            "fresh-install.json",
+            Some("fresh-install"),
+            classify_fresh_install,
+        );
+    }
+    if let Err(error) = deploy_release_image(request) {
+        return Outcome {
+            status: CaseStatus::Fail,
+            reason: format!("release image deploy failed: {error:#}"),
+        };
+    }
     evidence_or_produce(
         request,
         "fresh-install.json",
         Some("fresh-install"),
         classify_fresh_install,
     )
+}
+
+fn deploy_release_image(request: &ReleaseGateRequest) -> Result<()> {
+    let image = request
+        .image
+        .as_deref()
+        .context("no release image to deploy")?;
+    let endpoint = request
+        .endpoint
+        .as_deref()
+        .context("RUSTFS_ENDPOINT is required to deploy the release image")?;
+    let status = Command::new("bash")
+        .arg("scripts/release-gate-upgrade.sh")
+        .arg("deploy")
+        .env("RUSTFS_IMAGE", image)
+        .env("RUSTFS_VERSION", &request.version)
+        .env("RUSTFS_ENDPOINT", endpoint)
+        .env("RELEASE_GATE_ARTIFACT_DIR", &request.artifact_dir)
+        .status()
+        .context("start release image deploy")?;
+    if !status.success() {
+        bail!("release-gate-upgrade.sh deploy exited {status}");
+    }
+    Ok(())
 }
 
 fn evidence_or_produce(
@@ -991,6 +1085,27 @@ fn dm_error_outcome(request: &ReleaseGateRequest) -> Outcome {
     run_evidence_producer(request, "dm-error", "dm-error.json", classify_dm_error_file)
 }
 
+fn selected_dm_scenario() -> String {
+    std::env::var("RELEASE_GATE_DM_SCENARIO")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "dm-flakey".to_string())
+}
+
+fn dm_storage_class() -> Option<String> {
+    let value = std::env::var("RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS").ok()?;
+    let value = value.trim();
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|ch| ch.is_control() || matches!(ch, '=' | ' ' | '\'' | '"'))
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
 fn dm_env_ready(scenario: Option<&str>) -> bool {
     const KEYS: &[&str] = &[
         "RUSTFS_FAULT_TEST_DM_NAME",
@@ -1057,9 +1172,10 @@ fn version_outcome(output: Option<&str>, tag: &str) -> Outcome {
 }
 
 fn dynamic_dep_outcome(artifact_dir: &Path) -> Outcome {
-    let ldd = read_optional(&artifact_dir.join("rustfs-ldd.txt"));
+    let mut ldd_files = ldd_report_names(artifact_dir);
+    ldd_files.sort();
     let otool = read_optional(&artifact_dir.join("rustfs-otool.txt"));
-    if ldd.is_none() && otool.is_none() {
+    if ldd_files.is_empty() && otool.is_none() {
         return Outcome {
             status: CaseStatus::Skip,
             reason: "SKIP-no-artifact: neither rustfs-ldd.txt nor rustfs-otool.txt was captured"
@@ -1067,8 +1183,10 @@ fn dynamic_dep_outcome(artifact_dir: &Path) -> Outcome {
         };
     }
     let mut foreign = Vec::new();
-    if let Some(text) = ldd {
-        foreign.extend(non_system_dynamic_deps(DynTool::Ldd, &text));
+    for name in &ldd_files {
+        if let Some(text) = read_optional(&artifact_dir.join(name)) {
+            foreign.extend(non_system_dynamic_deps(DynTool::Ldd, &text));
+        }
     }
     if let Some(text) = otool {
         foreign.extend(non_system_dynamic_deps(DynTool::Otool, &text));
@@ -1465,6 +1583,9 @@ fn fault_skip(name: &str, request: &ReleaseGateRequest) -> Option<&'static str> 
     if spec.backend == FaultBackend::DeviceMapper && !request.device_mapper {
         return Some("SKIP-no-dm");
     }
+    if spec.backend == FaultBackend::DeviceMapper && spec.scenario != selected_dm_scenario() {
+        return Some("SKIP-dm-not-selected");
+    }
     if request.dry_run {
         return Some("SKIP-dry-run");
     }
@@ -1480,7 +1601,9 @@ fn skip_is_passing(reason: &str, request: &ReleaseGateRequest) -> bool {
         "SKIP-dry-run" => request.dry_run,
         "SKIP-toda-arm64" => !request.toda_usable,
         "SKIP-no-dm" => !request.device_mapper,
-        "DEFERRED-physical-power" | "SKIP-planned" | "SKIP-timechaos" => true,
+        "DEFERRED-physical-power" | "SKIP-planned" | "SKIP-timechaos" | "SKIP-dm-not-selected" => {
+            true
+        }
         "SKIP-no-artifact" => request.dry_run && !request.fetch,
         "SKIP-no-prev-version" => request.prev_version.is_none(),
         "SKIP-no-cluster" => request.dry_run,
@@ -1961,8 +2084,12 @@ fn classify_remount_file(text: &str) -> Outcome {
 fn classify_dm_error_file(text: &str) -> Outcome {
     flag_file(
         text,
-        &["table_has_error_target", "reads_survived", "recovered"],
-        "dm-error was injected and the volume recovered",
+        &[
+            "table_has_error_target",
+            "read_failed_during_fault",
+            "recovered",
+        ],
+        "dm-error rejected a read while the error target was active and the volume recovered",
     )
 }
 
@@ -2101,6 +2228,7 @@ async fn fetch_release_assets(tag: &str, dest: &Path, arch: &str) -> Result<Opti
         Some(sha) => Some(sha),
         None => resolve_tag_sha(&client, tag).await?,
     };
+    let mut wanted = Vec::new();
     for asset in assets {
         let name = asset
             .get("name")
@@ -2113,8 +2241,30 @@ async fn fetch_release_assets(tag: &str, dest: &Path, arch: &str) -> Result<Opti
         if !want_asset(name, arch) || !trusted_release_url(url) {
             continue;
         }
+        let size = asset.get("size").and_then(|value| value.as_u64());
+        wanted.push((name.to_string(), url.to_string(), size));
+    }
+    let sums_index = wanted
+        .iter()
+        .position(|(name, _, _)| name.eq_ignore_ascii_case("SHA256SUMS"))
+        .context("release has no SHA256SUMS asset")?;
+    let (sums_name, sums_url, sums_size) = wanted[sums_index].clone();
+    let sums_path = release_asset_path(dest, &sums_name)?;
+    download_verified(&client, &sums_url, &sums_path, sums_size, None)
+        .await
+        .context("download SHA256SUMS")?;
+    let sums = parse_sha256sums(&fs::read_to_string(&sums_path)?)?;
+    for (name, url, size) in &wanted {
+        if name.eq_ignore_ascii_case("SHA256SUMS") {
+            continue;
+        }
+        let expected = sums
+            .iter()
+            .find(|(_, listed)| listed == name)
+            .map(|(hash, _)| hash.clone())
+            .with_context(|| format!("{name} is not listed in SHA256SUMS"))?;
         let path = release_asset_path(dest, name)?;
-        download_to(&client, url, &path)
+        download_verified(&client, url, &path, *size, Some(&expected))
             .await
             .with_context(|| format!("download {name}"))?;
     }
@@ -2143,7 +2293,53 @@ fn want_asset(name: &str, arch: &str) -> bool {
     std::env::consts::OS == "macos" && (lower.contains("macos") || lower.contains("darwin"))
 }
 
-async fn download_to(client: &reqwest::Client, url: &str, path: &Path) -> Result<()> {
+async fn download_verified(
+    client: &reqwest::Client,
+    url: &str,
+    path: &Path,
+    expected_len: Option<u64>,
+    expected_sha: Option<&str>,
+) -> Result<()> {
+    let mut last_error = String::from("no attempt ran");
+    for _attempt in 1..=3 {
+        match download_to(client, url, path, expected_len).await {
+            Ok(()) => {}
+            Err(error) => {
+                let _ = fs::remove_file(path);
+                last_error = format!("{error:#}");
+                continue;
+            }
+        }
+        if let Some(expected) = expected_sha {
+            match sha256_file(path) {
+                Ok(actual) if actual == expected => return Ok(()),
+                Ok(actual) => {
+                    let _ = fs::remove_file(path);
+                    last_error = format!("sha256 {actual} != {expected}");
+                    continue;
+                }
+                Err(error) => {
+                    let _ = fs::remove_file(path);
+                    last_error = format!("{error:#}");
+                    continue;
+                }
+            }
+        }
+        return Ok(());
+    }
+    let _ = fs::remove_file(path);
+    bail!(
+        "download {} failed after 3 attempts: {last_error}",
+        path.display()
+    );
+}
+
+async fn download_to(
+    client: &reqwest::Client,
+    url: &str,
+    path: &Path,
+    expected_len: Option<u64>,
+) -> Result<()> {
     use futures::StreamExt;
     use std::io::Write;
     let response = client
@@ -2153,15 +2349,34 @@ async fn download_to(client: &reqwest::Client, url: &str, path: &Path) -> Result
         .with_context(|| format!("GET {url}"))?
         .error_for_status()
         .with_context(|| format!("GET {url}"))?;
+    let content_len = response.content_length();
+    if let (Some(expected), Some(content)) = (expected_len, content_len)
+        && expected != content
+    {
+        bail!("Content-Length {content} does not match release asset size {expected}");
+    }
     let mut file = fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let mut written = 0u64;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.with_context(|| format!("read {url}"))?;
+        written = written
+            .checked_add(chunk.len() as u64)
+            .context("download length overflow")?;
         file.write_all(&chunk)
             .with_context(|| format!("write {}", path.display()))?;
     }
     file.flush()
         .with_context(|| format!("flush {}", path.display()))?;
+    let expected = expected_len.or(content_len);
+    if let Some(expected) = expected
+        && written != expected
+    {
+        bail!("wrote {written} bytes, expected {expected}");
+    }
+    if written == 0 {
+        bail!("download was empty");
+    }
     Ok(())
 }
 
@@ -2279,27 +2494,128 @@ fn clear_produced_evidence(dir: &Path) {
     }
 }
 
-fn host_release_zip(dir: &Path, arch: &str) -> Option<PathBuf> {
-    let entries = fs::read_dir(dir).ok()?;
+fn linux_release_zips(dir: &Path, arch: &str) -> Vec<PathBuf> {
+    let mut zips = matching_zips(dir, arch)
+        .into_iter()
+        .filter(|path| zip_name(path).contains("linux"))
+        .collect::<Vec<_>>();
+    zips.sort();
+    zips
+}
+
+fn macos_release_zip(dir: &Path, arch: &str) -> Option<PathBuf> {
+    matching_zips(dir, arch).into_iter().find(|path| {
+        let name = zip_name(path);
+        name.contains("macos") || name.contains("darwin")
+    })
+}
+
+fn matching_zips(dir: &Path, arch: &str) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
     entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .find(|path| {
+        .filter(|path| {
             path.extension().and_then(|ext| ext.to_str()) == Some("zip")
                 && path
                     .file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| want_asset(name, arch))
         })
+        .collect()
+}
+
+fn zip_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+fn libc_of_zip(path: &Path) -> &'static str {
+    if zip_name(path).contains("musl") {
+        "musl"
+    } else {
+        "gnu"
+    }
+}
+
+fn preferred_image_zip(zips: &[PathBuf]) -> Option<&PathBuf> {
+    zips.iter()
+        .find(|path| libc_of_zip(path) == "gnu" && zip_name(path).contains("gnu"))
+        .or_else(|| zips.iter().find(|path| libc_of_zip(path) == "gnu"))
+        .or_else(|| zips.first())
+}
+
+fn ldd_report_name(path: &Path) -> &'static str {
+    if libc_of_zip(path) == "musl" {
+        "rustfs-ldd-musl.txt"
+    } else {
+        "rustfs-ldd.txt"
+    }
+}
+
+fn ldd_report_names(dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (name.starts_with("rustfs-ldd") && name.ends_with(".txt")).then_some(name)
+        })
+        .collect()
 }
 
 fn capture_release_binary(dir: &Path, arch: &str) -> Result<()> {
-    let Some(zip_path) = host_release_zip(dir, arch) else {
-        return Ok(());
-    };
-    let binary = dir.join("rustfs");
-    extract_rustfs_binary(&zip_path, &binary)?;
-    capture_binary_identity(&binary, dir)
+    let linux = linux_release_zips(dir, arch);
+    if let Some(zip_path) = preferred_image_zip(&linux) {
+        let binary = dir.join("rustfs");
+        extract_rustfs_binary(zip_path, &binary)?;
+        fs::write(
+            dir.join("rustfs-image-libc.txt"),
+            format!("{}\n", libc_of_zip(zip_path)),
+        )?;
+        let mut version_error = None;
+        if capture_version(&binary, dir).is_err() {
+            if let Some(macos_zip) = macos_release_zip(dir, arch) {
+                let staged = dir.join("rustfs-version-bin");
+                extract_rustfs_binary(&macos_zip, &staged)?;
+                // otool must be captured even when dyld cannot execute the binary.
+                capture_otool(&staged, &dir.join("rustfs-otool.txt"))?;
+                version_error = capture_version(&staged, dir).err();
+                let _ = fs::remove_file(&staged);
+            } else {
+                capture_version(&binary, dir)?;
+            }
+        }
+        for zip_path in &linux {
+            let staged = dir.join(format!("rustfs-{}", libc_of_zip(zip_path)));
+            extract_rustfs_binary(zip_path, &staged)?;
+            capture_ldd(&staged, &dir.join(ldd_report_name(zip_path)))?;
+            let _ = fs::remove_file(&staged);
+        }
+        if let Some(error) = version_error {
+            return Err(error);
+        }
+    } else if let Some(zip_path) = macos_release_zip(dir, arch) {
+        let binary = dir.join("rustfs");
+        extract_rustfs_binary(&zip_path, &binary)?;
+        capture_otool(&binary, &dir.join("rustfs-otool.txt"))?;
+        capture_version(&binary, dir)?;
+    }
+    if let Some(zip_path) = macos_release_zip(dir, arch)
+        && !dir.join("rustfs-otool.txt").is_file()
+    {
+        let staged = dir.join("rustfs-macos");
+        extract_rustfs_binary(&zip_path, &staged)?;
+        capture_otool(&staged, &dir.join("rustfs-otool.txt"))?;
+        let _ = fs::remove_file(staged);
+    }
+    Ok(())
 }
 
 fn extract_rustfs_binary(zip_path: &Path, dest: &Path) -> Result<()> {
@@ -2335,7 +2651,7 @@ fn extract_rustfs_binary(zip_path: &Path, dest: &Path) -> Result<()> {
     bail!("{} has no rustfs binary", zip_path.display());
 }
 
-fn capture_binary_identity(binary: &Path, dir: &Path) -> Result<()> {
+fn capture_version(binary: &Path, dir: &Path) -> Result<()> {
     let version = Command::new(binary)
         .arg("--version")
         .output()
@@ -2349,20 +2665,25 @@ fn capture_binary_identity(binary: &Path, dir: &Path) -> Result<()> {
     }
     fs::write(dir.join("rustfs-version.txt"), text)
         .with_context(|| format!("write {}", dir.join("rustfs-version.txt").display()))?;
+    Ok(())
+}
+
+fn capture_ldd(binary: &Path, dest: &Path) -> Result<()> {
     if let Ok(ldd) = Command::new("ldd").arg(binary).output() {
         let mut text = String::from_utf8_lossy(&ldd.stdout).into_owned();
         if !ldd.stderr.is_empty() {
             text.push_str(&String::from_utf8_lossy(&ldd.stderr));
         }
-        fs::write(dir.join("rustfs-ldd.txt"), text)?;
+        fs::write(dest, text)?;
     }
+    Ok(())
+}
+
+fn capture_otool(binary: &Path, dest: &Path) -> Result<()> {
     if let Ok(otool) = Command::new("otool").arg("-L").arg(binary).output()
         && otool.status.success()
     {
-        fs::write(
-            dir.join("rustfs-otool.txt"),
-            String::from_utf8_lossy(&otool.stdout).as_ref(),
-        )?;
+        fs::write(dest, String::from_utf8_lossy(&otool.stdout).as_ref())?;
     }
     Ok(())
 }
@@ -2854,5 +3175,107 @@ mod tests {
         assert!(want_asset("rustfs-linux-aarch64.zip", "aarch64"));
         assert!(!want_asset("rustfs-linux-x86_64.zip", "aarch64"));
         assert!(!want_asset("notes.txt", "aarch64"));
+    }
+
+    #[test]
+    fn image_binary_prefers_the_gnu_zip() {
+        let musl = PathBuf::from("rustfs-linux-musl-aarch64.zip");
+        let gnu = PathBuf::from("rustfs-linux-gnu-aarch64.zip");
+        let musl_first = vec![musl.clone(), gnu.clone()];
+        assert_eq!(preferred_image_zip(&musl_first), Some(&gnu));
+        let gnu_first = vec![gnu.clone(), musl.clone()];
+        assert_eq!(preferred_image_zip(&gnu_first), Some(&gnu));
+        assert_eq!(libc_of_zip(&gnu), "gnu");
+        assert_eq!(libc_of_zip(&musl), "musl");
+        assert_eq!(ldd_report_name(&musl), "rustfs-ldd-musl.txt");
+        assert_eq!(ldd_report_name(&gnu), "rustfs-ldd.txt");
+    }
+
+    #[test]
+    fn musl_static_ldd_does_not_hide_a_gnu_foreign_library() {
+        let dir = tempfile::tempdir().expect("temp");
+        fs::write(
+            dir.path().join("rustfs-ldd-musl.txt"),
+            "\tnot a dynamic executable\n",
+        )
+        .expect("musl ldd");
+        fs::write(
+            dir.path().join("rustfs-ldd.txt"),
+            "\tliblzma.so.5 => /opt/liblzma.so.5 (0x1)\n",
+        )
+        .expect("gnu ldd");
+        let outcome = dynamic_dep_outcome(dir.path());
+        assert_eq!(outcome.status, CaseStatus::Fail);
+        assert!(
+            outcome.reason.contains("/opt/liblzma.so.5"),
+            "{}",
+            outcome.reason
+        );
+        fs::write(
+            dir.path().join("rustfs-ldd.txt"),
+            "not a dynamic executable\n",
+        )
+        .expect("static");
+        assert_eq!(dynamic_dep_outcome(dir.path()).status, CaseStatus::Pass);
+    }
+
+    #[test]
+    fn dm_error_requires_a_failed_read_during_the_fault() {
+        let ok =
+            r#"{"table_has_error_target":true,"read_failed_during_fault":true,"recovered":true}"#;
+        assert_eq!(classify_dm_error_file(ok).status, CaseStatus::Pass);
+        let survived = r#"{"table_has_error_target":true,"reads_survived":true,"recovered":true}"#;
+        assert_eq!(classify_dm_error_file(survived).status, CaseStatus::Fail);
+    }
+
+    #[test]
+    fn unselected_dm_scenarios_are_a_passing_skip() {
+        let mut request = request("full", false);
+        request.cluster = true;
+        request.device_mapper = true;
+        let other = execute_case("fault:dm-drop-writes-after-ack-put", &request, &[], None);
+        assert!(
+            other.reason.starts_with("SKIP-dm-not-selected"),
+            "{}",
+            other.reason
+        );
+        assert!(skip_is_passing(&other.reason, &request));
+        let selected = execute_case("fault:dm-flakey", &request, &[], None);
+        assert!(
+            selected.reason.starts_with("SKIP-no-dm-device"),
+            "{}",
+            selected.reason
+        );
+        assert!(!skip_is_passing("SKIP-aborted: image missing", &request));
+    }
+
+    #[test]
+    fn missing_release_image_aborts_before_cluster_cases() {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut request = request("smoke", false);
+        request.cluster = true;
+        request.artifact_dir = dir.path().to_path_buf();
+        request.output_dir = dir.path().join("out");
+        let mut report = plan_release_gate(&request);
+        execute_pending(&mut report, &request).expect("execute");
+        let protocol = report
+            .cases
+            .iter()
+            .find(|case| case.id.starts_with("protocol:"))
+            .expect("protocol");
+        assert!(
+            protocol.reason.starts_with("SKIP-aborted"),
+            "{}",
+            protocol.reason
+        );
+        assert!(protocol.counts_as_failure);
+        let kill = report
+            .cases
+            .iter()
+            .find(|case| case.id == "fault:pod-kill-one")
+            .expect("pod-kill");
+        assert!(kill.reason.starts_with("SKIP-aborted"), "{}", kill.reason);
+        finalize_verdict(&mut report);
+        assert_eq!(report.verdict, "fail");
     }
 }

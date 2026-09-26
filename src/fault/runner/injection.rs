@@ -26,9 +26,10 @@ use crate::{
         history::DurabilityCohort,
         quorum::require_fresh_runtime_observation,
         scenarios::{
-            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_FAILURE_QUORUM_EDGE_SCENARIO,
-            QUORUM_P_IO_FAULT_SCENARIO, QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO,
-            requires_prefault_multipart_staging, requires_quorum_edge_read_survival,
+            NETWORK_LOSS_SCENARIO, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+            POD_FAILURE_QUORUM_EDGE_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
+            QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, requires_prefault_multipart_staging,
+            requires_quorum_edge_read_survival,
         },
     },
     framework::resources,
@@ -37,6 +38,20 @@ use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::time::Duration;
+
+fn network_loss_min_percent() -> Result<Option<u8>> {
+    let Ok(value) = std::env::var("RUSTFS_FAULT_TEST_NETWORK_LOSS_MIN_PERCENT") else {
+        return Ok(None);
+    };
+    let parsed: u8 = value.trim().parse().with_context(|| {
+        format!("RUSTFS_FAULT_TEST_NETWORK_LOSS_MIN_PERCENT must be 1..=100, got {value}")
+    })?;
+    ensure!(
+        (1..=100).contains(&parsed),
+        "RUSTFS_FAULT_TEST_NETWORK_LOSS_MIN_PERCENT must be 1..=100, got {parsed}"
+    );
+    Ok(Some(parsed))
+}
 
 use super::access::{
     PortForwardLost, ensure_s3_access, wait_for_local_forward, wait_for_tenant_s3,
@@ -1553,6 +1568,16 @@ impl FaultRun<'_> {
             .summary
             .require_fault_evidence(require_client_disruption)
             .and_then(|()| {
+                if plan.scenario.as_str() == NETWORK_LOSS_SCENARIO
+                    && let Some(min_percent) = network_loss_min_percent()?
+                {
+                    crate::fault::workload::execution::sustained_error_rate(
+                        workload.summary.attempted(),
+                        workload.summary.disrupted(),
+                        min_percent,
+                        30,
+                    )?;
+                }
                 if matches!(
                     plan.scenario.as_str(),
                     NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO | POD_FAILURE_QUORUM_EDGE_SCENARIO

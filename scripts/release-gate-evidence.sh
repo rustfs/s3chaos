@@ -145,15 +145,51 @@ EOF
     victim_b="${pods[3]}"
     chaos_a="rg-qe-${victim_a}"
     chaos_b="rg-qe-${victim_b}"
+    work="$(mktemp -d "${artifact_dir}/qe.XXXXXX")"
     delete_chaos() {
       kubectl -n "$chaos_namespace" delete podchaos "$chaos_a" "$chaos_b" --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
     }
-    trap delete_chaos EXIT
-    warm_ip="$(kubectl -n "$namespace" get pod "$warm" -o jsonpath='{.status.podIP}')"
-    "$mc_bin" alias set rg-warm "http://${warm_ip}:9000" "$access_key" "$secret_key" >/dev/null
-    "$mc_bin" mb --ignore-existing rg-warm/rg-qe >/dev/null
-    printf 'quorum-edge-object' >"$artifact_dir/qe-object.bin"
-    "$mc_bin" cp "$artifact_dir/qe-object.bin" rg-warm/rg-qe/object.bin >/dev/null
+    cleanup_probe() {
+      delete_chaos
+      "$mc_bin" alias rm rg-warm >/dev/null 2>&1 || true
+      "$mc_bin" alias rm rg-cold >/dev/null 2>&1 || true
+      rm -rf "$work"
+    }
+    trap cleanup_probe EXIT
+    # Aliases are created and checked before PodChaos. A failure here is a
+    # tool error: do not write probe JSON, and do not write objects into the
+    # repository working directory.
+    setup_alias() {
+      local name="$1" alias="$2" ip
+      ip="$(kubectl -n "$namespace" get pod "$name" -o jsonpath='{.status.podIP}')"
+      if [[ -z "$ip" ]]; then
+        echo "pod ${name} has no IP; refusing to probe" >&2
+        exit 1
+      fi
+      if ! "$mc_bin" alias set "$alias" "http://${ip}:9000" "$access_key" "$secret_key" >&2; then
+        echo "mc alias set ${alias} failed before the fault" >&2
+        exit 1
+      fi
+      if ! "$mc_bin" ls "$alias" >/dev/null; then
+        echo "alias ${alias} cannot list the pod endpoint before the fault" >&2
+        exit 1
+      fi
+    }
+    setup_alias "$warm" rg-warm
+    setup_alias "$cold" rg-cold
+    printf 'quorum-edge-object' >"$work/object.bin"
+    if ! "$mc_bin" mb --ignore-existing rg-warm/rg-qe >/dev/null; then
+      echo "mc mb rg-warm/rg-qe failed before the fault" >&2
+      exit 1
+    fi
+    if ! "$mc_bin" pipe rg-warm/rg-qe/object.bin <"$work/object.bin" >/dev/null; then
+      echo "mc pipe of the quorum object failed before the fault" >&2
+      exit 1
+    fi
+    if ! "$mc_bin" stat rg-warm/rg-qe/object.bin >/dev/null; then
+      echo "mc stat of the quorum object failed before the fault" >&2
+      exit 1
+    fi
     for victim in "$victim_a" "$victim_b"; do
       name="rg-qe-${victim}"
       kubectl -n "$chaos_namespace" apply -f - <<EOF
@@ -173,29 +209,74 @@ spec:
   gracePeriod: 0
 EOF
     done
-    sleep 5
+    read_ready() {
+      local name="$1" dest="$2" status
+      if ! status="$(kubectl -n "$namespace" get pod "$name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')"; then
+        echo "cannot read Ready condition for ${name}" >&2
+        exit 1
+      fi
+      printf -v "$dest" '%s' "$status"
+    }
+    deadline=$((SECONDS + 90))
+    while (( SECONDS < deadline )); do
+      read_ready "$victim_a" ready_a
+      read_ready "$victim_b" ready_b
+      if [[ "$ready_a" != "True" && "$ready_b" != "True" ]]; then
+        break
+      fi
+      sleep 2
+    done
+    read_ready "$victim_a" ready_a
+    read_ready "$victim_b" ready_b
+    if [[ "$ready_a" == "True" || "$ready_b" == "True" ]]; then
+      echo "quorum-edge victims stayed Ready; probe JSON was not written" >&2
+      exit 1
+    fi
+    tool_error() {
+      local err="$1"
+      # Alias and client setup failures abort the probe. An S3 404 or 503
+      # stays a counted request failure so the JSON still records R1.
+      grep -Eq 'alias .* not found|not a valid alias|Unable to initialize|Invalid URL' "$err"
+    }
     probe_pod() {
-      local name="$1" cold_flag="$2" ip alias ok attempted wrong put_rejected put_attempted live ready
+      local name="$1" cold_flag="$2" dest="$3" alias ok attempted wrong put_rejected put_attempted live ready ip
+      if [[ "$name" == "$warm" ]]; then
+        alias="rg-warm"
+      else
+        alias="rg-cold"
+      fi
+      if ! "$mc_bin" alias list | grep -Eq "^${alias}([[:space:]]|$)"; then
+        echo "alias ${alias} disappeared; refusing to record a probe" >&2
+        exit 1
+      fi
       ip="$(kubectl -n "$namespace" get pod "$name" -o jsonpath='{.status.podIP}')"
-      alias="rg-probe-${name}"
-      "$mc_bin" alias set "$alias" "http://${ip}:9000" "$access_key" "$secret_key" >/dev/null
       ok=0
       attempted=5
       wrong=0
       local i
       for i in 1 2 3 4 5; do
-        if "$mc_bin" cp "$alias/rg-qe/object.bin" "$artifact_dir/qe-got.bin" >/dev/null 2>&1; then
-          if cmp -s "$artifact_dir/qe-object.bin" "$artifact_dir/qe-got.bin"; then
+        if "$mc_bin" cat "${alias}/rg-qe/object.bin" >"$work/got.bin" 2>"$work/get.err"; then
+          if cmp -s "$work/object.bin" "$work/got.bin"; then
             ok=$((ok + 1))
           else
             wrong=$((wrong + 1))
           fi
+        elif tool_error "$work/get.err"; then
+          echo "mc cat tool error for ${alias}; refusing to record a probe" >&2
+          cat "$work/get.err" >&2
+          exit 1
         fi
       done
       put_rejected=0
       put_attempted=3
       for i in 1 2 3; do
-        if ! "$mc_bin" cp "$artifact_dir/qe-object.bin" "$alias/rg-qe/put-${name}-${i}" >/dev/null 2>&1; then
+        if "$mc_bin" pipe "${alias}/rg-qe/put-${name}-${i}" <"$work/object.bin" >/dev/null 2>"$work/put.err"; then
+          :
+        elif tool_error "$work/put.err"; then
+          echo "mc pipe tool error for ${alias}; refusing to record a probe" >&2
+          cat "$work/put.err" >&2
+          exit 1
+        else
           put_rejected=$((put_rejected + 1))
         fi
       done
@@ -207,15 +288,15 @@ EOF
       if [[ "$ready" == "000" || "$ready" == "0" ]]; then
         ready="$(health_code "http://${ip}:9000/minio/health/ready")"
       fi
-      printf '{"name":"%s","cold_bucket":%s,"get_ok":%s,"get_attempted":%s,"wrong_sha256":%s,"put_rejected":%s,"put_attempted":%s,"health_live":%s,"health_ready":%s}' \
-        "$name" "$cold_flag" "$ok" "$attempted" "$wrong" "$put_rejected" "$put_attempted" "$live" "$ready"
+      printf '{"name":"%s","cold_bucket":%s,"get_ok":%s,"get_attempted":%s,"wrong_sha256":%s,"put_rejected":%s,"put_attempted":%s,"health_live":%s,"health_ready":%s}\n' \
+        "$name" "$cold_flag" "$ok" "$attempted" "$wrong" "$put_rejected" "$put_attempted" "$live" "$ready" >"$dest"
     }
-    warm_json="$(probe_pod "$warm" false)"
-    cold_json="$(probe_pod "$cold" true)"
+    probe_pod "$warm" false "$work/warm.json"
+    probe_pod "$cold" true "$work/cold.json"
     cat >"$artifact_dir/quorum-edge-cold-read.json" <<EOF
-{"survivors":[${warm_json},${cold_json}]}
+{"survivors":[$(cat "$work/warm.json"),$(cat "$work/cold.json")]}
 EOF
-    delete_chaos
+    cleanup_probe
     trap - EXIT
     ;;
 
@@ -224,16 +305,44 @@ EOF
     node="${RUSTFS_FAULT_TEST_DM_NODE:-}"
     observer_ns="${RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE:-}"
     observer_pod="${RUSTFS_FAULT_TEST_DM_OBSERVER_POD:-}"
-    if [[ -z "$name" || -z "$node" || -z "$observer_ns" || -z "$observer_pod" ]]; then
-      echo "dm-error requires RUSTFS_FAULT_TEST_DM_NAME, DM_NODE, DM_OBSERVER_NAMESPACE, and DM_OBSERVER_POD" >&2
+    mount_path="${RUSTFS_FAULT_TEST_DM_MOUNT_PATH:-}"
+    if [[ -z "$name" || -z "$node" || -z "$observer_ns" || -z "$observer_pod" || -z "$mount_path" ]]; then
+      echo "dm-error requires RUSTFS_FAULT_TEST_DM_NAME, DM_NODE, DM_MOUNT_PATH, DM_OBSERVER_NAMESPACE, and DM_OBSERVER_POD" >&2
+      exit 1
+    fi
+    if [[ ! "$mount_path" =~ ^/[A-Za-z0-9._/-]+$ || ! "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      echo "refusing dm name ${name} or mount path ${mount_path}" >&2
       exit 1
     fi
     if ! command -v kubectl >/dev/null 2>&1; then
       echo "kubectl is required for dm-error" >&2
       exit 1
     fi
+    bound=0
+    while IFS=$'\t' read -r phase claim path; do
+      if [[ "$phase" == "Bound" && "$claim" == "$namespace" && "$path" == "$mount_path" ]]; then
+        bound=$((bound + 1))
+      fi
+    done < <(kubectl get pv -o jsonpath='{range .items[*]}{.status.phase}{"\t"}{.spec.claimRef.namespace}{"\t"}{.spec.local.path}{"\n"}{end}')
+    if [[ "$bound" -lt 1 ]]; then
+      echo "no Bound PV with local path ${mount_path} is claimed by namespace ${namespace}" >&2
+      exit 1
+    fi
+    # The observer image is busybox and has no dmsetup. The host does.
+    host_exec() {
+      kubectl -n "$observer_ns" exec "$observer_pod" -- nsenter -t 1 -m -i -- "$@"
+    }
+    dmsetup_bin="/usr/sbin/dmsetup"
+    if ! host_exec test -x "$dmsetup_bin"; then
+      if host_exec test -x /sbin/dmsetup; then
+        dmsetup_bin="/sbin/dmsetup"
+      else
+        echo "host nsenter cannot find dmsetup; the observer image does not provide it" >&2
+        exit 1
+      fi
+    fi
     dm() {
-      kubectl -n "$observer_ns" exec "$observer_pod" -- dmsetup "$@"
+      host_exec "$dmsetup_bin" "$@"
     }
     original="$(dm table "$name")"
     if [[ -z "$original" ]]; then
@@ -241,41 +350,47 @@ EOF
       exit 1
     fi
     sectors="$(awk '{print $2; exit}' <<<"$original")"
+    marker="${mount_path}/rg-dm-error-marker"
+    if ! host_exec sh -c "printf 'dm-error-marker\n' > '${marker}'"; then
+      echo "failed to write ${marker} while the original table was active" >&2
+      exit 1
+    fi
     restore_table() {
-      printf '%s\n' "$original" | kubectl -n "$observer_ns" exec -i "$observer_pod" -- dmsetup load "$name" >/dev/null
+      printf '%s\n' "$original" | kubectl -n "$observer_ns" exec -i "$observer_pod" -- nsenter -t 1 -m -i -- "$dmsetup_bin" load "$name" >/dev/null
       dm resume "$name" >/dev/null 2>&1 || true
     }
-    trap restore_table EXIT
+    cleanup_dm() {
+      restore_table
+      host_exec rm -f "$marker" >/dev/null 2>&1 || true
+    }
+    trap cleanup_dm EXIT
     dm suspend "$name"
-    printf '0 %s error\n' "$sectors" | kubectl -n "$observer_ns" exec -i "$observer_pod" -- dmsetup load "$name"
+    printf '0 %s error\n' "$sectors" | kubectl -n "$observer_ns" exec -i "$observer_pod" -- nsenter -t 1 -m -i -- "$dmsetup_bin" load "$name"
     dm resume "$name"
     injected="$(dm table "$name")"
     table_has_error_target=false
     if [[ "$injected" == *"error"* ]]; then
       table_has_error_target=true
     fi
+    # Read the marker while the error target is still active. A successful
+    # read here means the fault did not land.
+    read_failed_during_fault=false
+    if ! host_exec dd if="$marker" of=/dev/null bs=4096 count=1 status=none >/dev/null 2>&1; then
+      read_failed_during_fault=true
+    fi
     restore_table
-    trap - EXIT
     restored="$(dm table "$name")"
+    got="$(host_exec cat "$marker" 2>/dev/null || true)"
     recovered=false
-    if [[ "$restored" == "$original" ]]; then
+    if [[ "$restored" == "$original" && "$got" == "dm-error-marker" ]]; then
       recovered=true
     fi
-    reads_survived=false
-    if dm status "$name" >/dev/null 2>&1; then
-      reads_survived=true
-    fi
-    mount_path="${RUSTFS_FAULT_TEST_DM_MOUNT_PATH:-}"
-    if [[ -n "$mount_path" ]]; then
-      reads_survived=false
-      if kubectl -n "$observer_ns" exec "$observer_pod" -- dd if="$mount_path" of=/dev/null bs=4096 count=1 status=none >/dev/null 2>&1; then
-        reads_survived=true
-      fi
-    fi
+    host_exec rm -f "$marker" >/dev/null 2>&1 || true
+    trap - EXIT
     cat >"$artifact_dir/dm-error.json" <<EOF
-{"table_has_error_target":${table_has_error_target},"reads_survived":${reads_survived},"recovered":${recovered}}
+{"table_has_error_target":${table_has_error_target},"read_failed_during_fault":${read_failed_during_fault},"recovered":${recovered}}
 EOF
-    [[ "$table_has_error_target" == true && "$recovered" == true ]]
+    [[ "$table_has_error_target" == true && "$read_failed_during_fault" == true && "$recovered" == true ]]
     ;;
 
   *)

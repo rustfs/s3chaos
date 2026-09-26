@@ -21,7 +21,7 @@ time-to-baseline are what `warp-powerloss-metrics.json` records.
 | C-NET-01 partition one | `network-partition-one` | Covered | CI amd64, Mac Mini arm64 |
 | C-NET-02 intermittent flaky | `network-flaky` | Partial. Bursty correlated loss (`loss` 1..=40, `correlation` >= 75). One NetworkChaos action cannot also corrupt, and this is not a timed on/off gate. | CI amd64, Mac Mini arm64 |
 | C-NET-03 delay | `network-delay` | Covered | CI amd64, Mac Mini arm64 |
-| C-NET-04 steady loss | `network-loss` | Covered | CI amd64, Mac Mini arm64 |
+| C-NET-04 steady loss | `network-loss` | Covered. Default loss is 80%. The release gate widens the source selector to `mode: all` and requires at least 30 attempts with an error rate of `RUSTFS_FAULT_TEST_NETWORK_LOSS_MIN_PERCENT` (default 10). A quiet sample fails. | CI amd64, Mac Mini arm64 |
 | C-NET-05 one-way blackhole | `network-asymmetric-partition` | Covered. `direction: to`, `mode: one`. The write-quorum proof still requires `direction: both` and `mode: fixed`. | CI amd64, Mac Mini arm64 |
 | C-NET-06 corrupt | `network-corrupt` | Covered | CI amd64, Mac Mini arm64 |
 | C-NET-07 duplicate | `network-duplicate` | Covered | CI amd64, Mac Mini arm64 |
@@ -32,10 +32,10 @@ time-to-baseline are what `warp-powerloss-metrics.json` records.
 | C-DISK-02 empty replace | `fresh-volume-replacement` | Planned qualification case | manual |
 | C-DISK-03 bitrot | `on-disk-bitrot` | Planned qualification case. Object shards, not metadata. | manual |
 | C-DISK-04 full | `disk-full` and release-gate `disk-full-fill` | IOChaos ENOSPC is CI amd64 only. `disk-full-fill` writes the volume until ENOSPC without toda. | CI amd64 for IOChaos. Mac Mini arm64 for `disk-full-fill`. |
-| C-DISK-05 remount read-only | `io-read-only` and release-gate `volume-remount-ro` | IOChaos returns `EROFS` on `WRITE`. `volume-remount-ro` remounts the mount. | CI amd64 for IOChaos. Mac Mini arm64 for the remount when the pod is privileged. |
+| C-DISK-05 remount read-only | `io-read-only` and release-gate `volume-remount-ro` | IOChaos returns `EROFS` on `WRITE`. `volume-remount-ro` remounts the mount. Operator pods that drop capabilities are `SKIP-no-privileged` (not a pass), checked before the shared-filesystem refusal. | CI amd64 for IOChaos. Mac Mini arm64 for a privileged remount; otherwise `SKIP-no-privileged`. |
 | C-DISK-06 slow disk | `io-latency` | Covered | CI amd64. Mac Mini arm64 is `SKIP-toda-arm64`. |
 | C-DISK-07 two volumes, one Pod, one erasure set | `io-eio-same-pod-two-volumes` | Planned. `assess_same_pod_two_volume_geometry` fails closed. The runner still binds one volume per server. | manual |
-| C-DISK-08 dm-flakey / dm-error / drop_writes | `dm-flakey`, `dm-drop-writes-after-ack-*`, release-gate `dm-error` | dm-flakey and drop-writes are executable with a pre-provisioned device. `dm-error` is scored from `dm-error.json` until it is a catalog scenario. | manual (`SKIP-no-dm` otherwise) |
+| C-DISK-08 dm-flakey / dm-error / drop_writes | `dm-flakey`, `dm-drop-writes-after-ack-*`, release-gate `dm-error` | dm-flakey and drop-writes are executable with a pre-provisioned device. The release gate runs one DM scenario per invocation (`RELEASE_GATE_DM_SCENARIO`, default `dm-flakey`) against `RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS`. `dm-error` reads a file while the error target is active. | manual (`SKIP-no-dm` otherwise, `SKIP-dm-not-selected` for the DM scenarios that this run does not execute) |
 | C-PROC-01 crash storm | `pod-restart-storm` | Covered. Schedule is preferred. If `status.time` is still empty after 30s, a controller loop SIGKILLs the same Pod every 15s. | CI amd64, Mac Mini arm64 |
 | C-PROC-02 OOM | `stress-memory` | Partial. Memory pressure, not a cgroup `OOMKilled` proof. | CI amd64, Mac Mini arm64 |
 | C-PROC-03 CPU | `stress-cpu` | Covered | CI amd64, Mac Mini arm64 |

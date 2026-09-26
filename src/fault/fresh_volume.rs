@@ -1125,7 +1125,14 @@ fn exhaustive_entries(root: &Path) -> Result<Vec<String>> {
 
 fn device_id(metadata: &fs::Metadata) -> String {
     let device = metadata.dev();
-    format!("{}:{}", libc::major(device), libc::minor(device))
+    #[cfg(target_os = "linux")]
+    {
+        format!("{}:{}", libc::major(device), libc::minor(device))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        format!("{device}")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
