@@ -30,8 +30,9 @@ not fail the gate:
 | `SKIP-no-cluster` | dry-run only; a live run treats this as a gate failure |
 
 These statuses do not pass: `SKIP-no-mc`, `SKIP-no-privileged`,
-`SKIP-unsafe-shared-fs`, `SKIP-no-dm-device`, `SKIP-dm-topology`,
-`SKIP-no-unzip`, `SKIP-no-otool`, `SKIP-aborted`, and any other code.
+`SKIP-unsafe-shared-fs`, `SKIP-no-dm-device`, `SKIP-dm-in-use`,
+`SKIP-dm-topology`, `SKIP-no-unzip`, `SKIP-no-otool`, `SKIP-aborted`,
+and any other code.
 A live run with fetch
 enabled fails when checksum, `--version`, or `ldd`/`otool` input is missing.
 `volume-remount-ro` checks capabilities before the shared-filesystem test
@@ -170,24 +171,37 @@ re-running it. They are the contract the Mac Mini campaign already produced.
 - `volume-remount-ro.json` — `remounted_ro`, `writes_rejected`, `reads_ok`,
   `restored`.
 - `dm-error.json` — `table_has_error_target`, `read_failed_during_fault`,
-  `recovered`. The producer uses `nsenter` to run host `dmsetup`. It writes
-  a 4096-byte marker, fsyncs it, switches the table with
-  `dmsetup suspend --nolockfs` then `load` and `resume` (each step is
+  `recovered`, or a `skip` string. The producer uses `nsenter` to run host
+  `dmsetup`. It writes a 4096-byte marker, fsyncs it, switches the table
+  with `dmsetup suspend --nolockfs` then `load` and `resume` (each step is
   checked; a resume error is not ignored), drops the host page cache, and
   reads the marker with `dd iflag=direct`. That read must fail. Restore is
-  the same suspend/load/resume back to the saved table. The trap stays
-  armed until `dmsetup table` matches the saved table and the direct read
-  succeeds. If the filesystem rejects that read, the producer unmounts,
-  runs `e2fsck -fy` for ext2/3/4 or `xfs_repair` for XFS, and mounts again.
-  The gate creates and deletes its own 1Gi PV `rg-dm-error-pv` and PVC
-  `rg-dm-error-claim` (`volumeName` pins the claim to that PV). It does not
-  bind one of the four 100Gi static PVs. Before `dm-error` and before the
-  selected `dm-run`, Released 100Gi PVs of
-  `RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS` have `claimRef` removed and their
-  local paths emptied, so a Retain volume can bind on the next run.
-  `SKIP-no-dm` when device-mapper is not selected. `SKIP-no-dm-device`
-  (not a pass) when the selected scenario lacks the dm-run env or
-  `RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS`. That class is a
+  the same suspend/load/resume back to the saved table. `dmsetup table`
+  for the error target is recognized by its target-type field, so a
+  trailing space does not hide it. The EXIT trap always writes
+  `dm-error.json`. If the lab path was an exact mount of the dm device at
+  start, the trap mounts it again before exit, including when restore
+  fails. Mount checks use `findmnt --mountpoint`, which does not walk up
+  to the parent filesystem. If the filesystem rejects the restored read,
+  the producer unmounts that exact mount, runs `e2fsck -fy` for ext2/3/4
+  or `xfs_repair` for XFS only when the device's open count is 0, and
+  mounts again. A failed check still remounts. The gate creates and
+  deletes its own 1Gi PV `rg-dm-error-pv` and PVC `rg-dm-error-claim`
+  (`volumeName` pins the claim to that PV). It does not bind one of the
+  four 100Gi static PVs. Before it writes the marker, the path must be an
+  exact mount of `/dev/mapper/$DM_NAME`. A Bound PV for that path, another
+  mount of the device, or an open count above 1 (the host mount is one)
+  is `SKIP-dm-in-use` and does not pass. The producer does not unmount
+  that volume. Before and after the selected `dm-run`, the gate deletes
+  the fault Tenant when that Tenant's pool or its PVCs use
+  `RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS`, deletes only the fault-namespace
+  PVCs that claim the class's 100Gi PVs, waits until those PVs leave
+  Bound, removes `claimRef` from Released PVs, and empties their local
+  paths except `lost+found`. It does not delete the namespace. A
+  `SKIP-dm-topology` decided before `dm-run` starts does not delete the
+  Tenant. `SKIP-no-dm` when device-mapper is not selected.
+  `SKIP-no-dm-device` (not a pass) when the selected scenario lacks the
+  dm-run env or `RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS`. That class is a
   `kubernetes.io/no-provisioner` class and is passed only to the one
   `dm-run`. The dynamic class used by every other scenario stays in
   `RUSTFS_FAULT_TEST_STORAGE_CLASS`. Other DM scenarios are

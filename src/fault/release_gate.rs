@@ -648,7 +648,7 @@ fn run_fault_scenario(request: &ReleaseGateRequest, scenario: &str) -> Outcome {
         command.env("RUSTFS_RELEASE_GATE_NETWORK_LOSS_SCOPE", scope);
         command.env("RUSTFS_FAULT_TEST_NETWORK_LOSS_MIN_PERCENT", min_percent);
     }
-    match command.status() {
+    let outcome = match command.status() {
         Ok(status) if status.success() => Outcome {
             status: CaseStatus::Pass,
             reason: format!("fault scenario {scenario} passed"),
@@ -657,37 +657,62 @@ fn run_fault_scenario(request: &ReleaseGateRequest, scenario: &str) -> Outcome {
             if device_mapper {
                 let text = fs::read_to_string(&dm_log).unwrap_or_default();
                 if let Some(reason) = dm_topology_skip_from_output(&text) {
-                    return Outcome {
+                    Outcome {
                         status: CaseStatus::Skip,
                         reason,
-                    };
+                    }
+                } else {
+                    Outcome {
+                        status: CaseStatus::Fail,
+                        reason: format!("fault scenario {scenario} exited {status}"),
+                    }
                 }
-            }
-            Outcome {
-                status: CaseStatus::Fail,
-                reason: format!("fault scenario {scenario} exited {status}"),
+            } else {
+                Outcome {
+                    status: CaseStatus::Fail,
+                    reason: format!("fault scenario {scenario} exited {status}"),
+                }
             }
         }
         Err(error) => Outcome {
             status: CaseStatus::Fail,
             reason: format!("failed to start fault scenario {scenario}: {error}"),
         },
+    };
+    if device_mapper {
+        // The preflight skip returns before this. A dm-run that actually
+        // started, including one reclassified as SKIP-dm-topology, has
+        // already created the DM tenant and must release those PVs.
+        return release_dm_after_run(outcome);
+    }
+    outcome
+}
+
+fn release_dm_after_run(outcome: Outcome) -> Outcome {
+    match reset_dm_static_pvs() {
+        Ok(()) => outcome,
+        Err(error) => Outcome {
+            status: CaseStatus::Fail,
+            reason: format!("{error} (after: {})", outcome.reason),
+        },
     }
 }
 
+/// Drop a fault Tenant that still holds the DM class, then clear Released
+/// 100Gi PVs. A topology skip that returns before `dm-run` does not call this.
 fn reset_dm_static_pvs() -> Result<(), String> {
     let output = Command::new("bash")
         .arg("scripts/release-gate-evidence.sh")
-        .arg("reset-dm-pvs")
+        .arg("release-dm-pvs")
         .output()
-        .map_err(|error| format!("failed to start reset-dm-pvs: {error}"))?;
+        .map_err(|error| format!("failed to start release-dm-pvs: {error}"))?;
     let _ = std::io::stderr().write_all(&output.stderr);
     let _ = std::io::stdout().write_all(&output.stdout);
     if output.status.success() {
         Ok(())
     } else {
         Err(format!(
-            "reset-dm-pvs exited {}: {}",
+            "release-dm-pvs exited {}: {}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         ))
@@ -2228,6 +2253,29 @@ fn classify_remount_file(text: &str) -> Outcome {
 }
 
 fn classify_dm_error_file(text: &str) -> Outcome {
+    let parsed = match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(parsed) => parsed,
+        Err(error) => return bad_json(error),
+    };
+    if let Some(skip) = parsed
+        .get("skip")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|skip| !skip.is_empty())
+    {
+        // Only the in-use refusal is a skip. Any other code in this file would
+        // let a planted passing skip (SKIP-planned, SKIP-dry-run) hide a fault.
+        if skip.starts_with("SKIP-dm-in-use") {
+            return Outcome {
+                status: CaseStatus::Skip,
+                reason: skip.to_string(),
+            };
+        }
+        return Outcome {
+            status: CaseStatus::Fail,
+            reason: format!("dm-error skip is not allowed: {skip}"),
+        };
+    }
     flag_file(
         text,
         &[
@@ -3292,6 +3340,7 @@ mod tests {
             "SKIP-unsafe-shared-fs: local-path",
             "SKIP-no-dm-device: env missing",
             "SKIP-dm-topology: four pods on one node",
+            "SKIP-dm-in-use: volume0 is Bound",
             "SKIP-no-unzip: no extractor",
         ] {
             assert!(!skip_is_passing(reason, &request), "{reason}");
@@ -3453,6 +3502,56 @@ mod tests {
         assert_eq!(classify_dm_error_file(ok).status, CaseStatus::Pass);
         let survived = r#"{"table_has_error_target":true,"reads_survived":true,"recovered":true}"#;
         assert_eq!(classify_dm_error_file(survived).status, CaseStatus::Fail);
+        let cached =
+            r#"{"table_has_error_target":false,"read_failed_during_fault":true,"recovered":true}"#;
+        assert_eq!(classify_dm_error_file(cached).status, CaseStatus::Fail);
+    }
+
+    #[test]
+    fn dm_error_table_field_ignores_trailing_space() {
+        let dir = tempfile::tempdir().expect("temp");
+        for (line, expect) in [
+            ("0 8 error ", "error"),
+            ("0 8 error", "error"),
+            ("0 16777216 linear 7:4 0", "linear"),
+        ] {
+            let output = Command::new("bash")
+                .arg("scripts/release-gate-evidence.sh")
+                .arg("dm-table-target")
+                .arg(line)
+                .env("RELEASE_GATE_ARTIFACT_DIR", dir.path())
+                .output()
+                .expect("dm-table-target");
+            assert!(
+                output.status.success(),
+                "status {:?} stderr {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                expect,
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dm_error_in_use_skip_does_not_pass() {
+        let text = r#"{"skip":"SKIP-dm-in-use: /data/rustfs/volume0 has another mount, an open holder, or a Bound PersistentVolume"}"#;
+        let outcome = classify_dm_error_file(text);
+        assert_eq!(outcome.status, CaseStatus::Skip);
+        assert!(
+            outcome.reason.starts_with("SKIP-dm-in-use"),
+            "{}",
+            outcome.reason
+        );
+        let request = request("full", false);
+        assert!(!skip_is_passing(&outcome.reason, &request));
+        let flags = r#"{"skip":"","table_has_error_target":true,"read_failed_during_fault":true,"recovered":true}"#;
+        assert_eq!(classify_dm_error_file(flags).status, CaseStatus::Pass);
+        let planted = r#"{"skip":"SKIP-planned: not a dm-error result"}"#;
+        assert_eq!(classify_dm_error_file(planted).status, CaseStatus::Fail);
     }
 
     #[test]

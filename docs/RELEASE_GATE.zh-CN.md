@@ -27,8 +27,9 @@
 | `SKIP-no-cluster` | 仅限 dry-run；实跑把这项当成门禁失败 |
 
 这些状态不算通过：`SKIP-no-mc`、`SKIP-no-privileged`、
-`SKIP-unsafe-shared-fs`、`SKIP-no-dm-device`、`SKIP-dm-topology`、
-`SKIP-no-unzip`、`SKIP-no-otool`、`SKIP-aborted`，以及任何其他代码。
+`SKIP-unsafe-shared-fs`、`SKIP-no-dm-device`、`SKIP-dm-in-use`、
+`SKIP-dm-topology`、`SKIP-no-unzip`、`SKIP-no-otool`、`SKIP-aborted`，
+以及任何其他代码。
 开启 fetch 的实跑在
 缺少校验和、`--version` 或 `ldd`/`otool` 输入时失败。
 `volume-remount-ro` 先检查能力，再检查是否共享文件系统。operator Pod
@@ -153,20 +154,31 @@ containerd 套接字。套接字仅 root 可写时，脚本使用 `sudo -n`，�
 - `volume-remount-ro.json` — `remounted_ro`、`writes_rejected`、`reads_ok`、
   `restored`。
 - `dm-error.json` — `table_has_error_target`、`read_failed_during_fault`、
-  `recovered`。生产者用 `nsenter` 跑宿主机 `dmsetup`。它写入并 fsync
-  一个 4096 字节的 marker，用 `dmsetup suspend --nolockfs`、`load`、
-  `resume` 切换表（每一步都检查退出码，resume 的错误不会被忽略），丢掉
-  宿主机页缓存，再用 `dd iflag=direct` 读取。这次读必须失败。恢复是同样的
-  suspend/load/resume，回到保存的原表。在 `dmsetup table` 与原表一致且
-  直接读成功之前，EXIT trap 保持武装。如果文件系统拒绝这次读，生产者会
-  卸载，对 ext2/3/4 执行 `e2fsck -fy`，对 XFS 执行 `xfs_repair`，然后重新
-  挂载。门禁自己创建并删除 1Gi 的 PV `rg-dm-error-pv` 和 PVC
+  `recovered`，或者一个 `skip` 字符串。生产者用 `nsenter` 跑宿主机
+  `dmsetup`。它写入并 fsync 一个 4096 字节的 marker，用
+  `dmsetup suspend --nolockfs`、`load`、`resume` 切换表（每一步都检查
+  退出码，resume 的错误不会被忽略），丢掉宿主机页缓存，再用
+  `dd iflag=direct` 读取。这次读必须失败。恢复是同样的
+  suspend/load/resume，回到保存的原表。error target 看的是 `dmsetup table`
+  的目标类型字段，行尾空格不会把它判成未注入。EXIT trap 总会写出
+  `dm-error.json`。如果开始时实验路径是该 dm 设备的精确挂载，trap 在退出
+  前会把它重新挂上，表恢复失败时也一样。挂载检查用
+  `findmnt --mountpoint`，不会向上走到父文件系统。如果文件系统拒绝恢复后
+  的读，生产者只卸载这个精确挂载点；设备 open count 为 0 时才对 ext2/3/4
+  执行 `e2fsck -fy`、对 XFS 执行 `xfs_repair`，然后重新挂载。检查失败也
+  会重新挂载。门禁自己创建并删除 1Gi 的 PV `rg-dm-error-pv` 和 PVC
   `rg-dm-error-claim`（`volumeName` 把 claim 钉在这个 PV 上）。它不会绑定
-  四个 100Gi 静态 PV 中的任何一个。在 `dm-error` 之前，以及在选中的
-  `dm-run` 之前，`RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS` 上处于 Released
-  的 100Gi PV 会被去掉 `claimRef`，本地路径会被清空，这样 Retain 卷下一次
-  还能绑定。未选择 device-mapper 时是 `SKIP-no-dm`。选中的场景缺少 dm-run
-  环境或 `RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS` 时是 `SKIP-no-dm-device`
+  四个 100Gi 静态 PV 中的任何一个。写 marker 之前，该路径必须是
+  `/dev/mapper/$DM_NAME` 的精确挂载。该路径的 PV 处于 Bound、设备还有别的
+  挂载，或者 open count 大于 1（宿主机挂载本身算 1）时，结果是
+  `SKIP-dm-in-use`，不算通过，也不会卸载这个卷。在选中的 `dm-run` 之前和
+  之后，如果故障 Tenant 的 pool 或其 PVC 使用
+  `RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS`，门禁会删除这个 Tenant，只删除
+  故障命名空间里认领该类 100Gi PV 的 PVC，等到这些 PV 不再 Bound，再去掉
+  Released PV 的 `claimRef`，并清空本地路径，但保留 `lost+found`。它不删除
+  命名空间。`dm-run` 启动前就判定的 `SKIP-dm-topology` 不会删除 Tenant。
+  未选择 device-mapper 时是 `SKIP-no-dm`。选中的场景缺少 dm-run 环境或
+  `RUSTFS_RELEASE_GATE_DM_STORAGE_CLASS` 时是 `SKIP-no-dm-device`
   （不算通过）。该存储类的 provisioner 必须是
   `kubernetes.io/no-provisioner`，并且只传给这一次 `dm-run`。其他场景
   继续使用 `RUSTFS_FAULT_TEST_STORAGE_CLASS` 里的动态存储类。其余 DM
