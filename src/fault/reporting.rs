@@ -39,6 +39,10 @@ pub(crate) struct FaultStatusSnapshot {
     pub(crate) dm_status: Option<DmStatusSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) lifecycle_status: Option<LifecycleStatusSnapshot>,
+    /// Pods a harness-driven controller is killing when the Chaos Mesh
+    /// Schedule snapshot has no `containerRecords` yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) controller_target_pods: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

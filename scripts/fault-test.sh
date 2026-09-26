@@ -985,7 +985,7 @@ capture_fault_logs() {
 
 health_status_json() {
   local baseline_ready_nodes="$1" baseline_tenants="$2" require_chaos="$3"
-  local current_ready_nodes=0 disk_pressure_nodes="" disk_pressure_count=0
+  local current_ready_nodes=0 disk_pressure_nodes="" disk_pressure_count=0 nodes_json=""
   local nodes_safe=false disk_pressure_safe=true tenants_safe=true chaos_safe=true chaos_required=false
   local safe=false reason="cluster_health_safe" message="cluster health is safe"
 
@@ -993,9 +993,13 @@ health_status_json() {
     chaos_required=true
   fi
 
-  current_ready_nodes="$(kubectl_cluster get nodes -o json 2>/dev/null \
-    | jq -r '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length' 2>/dev/null \
-    || echo 0)"
+  # `pipeline || echo` under pipefail prints both the jq value and the
+  # fallback when kubectl fails, which is not a number `[[` can compare.
+  nodes_json="$(kubectl_cluster get nodes -o json 2>/dev/null || true)"
+  current_ready_nodes="$(printf '%s' "$nodes_json" | jq -r '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length' 2>/dev/null || true)"
+  if [[ ! "$current_ready_nodes" =~ ^[0-9]+$ ]]; then
+    current_ready_nodes=0
+  fi
   if [[ "$current_ready_nodes" -ge "$baseline_ready_nodes" ]]; then
     nodes_safe=true
   else
@@ -1003,8 +1007,7 @@ health_status_json() {
     message="Ready node count is below baseline"
   fi
 
-  disk_pressure_nodes="$(kubectl_cluster get nodes -o json 2>/dev/null \
-    | jq -r '[.items[]
+  disk_pressure_nodes="$(printf '%s' "$nodes_json" | jq -r '[.items[]
       | select(any(.status.conditions[]; .type == "DiskPressure" and .status == "True"))
       | .metadata.name] | join(",")' 2>/dev/null || true)"
   if [[ -n "$disk_pressure_nodes" ]]; then

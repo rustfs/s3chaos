@@ -501,7 +501,11 @@ impl FaultLifecyclePort for PodKillStormFaultHandle {
     }
 
     fn snapshot(&self, stage: &str) -> Result<FaultStatusSnapshot> {
-        chaos_fault_snapshot(self.guard.as_ref(), stage)
+        let mut snapshot = chaos_fault_snapshot(self.guard.as_ref(), stage)?;
+        if self.controller_running() {
+            snapshot.controller_target_pods = Some(vec![self.victim.name.clone()]);
+        }
+        Ok(snapshot)
     }
 
     fn failure_artifacts(&self) -> Option<&dyn FaultFailureArtifactSource> {
@@ -766,6 +770,7 @@ impl FaultLifecyclePort for DmFlakeyFaultHandle {
                 _ => self.guard.snapshot(stage)?,
             }),
             lifecycle_status: None,
+            controller_target_pods: None,
         })
     }
 
@@ -782,6 +787,7 @@ fn chaos_fault_snapshot(guard: &ChaosGuard, stage: &str) -> Result<FaultStatusSn
         chaos_status: Some(serde_json::from_str(&guard.json()?)?),
         dm_status: None,
         lifecycle_status: None,
+        controller_target_pods: None,
     })
 }
 
@@ -1504,6 +1510,7 @@ mod tests {
                 chaos_status: None,
                 dm_status: None,
                 lifecycle_status: None,
+                controller_target_pods: None,
             })
         }
 

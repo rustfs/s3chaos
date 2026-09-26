@@ -106,6 +106,8 @@ release-gate:
 	@test -n "$(RUSTFS_VERSION)" || (echo "RUSTFS_VERSION is required, for example: make release-gate RUSTFS_VERSION=1.0.1-preview.11" >&2; exit 1)
 	bash -n $(CURDIR)/scripts/release-gate-upgrade.sh
 	bash -n $(CURDIR)/scripts/release-gate-host-disk.sh
+	bash -n $(CURDIR)/scripts/release-gate-evidence.sh
+	bash -n $(CURDIR)/scripts/release-gate-image.sh
 	+RUSTFS_VERSION="$(RUSTFS_VERSION)" \
 		RUSTFS_PREV_VERSION="$(RUSTFS_PREV_VERSION)" \
 		RUSTFS_IMAGE="$(RUSTFS_IMAGE)" \

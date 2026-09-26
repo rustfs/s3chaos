@@ -2942,6 +2942,7 @@ impl<'a> FreshVolumeDriver<'a> {
             chaos_status: Some(serde_json::from_str(&guard.json()?)?),
             dm_status: None,
             lifecycle_status: None,
+            controller_target_pods: None,
         })?;
         Ok(ControllerSnapshotEvidence {
             phase: phase.to_string(),

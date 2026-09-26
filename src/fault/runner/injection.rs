@@ -1649,6 +1649,12 @@ fn injected_source_pod_names(snapshots: &[FaultStatusSnapshot]) -> Result<BTreeS
             targets.extend(lifecycle.target_pods.iter().cloned());
             continue;
         }
+        // A harness controller kills a pinned pod while the Schedule object
+        // still has no containerRecords. Those pods are the fault targets.
+        if let Some(controller_pods) = &snapshot.controller_target_pods {
+            targets.extend(controller_pods.iter().cloned());
+            continue;
+        }
         let Some(status) = &snapshot.chaos_status else {
             continue;
         };
@@ -1953,6 +1959,7 @@ mod availability_endpoint_tests {
             })),
             dm_status: None,
             lifecycle_status: None,
+            controller_target_pods: None,
         }
     }
 
@@ -1981,6 +1988,7 @@ mod availability_endpoint_tests {
                 pods: Vec::new(),
                 observed_at_ms: 1,
             }),
+            controller_target_pods: None,
         };
         let targets = injected_source_pod_names(&[snapshot]).expect("targets");
         assert_eq!(
@@ -2021,7 +2029,25 @@ mod availability_endpoint_tests {
             chaos_status: None,
             dm_status: None,
             lifecycle_status: None,
+            controller_target_pods: None,
         };
         assert!(injected_source_pod_names(&[dm_only]).is_err());
+    }
+
+    #[test]
+    fn controller_targets_name_the_storm_victim_without_schedule_records() {
+        let snapshot = FaultStatusSnapshot {
+            stage: "active".to_string(),
+            resource_kind: Some("Schedule".to_string()),
+            resource_name: Some("pod-restart-storm".to_string()),
+            chaos_status: Some(serde_json::json!({
+                "status": {"experiment": {}}
+            })),
+            dm_status: None,
+            lifecycle_status: None,
+            controller_target_pods: Some(vec!["primary-3".to_string()]),
+        };
+        let targets = injected_source_pod_names(&[snapshot]).expect("targets");
+        assert_eq!(targets, BTreeSet::from(["primary-3".to_string()]));
     }
 }

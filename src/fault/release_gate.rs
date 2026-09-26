@@ -17,8 +17,9 @@
 //! One entry point plans smoke, standard, or full coverage, runs the cases
 //! this host can actually execute, and writes JSON, JUnit, and Markdown.
 //! Skips carry a stable reason code. A live run fails when a required case
-//! was skipped because the cluster was missing. Dry-run and known platform
-//! limits (arm64 toda, no device-mapper, physical power) do not.
+//! was skipped because the cluster was missing, evidence was not produced,
+//! or the run was misconfigured. Dry-run and known platform limits (arm64
+//! toda, no device-mapper, physical power, catalog-planned admin work) do not.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -92,6 +93,7 @@ pub struct ReleaseGateRequest {
     pub version: String,
     pub prev_version: Option<String>,
     pub image: Option<String>,
+    pub prev_image: Option<String>,
     pub git_sha: Option<String>,
     pub tier: ReleaseTier,
     pub dry_run: bool,
@@ -104,6 +106,7 @@ pub struct ReleaseGateRequest {
     pub toda_usable: bool,
     pub endpoint: Option<String>,
     pub regression_percent: f64,
+    pub evidence_reuse: bool,
 }
 
 impl ReleaseGateRequest {
@@ -134,10 +137,24 @@ impl ReleaseGateRequest {
         let toda_usable = bool_value(env.get("RUSTFS_RELEASE_GATE_TODA"), toda_default)?;
         let cluster = bool_value(env.get("RUSTFS_RELEASE_GATE_HAS_CLUSTER"), false)?;
         let device_mapper = bool_value(env.get("RUSTFS_RELEASE_GATE_HAS_DM"), false)?;
+        let evidence_reuse = bool_value(env.get("RELEASE_GATE_REUSE_EVIDENCE"), false)?;
         let output_dir = env
             .get("RELEASE_GATE_OUTPUT")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("target/release-gate").join(sanitize_token(&version)));
+            .unwrap_or_else(|| {
+                let run_id = env
+                    .get("RELEASE_GATE_RUN_ID")
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                PathBuf::from("target/release-gate")
+                    .join(sanitize_token(&version))
+                    .join(tier.as_str())
+                    .join(sanitize_token(&run_id))
+            });
         let artifact_dir = env
             .get("RUSTFS_ARTIFACT_DIR")
             .map(PathBuf::from)
@@ -159,6 +176,10 @@ impl ReleaseGateRequest {
                 .get("RUSTFS_IMAGE")
                 .cloned()
                 .filter(|value| !value.is_empty()),
+            prev_image: env
+                .get("RUSTFS_PREV_IMAGE")
+                .cloned()
+                .filter(|value| !value.is_empty()),
             git_sha: env
                 .get("RUSTFS_GIT_SHA")
                 .cloned()
@@ -178,6 +199,7 @@ impl ReleaseGateRequest {
                 .cloned()
                 .filter(|value| !value.is_empty()),
             regression_percent,
+            evidence_reuse,
         })
     }
 }
@@ -213,6 +235,8 @@ pub struct ReleaseGateReport {
     pub rustfs_image: Option<String>,
     pub git_sha: Option<String>,
     pub arch: String,
+    pub output_dir: String,
+    pub evidence_reuse: bool,
     pub artifact_checksums: Vec<ChecksumRow>,
     pub cases: Vec<CaseRow>,
 }
@@ -220,36 +244,101 @@ pub struct ReleaseGateReport {
 pub async fn run_release_gate(mut request: ReleaseGateRequest) -> Result<ReleaseGateReport> {
     fs::create_dir_all(&request.output_dir)?;
     fs::create_dir_all(&request.artifact_dir)?;
-    let mut fetch_error = None;
+    let mut prelude = Vec::new();
     if request.fetch {
-        match fetch_release_assets(&request.version, &request.artifact_dir).await {
+        match fetch_release_assets(&request.version, &request.artifact_dir, &request.arch).await {
             Ok(sha) => {
                 if request.git_sha.is_none() {
                     request.git_sha = sha;
                 }
             }
-            Err(error) => fetch_error = Some(format!("{error:#}")),
+            Err(error) => prelude.push(prelude_failure(
+                "release-fetch",
+                "Fetch the published release assets",
+                &request,
+                format!("{error:#}"),
+            )),
+        }
+        if let Some(prev) = request.prev_version.clone() {
+            let dest = request.artifact_dir.join("previous");
+            fs::create_dir_all(&dest)?;
+            if let Err(error) = fetch_release_assets(&prev, &dest, &request.arch).await {
+                prelude.push(prelude_failure(
+                    "release-fetch-previous",
+                    "Fetch the previous release assets",
+                    &request,
+                    format!("{error:#}"),
+                ));
+            }
+        }
+    }
+    if let Err(error) = capture_release_binary(&request.artifact_dir, &request.arch) {
+        prelude.push(prelude_failure(
+            "release-artifact-extract",
+            "Extract the host release binary and capture --version and ldd",
+            &request,
+            format!("{error:#}"),
+        ));
+    }
+    if request.prev_version.is_some()
+        && let Err(error) =
+            capture_release_binary(&request.artifact_dir.join("previous"), &request.arch)
+    {
+        prelude.push(prelude_failure(
+            "release-artifact-extract-previous",
+            "Extract the previous release binary",
+            &request,
+            format!("{error:#}"),
+        ));
+    }
+    if !request.dry_run && request.cluster {
+        if !request.evidence_reuse {
+            clear_produced_evidence(&request.artifact_dir);
+        }
+        if request.image.is_none() {
+            match build_release_image(&request.version, &request.artifact_dir.join("rustfs")) {
+                Ok(image) => request.image = Some(image),
+                Err(error) => prelude.push(prelude_failure(
+                    "release-image",
+                    "Build and load an image from the release zip",
+                    &request,
+                    format!("{error:#}"),
+                )),
+            }
+        }
+        if request.prev_version.is_some() && request.prev_image.is_none() {
+            let tag = request.prev_version.clone().unwrap_or_default();
+            match build_release_image(&tag, &request.artifact_dir.join("previous").join("rustfs")) {
+                Ok(image) => request.prev_image = Some(image),
+                Err(error) => prelude.push(prelude_failure(
+                    "release-image-previous",
+                    "Build and load an image from the previous release zip",
+                    &request,
+                    format!("{error:#}"),
+                )),
+            }
         }
     }
     let mut report = plan_release_gate(&request);
-    if let Some(error) = fetch_error {
-        report.cases.insert(
-            0,
-            CaseRow {
-                id: "release-fetch".to_string(),
-                title: "Fetch the published release assets".to_string(),
-                tier: request.tier.as_str().to_string(),
-                surfaces: "ci-amd64,mac-mini-arm64".to_string(),
-                status: CaseStatus::Fail.as_str().to_string(),
-                reason: error,
-                counts_as_failure: true,
-            },
-        );
+    for failure in prelude.into_iter().rev() {
+        report.cases.insert(0, failure);
     }
     execute_pending(&mut report, &request)?;
     finalize_verdict(&mut report);
     write_reports(&request.output_dir, &report)?;
     Ok(report)
+}
+
+fn prelude_failure(id: &str, title: &str, request: &ReleaseGateRequest, reason: String) -> CaseRow {
+    CaseRow {
+        id: id.to_string(),
+        title: title.to_string(),
+        tier: request.tier.as_str().to_string(),
+        surfaces: "ci-amd64,mac-mini-arm64".to_string(),
+        status: CaseStatus::Fail.as_str().to_string(),
+        reason,
+        counts_as_failure: true,
+    }
 }
 
 pub fn plan_release_gate(request: &ReleaseGateRequest) -> ReleaseGateReport {
@@ -292,13 +381,15 @@ pub fn plan_release_gate(request: &ReleaseGateRequest) -> ReleaseGateReport {
         rustfs_image: request.image.clone(),
         git_sha: request.git_sha.clone(),
         arch: request.arch.clone(),
+        output_dir: request.output_dir.display().to_string(),
+        evidence_reuse: request.evidence_reuse,
         artifact_checksums: Vec::new(),
         cases,
     }
 }
 
 fn execute_pending(report: &mut ReleaseGateReport, request: &ReleaseGateRequest) -> Result<()> {
-    let checksums = evaluate_checksums(&request.artifact_dir).unwrap_or_default();
+    let checksums = collect_checksums(&request.artifact_dir);
     report.artifact_checksums = checksums.clone();
     let version_output = read_optional(&request.artifact_dir.join("rustfs-version.txt"));
     if report.git_sha.is_none() {
@@ -392,12 +483,33 @@ fn execute_case(
             status: CaseStatus::Pass,
             reason: "each executable fault scenario checks committed object checksums before, during, and after the fault".to_string(),
         },
-        "quorum-edge-cold-read" => evidence_or_live(request, "quorum-edge-cold-read.json", classify_quorum_edge_file),
-        "large-object-get-integrity" => evidence_or_live(request, "large-object-get.json", classify_large_get_file),
+        "quorum-edge-cold-read" => evidence_or_produce(
+            request,
+            "quorum-edge-cold-read.json",
+            Some("quorum-edge"),
+            classify_quorum_edge_file,
+        ),
+        "quorum-edge-readiness" => evidence_or_produce(
+            request,
+            "quorum-edge-cold-read.json",
+            Some("quorum-edge"),
+            classify_quorum_readiness_file,
+        ),
+        "large-object-get-integrity" => evidence_or_produce(
+            request,
+            "large-object-get.json",
+            Some("large-object-get"),
+            classify_large_get_file,
+        ),
         "upgrade-stability" => evidence_or_upgrade(request, false),
         "upgrade-rollback" => evidence_or_upgrade(request, true),
         "warp-regression-vs-previous" => warp_outcome(request),
-        "s3-lifecycle-rule" => evidence_or_live(request, "lifecycle-rule.json", classify_lifecycle_file),
+        "s3-lifecycle-rule" => evidence_or_produce(
+            request,
+            "lifecycle-rule.json",
+            Some("lifecycle"),
+            classify_lifecycle_file,
+        ),
         "expand-pools" => evidence_or_skip(request, "expand-status.json", "SKIP-planned", classify_expand_file),
         "admin-decommission-complete" => {
             evidence_or_skip(request, "decommission-status.json", "SKIP-planned", classify_decommission_file)
@@ -409,7 +521,7 @@ fn execute_case(
         "volume-remount-ro" => {
             run_host_disk(request, "remount", "volume-remount-ro.json", classify_remount_file)
         }
-        "dm-error" => evidence_or_skip(request, "dm-error.json", "SKIP-no-dm", classify_dm_error_file),
+        "dm-error" => dm_error_outcome(request),
         "fresh-install" => fresh_install_outcome(request),
         "physical-power" => Outcome {
             status: CaseStatus::Skip,
@@ -438,9 +550,22 @@ fn run_fault_scenario(request: &ReleaseGateRequest, scenario: &str) -> Outcome {
             reason: reason.to_string(),
         };
     }
+    let device_mapper = scenarios::scenario_catalog()
+        .iter()
+        .find(|spec| spec.scenario == scenario)
+        .is_some_and(|spec| spec.backend == FaultBackend::DeviceMapper);
+    if device_mapper && !dm_env_ready(Some(scenario)) {
+        return Outcome {
+            status: CaseStatus::Skip,
+            reason: format!(
+                "SKIP-no-dm-device: {scenario} needs the device-mapper env contract (DM_NAME, DM_NODE, mount, observer, and host allowlists)"
+            ),
+        };
+    }
     let script = PathBuf::from("scripts/fault-test.sh");
     let mut command = Command::new("bash");
-    command.arg(&script).arg("run").arg(scenario);
+    let entry = if device_mapper { "dm-run" } else { "run" };
+    command.arg(&script).arg(entry).arg(scenario);
     if let Some(image) = &request.image {
         command.env("RUSTFS_FAULT_TEST_SERVER_IMAGE", image);
     }
@@ -472,10 +597,46 @@ fn run_protocol_suite(request: &ReleaseGateRequest, suite: &str) -> Outcome {
             reason: reason.to_string(),
         };
     }
+    let plan = match Command::new("bash")
+        .arg("scripts/protocol-test.sh")
+        .arg("suite-plan")
+        .arg(suite)
+        .output()
+    {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Outcome {
+                status: CaseStatus::Fail,
+                reason: format!("failed to plan protocol suite {suite}: {error}"),
+            };
+        }
+    };
+    if !plan.status.success() {
+        let detail = String::from_utf8_lossy(&plan.stderr);
+        return Outcome {
+            status: CaseStatus::Fail,
+            reason: format!(
+                "protocol suite plan {suite} exited {}: {}",
+                plan.status,
+                detail.trim()
+            ),
+        };
+    }
+    let fingerprint = match protocol_plan_fingerprint(&plan.stdout) {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => {
+            return Outcome {
+                status: CaseStatus::Fail,
+                reason: format!("protocol suite plan {suite} has no fingerprint: {error:#}"),
+            };
+        }
+    };
     match Command::new("bash")
         .arg("scripts/protocol-test.sh")
         .arg("suite-run")
         .arg(suite)
+        .env("RUSTFS_PROTOCOL_TEST_DEDICATED", "1")
+        .env("RUSTFS_PROTOCOL_TEST_TARGET_FINGERPRINT", fingerprint)
         .status()
     {
         Ok(status) if status.success() => Outcome {
@@ -493,32 +654,36 @@ fn run_protocol_suite(request: &ReleaseGateRequest, suite: &str) -> Outcome {
     }
 }
 
-fn fresh_install_outcome(request: &ReleaseGateRequest) -> Outcome {
-    if let Some(text) = read_optional(&request.artifact_dir.join("fresh-install.json")) {
-        return classify_fresh_install(&text);
+fn protocol_plan_fingerprint(stdout: &[u8]) -> Result<String> {
+    let text = String::from_utf8_lossy(stdout);
+    let json_start = text
+        .find('{')
+        .context("protocol suite plan did not print JSON")?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(text[json_start..].trim()).context("decode protocol suite plan")?;
+    let sha = parsed
+        .pointer("/target/fingerprint/sha256")
+        .and_then(serde_json::Value::as_str)
+        .context("target.fingerprint.sha256 is missing")?;
+    if sha.len() != 64 || !sha.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        bail!("target.fingerprint.sha256 is not a sha256");
     }
-    if request.dry_run || !request.cluster {
-        let reason = if request.dry_run {
-            "SKIP-dry-run"
-        } else {
-            "SKIP-no-cluster"
-        };
-        return Outcome {
-            status: CaseStatus::Skip,
-            reason: format!(
-                "{reason}: fresh install checks /health on the new image after the tenant becomes Ready"
-            ),
-        };
-    }
-    Outcome {
-        status: CaseStatus::Fail,
-        reason: "fresh-install.json is required on a live cluster; tenant preflight does not prove a new-image install".to_string(),
-    }
+    Ok(sha.to_ascii_lowercase())
 }
 
-fn evidence_or_live(
+fn fresh_install_outcome(request: &ReleaseGateRequest) -> Outcome {
+    evidence_or_produce(
+        request,
+        "fresh-install.json",
+        Some("fresh-install"),
+        classify_fresh_install,
+    )
+}
+
+fn evidence_or_produce(
     request: &ReleaseGateRequest,
     file_name: &str,
+    producer: Option<&str>,
     classify: fn(&str) -> Outcome,
 ) -> Outcome {
     if let Some(text) = read_optional(&request.artifact_dir.join(file_name)) {
@@ -538,11 +703,44 @@ fn evidence_or_live(
             ),
         };
     }
-    Outcome {
-        status: CaseStatus::Fail,
-        reason: format!(
-            "live cluster has no {file_name} evidence; the Mac Mini run must write that file under the artifact directory"
-        ),
+    let Some(mode) = producer else {
+        return Outcome {
+            status: CaseStatus::Fail,
+            reason: format!("live cluster has no {file_name} evidence and no producer"),
+        };
+    };
+    run_evidence_producer(request, mode, file_name, classify)
+}
+
+fn run_evidence_producer(
+    request: &ReleaseGateRequest,
+    mode: &str,
+    file_name: &str,
+    classify: fn(&str) -> Outcome,
+) -> Outcome {
+    let status = Command::new("bash")
+        .arg("scripts/release-gate-evidence.sh")
+        .arg(mode)
+        .env("RELEASE_GATE_ARTIFACT_DIR", &request.artifact_dir)
+        .env(
+            "RUSTFS_ENDPOINT",
+            request.endpoint.clone().unwrap_or_default(),
+        )
+        .env("RUSTFS_IMAGE", request.image.clone().unwrap_or_default())
+        .env("RUSTFS_VERSION", request.version.clone())
+        .status();
+    if let Some(text) = read_optional(&request.artifact_dir.join(file_name)) {
+        return classify(&text);
+    }
+    match status {
+        Ok(status) => Outcome {
+            status: CaseStatus::Fail,
+            reason: format!("evidence producer {mode} exited {status} without writing {file_name}"),
+        },
+        Err(error) => Outcome {
+            status: CaseStatus::Fail,
+            reason: format!("failed to start evidence producer {mode}: {error}"),
+        },
     }
 }
 
@@ -584,6 +782,14 @@ fn evidence_or_upgrade(request: &ReleaseGateRequest, rollback: bool) -> Outcome 
             request.prev_version.clone().unwrap_or_default(),
         )
         .env("RUSTFS_IMAGE", request.image.clone().unwrap_or_default())
+        .env(
+            "RUSTFS_PREV_IMAGE",
+            request.prev_image.clone().unwrap_or_default(),
+        )
+        .env(
+            "RUSTFS_ENDPOINT",
+            request.endpoint.clone().unwrap_or_default(),
+        )
         .env("RELEASE_GATE_ARTIFACT_DIR", &request.artifact_dir)
         .status()
     {
@@ -593,9 +799,9 @@ fn evidence_or_upgrade(request: &ReleaseGateRequest, rollback: bool) -> Outcome 
             }
             if status.code() == Some(2) {
                 Outcome {
-                    status: CaseStatus::Skip,
+                    status: CaseStatus::Fail,
                     reason: format!(
-                        "SKIP-no-mc: upgrade script exited 2; mc or the tenant was not available for {mode}"
+                        "upgrade script {mode} exited 2 because mc or kubectl is not installed"
                     ),
                 }
             } else if status.success() {
@@ -644,6 +850,14 @@ fn evidence_or_skip(
             reason: format!("SKIP-no-cluster: no {file_name} evidence"),
         };
     }
+    if absent_code == "SKIP-planned" {
+        return Outcome {
+            status: CaseStatus::Skip,
+            reason: format!(
+                "SKIP-planned: {file_name} is not produced while the catalog scenario is Planned"
+            ),
+        };
+    }
     Outcome {
         status: CaseStatus::Fail,
         reason: format!(
@@ -683,11 +897,18 @@ fn run_host_disk(
             if let Some(text) = read_optional(&request.artifact_dir.join(file_name)) {
                 return classify(&text);
             }
-            if status.code() == Some(2) {
+            if status.code() == Some(3) {
                 Outcome {
                     status: CaseStatus::Skip,
                     reason: format!(
-                        "SKIP-no-privileged: host disk {mode} could not remount or fill the volume without privileges"
+                        "SKIP-unsafe-shared-fs: host disk {mode} refused to touch a volume that shares the node filesystem"
+                    ),
+                }
+            } else if status.code() == Some(2) {
+                Outcome {
+                    status: CaseStatus::Skip,
+                    reason: format!(
+                        "SKIP-no-privileged: host disk {mode} cannot remount; operator pods drop capabilities, so this is not coverage"
                     ),
                 }
             } else if status.success() {
@@ -716,9 +937,7 @@ fn warp_outcome(request: &ReleaseGateRequest) -> Outcome {
     if request.prev_version.is_none() {
         return Outcome {
             status: CaseStatus::Skip,
-            reason:
-                "SKIP-no-baseline: warp regression needs RUSTFS_PREV_VERSION and warp-compare.json"
-                    .to_string(),
+            reason: "SKIP-no-prev-version: warp regression needs RUSTFS_PREV_VERSION".to_string(),
         };
     }
     if request.dry_run {
@@ -735,8 +954,65 @@ fn warp_outcome(request: &ReleaseGateRequest) -> Outcome {
     }
     Outcome {
         status: CaseStatus::Fail,
-        reason: "live cluster has no warp-compare.json; record current and baseline ops/s before this case can pass".to_string(),
+        reason: "live cluster has no warp-compare.json; the upgrade producer records warp ops when the warp binary is installed".to_string(),
     }
+}
+
+fn dm_error_outcome(request: &ReleaseGateRequest) -> Outcome {
+    if let Some(text) = read_optional(&request.artifact_dir.join("dm-error.json")) {
+        return classify_dm_error_file(&text);
+    }
+    if !request.device_mapper {
+        return Outcome {
+            status: CaseStatus::Skip,
+            reason: "SKIP-no-dm: no dm-error.json evidence".to_string(),
+        };
+    }
+    if request.dry_run {
+        return Outcome {
+            status: CaseStatus::Skip,
+            reason: "SKIP-dry-run: no dm-error.json evidence".to_string(),
+        };
+    }
+    if !request.cluster {
+        return Outcome {
+            status: CaseStatus::Skip,
+            reason: "SKIP-no-cluster: no dm-error.json evidence".to_string(),
+        };
+    }
+    if !dm_env_ready(None) {
+        return Outcome {
+            status: CaseStatus::Skip,
+            reason:
+                "SKIP-no-dm-device: HAS_DM is set but the device-mapper env contract is incomplete"
+                    .to_string(),
+        };
+    }
+    run_evidence_producer(request, "dm-error", "dm-error.json", classify_dm_error_file)
+}
+
+fn dm_env_ready(scenario: Option<&str>) -> bool {
+    const KEYS: &[&str] = &[
+        "RUSTFS_FAULT_TEST_DM_NAME",
+        "RUSTFS_FAULT_TEST_DM_NODE",
+        "RUSTFS_FAULT_TEST_DM_MOUNT_PATH",
+        "RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE",
+        "RUSTFS_FAULT_TEST_DM_OBSERVER_POD",
+        "RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE",
+        "RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST",
+        "RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST",
+        "RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST",
+    ];
+    if !KEYS.iter().copied().all(env_nonempty) {
+        return false;
+    }
+    scenario != Some("dm-flakey") || env_nonempty("RUSTFS_FAULT_TEST_DM_FAULT_TABLE")
+}
+
+fn env_nonempty(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
 }
 
 fn checksum_outcome(checksums: &[ChecksumRow]) -> Outcome {
@@ -850,7 +1126,12 @@ fn markdown(report: &ReleaseGateReport) -> String {
         "- Git SHA: {}\n",
         report.git_sha.as_deref().unwrap_or("-")
     ));
-    text.push_str(&format!("- Arch: {}\n\n", report.arch));
+    text.push_str(&format!("- Arch: {}\n", report.arch));
+    text.push_str(&format!("- Output: {}\n", report.output_dir));
+    text.push_str(&format!(
+        "- Evidence reuse: {}\n\n",
+        if report.evidence_reuse { "yes" } else { "no" }
+    ));
     if !report.artifact_checksums.is_empty() {
         text.push_str("## Artifact checksums\n\n");
         text.push_str("| File | SHA256 | Match |\n| --- | --- | --- |\n");
@@ -873,7 +1154,7 @@ fn markdown(report: &ReleaseGateReport) -> String {
             case.tier,
             case.surfaces,
             case.status,
-            case.reason.replace('|', "\\|")
+            markdown_cell(&case.reason)
         ));
     }
     text.push('\n');
@@ -1026,13 +1307,6 @@ fn case_specs() -> Vec<CaseSpec> {
             action: Action::Check,
         },
         CaseSpec {
-            id: "warp-regression-vs-previous",
-            title: "warp PUT/GET/mixed regression against the previous release",
-            tier: ReleaseTier::Standard,
-            surfaces: "ci-amd64,mac-mini-arm64",
-            action: Action::Check,
-        },
-        CaseSpec {
             id: "upgrade-stability",
             title: "Rolling upgrade from the previous release keeps data, metadata, and config",
             tier: ReleaseTier::Standard,
@@ -1047,8 +1321,22 @@ fn case_specs() -> Vec<CaseSpec> {
             action: Action::Check,
         },
         CaseSpec {
+            id: "warp-regression-vs-previous",
+            title: "warp PUT/GET/mixed regression against the previous release",
+            tier: ReleaseTier::Standard,
+            surfaces: "ci-amd64,mac-mini-arm64",
+            action: Action::Check,
+        },
+        CaseSpec {
             id: "quorum-edge-cold-read",
             title: "Quorum-edge reads on every survivor, including a cold bucket",
+            tier: ReleaseTier::Standard,
+            surfaces: "ci-amd64,mac-mini-arm64",
+            action: Action::Check,
+        },
+        CaseSpec {
+            id: "quorum-edge-readiness",
+            title: "Quorum-edge survivors stay on the Kubernetes Service",
             tier: ReleaseTier::Standard,
             surfaces: "ci-amd64,mac-mini-arm64",
             action: Action::Check,
@@ -1192,15 +1480,8 @@ fn skip_is_passing(reason: &str, request: &ReleaseGateRequest) -> bool {
         "SKIP-dry-run" => request.dry_run,
         "SKIP-toda-arm64" => !request.toda_usable,
         "SKIP-no-dm" => !request.device_mapper,
-        "DEFERRED-physical-power"
-        | "SKIP-planned"
-        | "SKIP-timechaos"
-        | "SKIP-no-artifact"
-        | "SKIP-no-baseline"
-        | "SKIP-no-otool"
-        | "SKIP-no-mc"
-        | "SKIP-no-unzip"
-        | "SKIP-no-privileged" => true,
+        "DEFERRED-physical-power" | "SKIP-planned" | "SKIP-timechaos" => true,
+        "SKIP-no-artifact" => request.dry_run && !request.fetch,
         "SKIP-no-prev-version" => request.prev_version.is_none(),
         "SKIP-no-cluster" => request.dry_run,
         _ => false,
@@ -1234,6 +1515,13 @@ fn ldd_foreign(output: &str) -> Vec<String> {
         if line.starts_with("linux-vdso") || line.contains("ld-linux") {
             continue;
         }
+        if let Some((library, rest)) = line.split_once("=>") {
+            let rest = rest.trim();
+            if rest.starts_with("not found") {
+                foreign.push(format!("missing: {}", library.trim()));
+                continue;
+            }
+        }
         let path = line
             .split("=>")
             .nth(1)
@@ -1242,9 +1530,6 @@ fn ldd_foreign(output: &str) -> Vec<String> {
             .split_whitespace()
             .next()
             .unwrap_or(line);
-        if path == "not" {
-            continue;
-        }
         if is_linux_system_path(path) {
             continue;
         }
@@ -1292,17 +1577,18 @@ pub fn version_matches_tag(output: &str, tag: &str) -> bool {
 }
 
 pub fn parse_git_sha(output: &str) -> Option<String> {
-    output
-        .split_whitespace()
-        .find(|token| {
+    for line in output.lines() {
+        if !line.to_ascii_lowercase().contains("git commit") {
+            continue;
+        }
+        for token in line.split_whitespace() {
             let token = token.trim_matches(|ch: char| !ch.is_ascii_hexdigit());
-            (7..=40).contains(&token.len()) && token.chars().all(|ch| ch.is_ascii_hexdigit())
-        })
-        .map(|token| {
-            token
-                .trim_matches(|ch: char| !ch.is_ascii_hexdigit())
-                .to_string()
-        })
+            if (7..=40).contains(&token.len()) && token.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                return Some(token.to_string());
+            }
+        }
+    }
+    None
 }
 
 pub fn parse_sha256sums(text: &str) -> Result<Vec<(String, String)>> {
@@ -1395,6 +1681,35 @@ fn classify_quorum_edge_file(text: &str) -> Outcome {
                 survivor.name, survivor.health_live
             ));
         }
+    }
+    if reasons.is_empty() {
+        Outcome {
+            status: CaseStatus::Pass,
+            reason: "every survivor served its bucket and rejected writes".to_string(),
+        }
+    } else {
+        Outcome {
+            status: CaseStatus::Fail,
+            reason: reasons.join("; "),
+        }
+    }
+}
+
+fn classify_quorum_readiness_file(text: &str) -> Outcome {
+    let survivors = match serde_json::from_str::<QuorumFile>(text) {
+        Ok(parsed) => parsed.survivors,
+        Err(error) => {
+            return Outcome {
+                status: CaseStatus::Fail,
+                reason: format!("quorum-edge evidence is not the expected JSON: {error}"),
+            };
+        }
+    };
+    let mut reasons = Vec::new();
+    if survivors.len() < 2 {
+        reasons.push("expected a probe of each survivor, got fewer than 2".to_string());
+    }
+    for survivor in &survivors {
         if survivor.health_ready != 200 {
             reasons.push(format!(
                 "{} /health/ready={} (readiness removed the survivor from a Kubernetes Service)",
@@ -1405,8 +1720,7 @@ fn classify_quorum_edge_file(text: &str) -> Outcome {
     if reasons.is_empty() {
         Outcome {
             status: CaseStatus::Pass,
-            reason: "every survivor served the cold bucket, rejected writes, and stayed ready"
-                .to_string(),
+            reason: "every survivor /health/ready stayed 200".to_string(),
         }
     } else {
         Outcome {
@@ -1495,6 +1809,12 @@ fn classify_upgrade_file(text: &str, rollback: bool) -> Outcome {
             parsed.client_errors, parsed.error_threshold
         ));
     }
+    if parsed.rollout_probe_failures > parsed.rollout_error_threshold {
+        reasons.push(format!(
+            "rollout probe failures {} exceeded {}",
+            parsed.rollout_probe_failures, parsed.rollout_error_threshold
+        ));
+    }
     if rollback && parsed.rolled_back != Some(true) {
         reasons.push("rollback did not complete".to_string());
     }
@@ -1520,6 +1840,10 @@ struct UpgradeEvidence {
     policy_match: bool,
     client_errors: u64,
     error_threshold: u64,
+    #[serde(default)]
+    rollout_probe_failures: u64,
+    #[serde(default)]
+    rollout_error_threshold: u64,
     rolled_back: Option<bool>,
 }
 
@@ -1649,7 +1973,10 @@ fn classify_fresh_install(text: &str) -> Outcome {
     };
     let health = parsed.get("health").and_then(|value| value.as_u64());
     let live = parsed.get("live").and_then(|value| value.as_u64());
-    if health == Some(200) && live == Some(200) {
+    let image_matches = parsed
+        .get("image_matches")
+        .and_then(|value| value.as_bool());
+    if health == Some(200) && live == Some(200) && image_matches != Some(false) {
         Outcome {
             status: CaseStatus::Pass,
             reason: "fresh install /health and /health/live returned 200".to_string(),
@@ -1657,7 +1984,9 @@ fn classify_fresh_install(text: &str) -> Outcome {
     } else {
         Outcome {
             status: CaseStatus::Fail,
-            reason: format!("fresh install health={health:?} live={live:?}"),
+            reason: format!(
+                "fresh install health={health:?} live={live:?} image_matches={image_matches:?}"
+            ),
         }
     }
 }
@@ -1692,6 +2021,18 @@ fn bad_json(error: serde_json::Error) -> Outcome {
     }
 }
 
+fn collect_checksums(artifact_dir: &Path) -> Vec<ChecksumRow> {
+    let mut rows = evaluate_checksums(artifact_dir).unwrap_or_default();
+    let previous = artifact_dir.join("previous");
+    if let Ok(mut more) = evaluate_checksums(&previous) {
+        for row in &mut more {
+            row.name = format!("previous/{}", row.name);
+        }
+        rows.extend(more);
+    }
+    rows
+}
+
 fn evaluate_checksums(artifact_dir: &Path) -> Result<Vec<ChecksumRow>> {
     let sums_path = artifact_dir.join("SHA256SUMS");
     if !sums_path.is_file() {
@@ -1723,13 +2064,17 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-async fn fetch_release_assets(tag: &str, dest: &Path) -> Result<Option<String>> {
+async fn fetch_release_assets(tag: &str, dest: &Path, arch: &str) -> Result<Option<String>> {
     let client = reqwest::Client::builder()
         .user_agent("s3chaos-release-gate")
-        .timeout(Duration::from_secs(180))
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(900))
         .build()
         .context("build release-gate HTTP client")?;
-    let api = format!("https://api.github.com/repos/rustfs/rustfs/releases/tags/{tag}");
+    let api = format!(
+        "https://api.github.com/repos/rustfs/rustfs/releases/tags/{}",
+        encode_tag(tag)
+    );
     let response = client
         .get(&api)
         .send()
@@ -1747,13 +2092,15 @@ async fn fetch_release_assets(tag: &str, dest: &Path) -> Result<Option<String>> 
         .get("assets")
         .and_then(|value| value.as_array())
         .context("release JSON has no assets")?;
-    let sha = release
+    let commitish = release
         .get("target_commitish")
         .and_then(|value| value.as_str())
-        .filter(|value| {
-            (7..=40).contains(&value.len()) && value.chars().all(|ch| ch.is_ascii_hexdigit())
-        })
+        .filter(|value| is_git_sha(value))
         .map(str::to_string);
+    let sha = match commitish {
+        Some(sha) => Some(sha),
+        None => resolve_tag_sha(&client, tag).await?,
+    };
     for asset in assets {
         let name = asset
             .get("name")
@@ -1763,28 +2110,121 @@ async fn fetch_release_assets(tag: &str, dest: &Path) -> Result<Option<String>> 
             .get("browser_download_url")
             .and_then(|value| value.as_str())
             .unwrap_or("");
-        if !want_asset(name) || !trusted_release_url(url) {
+        if !want_asset(name, arch) || !trusted_release_url(url) {
             continue;
         }
         let path = release_asset_path(dest, name)?;
-        let bytes = client
-            .get(url)
-            .send()
+        download_to(&client, url, &path)
             .await
-            .with_context(|| format!("GET {url}"))?
-            .error_for_status()
-            .with_context(|| format!("download {name}"))?
-            .bytes()
-            .await
-            .with_context(|| format!("read {name}"))?;
-        fs::write(&path, &bytes).with_context(|| format!("write {}", path.display()))?;
+            .with_context(|| format!("download {name}"))?;
     }
     Ok(sha)
 }
 
-fn want_asset(name: &str) -> bool {
+fn want_asset(name: &str, arch: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower == "sha256sums" || lower.contains("linux") || lower.ends_with(".txt")
+    if lower == "sha256sums" {
+        return true;
+    }
+    if !lower.ends_with(".zip") {
+        return false;
+    }
+    let tokens: &[&str] = match arch {
+        "aarch64" | "arm64" => &["aarch64", "arm64"],
+        "x86_64" | "amd64" => &["x86_64", "amd64"],
+        _ => &[],
+    };
+    if !tokens.iter().any(|token| lower.contains(token)) {
+        return false;
+    }
+    if lower.contains("linux") {
+        return true;
+    }
+    std::env::consts::OS == "macos" && (lower.contains("macos") || lower.contains("darwin"))
+}
+
+async fn download_to(client: &reqwest::Client, url: &str, path: &Path) -> Result<()> {
+    use futures::StreamExt;
+    use std::io::Write;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()
+        .with_context(|| format!("GET {url}"))?;
+    let mut file = fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| format!("read {url}"))?;
+        file.write_all(&chunk)
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    file.flush()
+        .with_context(|| format!("flush {}", path.display()))?;
+    Ok(())
+}
+
+fn is_git_sha(value: &str) -> bool {
+    (7..=40).contains(&value.len()) && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn encode_tag(tag: &str) -> String {
+    tag.replace('+', "%2B")
+}
+
+async fn resolve_tag_sha(client: &reqwest::Client, tag: &str) -> Result<Option<String>> {
+    let url = format!(
+        "https://api.github.com/repos/rustfs/rustfs/git/ref/tags/{}",
+        encode_tag(tag)
+    );
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    let value = response
+        .json::<serde_json::Value>()
+        .await
+        .context("decode git ref")?;
+    let kind = value
+        .pointer("/object/type")
+        .and_then(serde_json::Value::as_str);
+    let sha = value
+        .pointer("/object/sha")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    if kind == Some("commit") {
+        return Ok(sha.filter(|value| is_git_sha(value)));
+    }
+    if kind != Some("tag") {
+        return Ok(None);
+    }
+    let object_url = value
+        .pointer("/object/url")
+        .and_then(serde_json::Value::as_str)
+        .context("annotated tag has no object url")?;
+    if !object_url.starts_with("https://api.github.com/repos/rustfs/rustfs/") {
+        bail!("refusing git object url {object_url}");
+    }
+    let tag_object = client
+        .get(object_url)
+        .send()
+        .await
+        .with_context(|| format!("GET {object_url}"))?
+        .error_for_status()
+        .with_context(|| format!("GET {object_url}"))?
+        .json::<serde_json::Value>()
+        .await
+        .context("decode annotated tag")?;
+    Ok(tag_object
+        .pointer("/object/sha")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| is_git_sha(value))
+        .map(str::to_string))
 }
 
 fn trusted_release_url(url: &str) -> bool {
@@ -1812,6 +2252,149 @@ fn release_asset_path(dest: &Path, name: &str) -> Result<PathBuf> {
         bail!("release asset name {name:?} escapes the artifact directory");
     }
     Ok(path)
+}
+
+const PRODUCED_EVIDENCE: &[&str] = &[
+    "upgrade-stability.json",
+    "upgrade-rollback.json",
+    "disk-full-fill.json",
+    "volume-remount-ro.json",
+    "fresh-install.json",
+    "large-object-get.json",
+    "lifecycle-rule.json",
+    "warp-compare.json",
+    "warp-baseline-ops.txt",
+    "warp-current-ops.txt",
+    "probe.fail",
+    "quorum-edge-cold-read.json",
+    "dm-error.json",
+    "expand-status.json",
+    "decommission-status.json",
+    "rebalance-status.json",
+];
+
+fn clear_produced_evidence(dir: &Path) {
+    for name in PRODUCED_EVIDENCE {
+        let _ = fs::remove_file(dir.join(name));
+    }
+}
+
+fn host_release_zip(dir: &Path, arch: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension().and_then(|ext| ext.to_str()) == Some("zip")
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| want_asset(name, arch))
+        })
+}
+
+fn capture_release_binary(dir: &Path, arch: &str) -> Result<()> {
+    let Some(zip_path) = host_release_zip(dir, arch) else {
+        return Ok(());
+    };
+    let binary = dir.join("rustfs");
+    extract_rustfs_binary(&zip_path, &binary)?;
+    capture_binary_identity(&binary, dir)
+}
+
+fn extract_rustfs_binary(zip_path: &Path, dest: &Path) -> Result<()> {
+    let file = fs::File::open(zip_path).with_context(|| format!("open {}", zip_path.display()))?;
+    let mut archive =
+        zip::ZipArchive::new(file).with_context(|| format!("read zip {}", zip_path.display()))?;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .with_context(|| format!("zip entry {index}"))?;
+        let name = entry.name().to_string();
+        if name.contains("..") || name.contains('\\') {
+            continue;
+        }
+        let file_name = Path::new(&name)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        if file_name != "rustfs" {
+            continue;
+        }
+        let mut output =
+            fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
+        std::io::copy(&mut entry, &mut output)
+            .with_context(|| format!("extract rustfs from {}", zip_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dest, fs::Permissions::from_mode(0o755))?;
+        }
+        return Ok(());
+    }
+    bail!("{} has no rustfs binary", zip_path.display());
+}
+
+fn capture_binary_identity(binary: &Path, dir: &Path) -> Result<()> {
+    let version = Command::new(binary)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("run {} --version", binary.display()))?;
+    let mut text = String::from_utf8_lossy(&version.stdout).into_owned();
+    if !version.stderr.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&String::from_utf8_lossy(&version.stderr));
+    }
+    fs::write(dir.join("rustfs-version.txt"), text)
+        .with_context(|| format!("write {}", dir.join("rustfs-version.txt").display()))?;
+    if let Ok(ldd) = Command::new("ldd").arg(binary).output() {
+        let mut text = String::from_utf8_lossy(&ldd.stdout).into_owned();
+        if !ldd.stderr.is_empty() {
+            text.push_str(&String::from_utf8_lossy(&ldd.stderr));
+        }
+        fs::write(dir.join("rustfs-ldd.txt"), text)?;
+    }
+    if let Ok(otool) = Command::new("otool").arg("-L").arg(binary).output()
+        && otool.status.success()
+    {
+        fs::write(
+            dir.join("rustfs-otool.txt"),
+            String::from_utf8_lossy(&otool.stdout).as_ref(),
+        )?;
+    }
+    Ok(())
+}
+
+fn build_release_image(tag: &str, binary: &Path) -> Result<String> {
+    if !binary.is_file() {
+        bail!("no extracted rustfs binary at {}", binary.display());
+    }
+    let output = Command::new("bash")
+        .arg("scripts/release-gate-image.sh")
+        .arg(tag)
+        .arg(binary)
+        .output()
+        .context("start release-gate-image.sh")?;
+    if !output.status.success() {
+        bail!(
+            "release-gate-image.sh exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let image = String::from_utf8_lossy(&output.stdout);
+    let image = image.trim();
+    if image.is_empty() || image.lines().count() != 1 {
+        bail!("release-gate-image.sh did not print one image reference");
+    }
+    if !image.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '+' | '-' | ':' | '/' | '@')
+    }) {
+        bail!("refusing image reference {image:?}");
+    }
+    Ok(image.to_string())
 }
 
 fn read_optional(path: &Path) -> Option<String> {
@@ -1871,6 +2454,13 @@ fn sanitize_token(value: &str) -> String {
             }
         })
         .collect()
+}
+
+fn markdown_cell(value: &str) -> String {
+    value
+        .replace('|', "\\|")
+        .replace('\r', "")
+        .replace('\n', "<br>")
 }
 
 fn xml_escape(value: &str) -> String {
@@ -2016,7 +2606,12 @@ mod tests {
         let outcome = fresh_install_outcome(&request);
         assert_eq!(outcome.status, CaseStatus::Fail);
         let expand = execute_case("expand-pools", &request, &[], None);
-        assert_eq!(expand.status, CaseStatus::Fail, "{}", expand.reason);
+        assert_eq!(expand.status, CaseStatus::Skip, "{}", expand.reason);
+        assert!(
+            expand.reason.starts_with("SKIP-planned"),
+            "{}",
+            expand.reason
+        );
         request.device_mapper = false;
         let dm = execute_case("dm-error", &request, &[], None);
         assert!(dm.reason.starts_with("SKIP-no-dm"), "{}", dm.reason);
@@ -2033,10 +2628,33 @@ mod tests {
         let outcome = classify_quorum_edge_file(text);
         assert_eq!(outcome.status, CaseStatus::Fail);
         assert!(outcome.reason.contains("n4"), "{}", outcome.reason);
+        assert!(outcome.reason.contains("0/600"), "{}", outcome.reason);
         assert!(
-            outcome.reason.contains("/health/ready"),
+            !outcome.reason.contains("/health/ready"),
             "{}",
             outcome.reason
+        );
+        let readiness = classify_quorum_readiness_file(text);
+        assert_eq!(readiness.status, CaseStatus::Fail);
+        assert!(
+            readiness.reason.contains("/health/ready"),
+            "{}",
+            readiness.reason
+        );
+    }
+
+    #[test]
+    fn readiness_failure_does_not_hide_a_served_cold_read() {
+        let text = r#"{
+            "survivors": [
+                {"name":"n3","cold_bucket":false,"get_ok":30,"get_attempted":30,"wrong_sha256":0,"put_rejected":4,"put_attempted":4,"health_live":200,"health_ready":503},
+                {"name":"n4","cold_bucket":true,"get_ok":30,"get_attempted":30,"wrong_sha256":0,"put_rejected":4,"put_attempted":4,"health_live":200,"health_ready":503}
+            ]
+        }"#;
+        assert_eq!(classify_quorum_edge_file(text).status, CaseStatus::Pass);
+        assert_eq!(
+            classify_quorum_readiness_file(text).status,
+            CaseStatus::Fail
         );
     }
 
@@ -2049,6 +2667,10 @@ mod tests {
             ]
         }"#;
         assert_eq!(classify_quorum_edge_file(text).status, CaseStatus::Pass);
+        assert_eq!(
+            classify_quorum_readiness_file(text).status,
+            CaseStatus::Pass
+        );
     }
 
     #[test]
@@ -2069,6 +2691,11 @@ mod tests {
         );
         let ldd = "\tlinux-vdso.so.1 (0x0000)\n\tlibc.so.6 => /lib/aarch64-linux-gnu/libc.so.6 (0x0000)\n\t/lib/ld-linux-aarch64.so.1 (0x0000)\n";
         assert!(non_system_dynamic_deps(DynTool::Ldd, ldd).is_empty());
+        let missing = "\tliblzma.so.5 => not found\n\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x0000)\n";
+        assert_eq!(
+            non_system_dynamic_deps(DynTool::Ldd, missing),
+            vec!["missing: liblzma.so.5".to_string()]
+        );
     }
 
     #[test]
@@ -2088,6 +2715,12 @@ mod tests {
             parse_git_sha("git commit 0913686b12845eefc69a2f4ed4ee6a8161e25742"),
             Some("0913686b12845eefc69a2f4ed4ee6a8161e25742".to_string())
         );
+        let version = "rustfs 1.0.1-preview.11\nrustc 1.98.1 (48a229cea 2026-09-01)\ngit commit : 0913686b12845eefc69a2f4ed4ee6a8161e25742\n";
+        assert_eq!(
+            parse_git_sha(version),
+            Some("0913686b12845eefc69a2f4ed4ee6a8161e25742".to_string())
+        );
+        assert_eq!(parse_git_sha("rustc 1.98.1 (48a229cea 2026-09-01)"), None);
     }
 
     #[test]
@@ -2114,6 +2747,16 @@ mod tests {
         assert_eq!(classify_upgrade_file(bad, true).status, CaseStatus::Fail);
         let ok = r#"{"objects_match":true,"multipart_match":true,"versions_match":true,"lifecycle_match":true,"policy_match":true,"client_errors":1,"error_threshold":5,"rolled_back":true}"#;
         assert_eq!(classify_upgrade_file(ok, true).status, CaseStatus::Pass);
+        let noisy_rollout = r#"{"objects_match":true,"multipart_match":true,"versions_match":true,"lifecycle_match":true,"policy_match":true,"client_errors":0,"error_threshold":0,"rollout_probe_failures":11,"rollout_error_threshold":10,"rolled_back":true}"#;
+        assert_eq!(
+            classify_upgrade_file(noisy_rollout, true).status,
+            CaseStatus::Fail
+        );
+        let tolerated = r#"{"objects_match":true,"multipart_match":true,"versions_match":true,"lifecycle_match":true,"policy_match":true,"client_errors":0,"error_threshold":0,"rollout_probe_failures":2,"rollout_error_threshold":10,"rolled_back":true}"#;
+        assert_eq!(
+            classify_upgrade_file(tolerated, true).status,
+            CaseStatus::Pass
+        );
     }
 
     #[test]
@@ -2132,5 +2775,84 @@ mod tests {
                 .iter()
                 .any(|case| case.id == "release-artifact-dynamic-deps")
         );
+    }
+
+    #[test]
+    fn missing_artifact_capture_fails_a_fetching_run() {
+        let mut request = request("smoke", false);
+        request.fetch = true;
+        let outcome = version_outcome(None, &request.version);
+        assert_eq!(outcome.status, CaseStatus::Skip);
+        assert!(outcome.reason.starts_with("SKIP-no-artifact"));
+        assert!(!skip_is_passing(&outcome.reason, &request));
+        request.dry_run = true;
+        request.fetch = false;
+        assert!(skip_is_passing(&outcome.reason, &request));
+    }
+
+    #[test]
+    fn misconfiguration_skips_do_not_pass() {
+        let request = request("standard", false);
+        for reason in [
+            "SKIP-no-mc: missing mc",
+            "SKIP-no-privileged: cannot remount",
+            "SKIP-unsafe-shared-fs: local-path",
+            "SKIP-no-dm-device: env missing",
+            "SKIP-no-unzip: no extractor",
+        ] {
+            assert!(!skip_is_passing(reason, &request), "{reason}");
+        }
+    }
+
+    #[test]
+    fn dm_without_a_device_is_not_a_passing_skip() {
+        let mut request = request("full", false);
+        request.cluster = true;
+        request.device_mapper = true;
+        let outcome = execute_case("fault:dm-flakey", &request, &[], None);
+        assert!(
+            outcome.reason.starts_with("SKIP-no-dm-device"),
+            "{}",
+            outcome.reason
+        );
+        assert!(!skip_is_passing(&outcome.reason, &request));
+    }
+
+    #[test]
+    fn markdown_cells_keep_newlines_inside_the_table() {
+        let report = ReleaseGateReport {
+            schema_version: SCHEMA_VERSION,
+            verdict: "fail".to_string(),
+            mode: "live".to_string(),
+            tier: "smoke".to_string(),
+            rustfs_version: "1.0.1-preview.11".to_string(),
+            rustfs_prev_version: None,
+            rustfs_image: None,
+            git_sha: None,
+            arch: "aarch64".to_string(),
+            output_dir: "target/release-gate/run".to_string(),
+            evidence_reuse: false,
+            artifact_checksums: Vec::new(),
+            cases: vec![CaseRow {
+                id: "release-artifact-version".to_string(),
+                title: "version".to_string(),
+                tier: "smoke".to_string(),
+                surfaces: "ci-amd64".to_string(),
+                status: "FAIL".to_string(),
+                reason: "line one\nline | two".to_string(),
+                counts_as_failure: true,
+            }],
+        };
+        let text = markdown(&report);
+        assert!(text.contains("line one<br>line \\| two"), "{text}");
+        assert!(!text.lines().any(|line| line.contains("line | two")));
+    }
+
+    #[test]
+    fn host_arch_fetch_ignores_other_linux_zips() {
+        assert!(want_asset("SHA256SUMS", "aarch64"));
+        assert!(want_asset("rustfs-linux-aarch64.zip", "aarch64"));
+        assert!(!want_asset("rustfs-linux-x86_64.zip", "aarch64"));
+        assert!(!want_asset("notes.txt", "aarch64"));
     }
 }
