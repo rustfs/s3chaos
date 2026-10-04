@@ -582,6 +582,7 @@ impl FaultSuitePlanAttempt {
             ack_trigger: acknowledged_mutation_kind(&input.scenario.name).map(|mutation| {
                 FaultRunAckTriggerSpec {
                     mutation,
+                    calibration_mode: input.config.ack_calibration,
                     operation_timeout_ms: input.config.ack_operation_timeout.as_millis() as u64,
                     max_ack_to_fault_ms: input.config.max_ack_to_fault.as_millis() as u64,
                 }
@@ -635,7 +636,17 @@ impl FaultSuitePlanAttempt {
             artifacts: FaultSuitePlanArtifacts {
                 attempt_dir: input.attempt_dir.display().to_string(),
                 case_dir: case_dir.display().to_string(),
-                required: FaultRunArtifactSpec::required_names_for_scenario(&input.scenario.name),
+                required: {
+                    let mut required =
+                        FaultRunArtifactSpec::required_names_for_scenario(&input.scenario.name);
+                    if input.config.ack_calibration.is_some() {
+                        required.push(
+                            crate::fault::acknowledged_mutation::ACK_CALIBRATION_ARTIFACT
+                                .to_string(),
+                        );
+                    }
+                    required
+                },
                 event_stream: "run-events.jsonl".to_string(),
             },
             budget: input.budget,
@@ -754,6 +765,13 @@ fn scenario_config(
     // authorization for Planned scenarios into their ordinary attempts.
     config.qualify_planned_admin = false;
     config.qualify_planned_storage = false;
+    config.ack_calibration = scenario.ack_calibration;
+    if let Some(mode) = config.ack_calibration {
+        crate::fault::acknowledged_mutation::require_calibration_image(
+            &config.cluster.rustfs_image,
+        )?;
+        mode.configure(&mut config.cluster.rustfs_env)?;
+    }
     config.scenario = scenario.name.clone();
     config.scenario_parameters = scenario.params.clone();
     config.storage_recovery_case = scenario.storage_recovery_case;
@@ -827,6 +845,20 @@ fn validate_suite_runtime_contract(
     suite: &ResolvedFaultSuite,
     base_config: &FaultTestConfig,
 ) -> Result<()> {
+    if suite
+        .scenarios
+        .iter()
+        .any(|scenario| scenario.ack_calibration.is_some())
+    {
+        ensure!(
+            suite.budgets.stop_on_first_failure && suite.budgets.continue_on_severities.is_empty(),
+            "ACK calibration requires stopOnFirstFailure and no continueOnSeverities"
+        );
+        ensure!(
+            base_config.workload_seed.is_some(),
+            "ACK calibration requires an explicit RUSTFS_FAULT_TEST_SEED shared by both controls"
+        );
+    }
     if let Some(stable_window_seconds) = suite.budgets.recovery_stable_window_seconds {
         ensure!(
             Duration::from_secs(stable_window_seconds) < base_config.cluster.timeout,
@@ -914,6 +946,85 @@ mod tests {
     };
     use serde_json::json;
     use std::{path::Path, path::PathBuf, time::Duration};
+
+    #[cfg(unix)]
+    #[test]
+    fn ack_calibration_examples_reach_supervised_dm_preflight_with_both_modes() {
+        for mode in ["strict", "relaxed"] {
+            let suite_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("fault/examples/ack-put-{mode}.yaml"));
+            let suite = crate::fault::suite::resolve_fault_suite_yaml(&suite_path).unwrap();
+            let mut base = FaultTestConfig::for_test("lab", "dedicated-dm");
+            base.workload_seed = Some(424242);
+            base.cluster.rustfs_image = format!("rustfs/rustfs@sha256:{}", "a".repeat(64));
+            let expansion =
+                build_fault_suite_plan_expansion(suite, base, "suite-test".into()).unwrap();
+            let config = &expansion.attempts[0].config;
+            for name in [
+                "RUSTFS_DURABILITY_MODE",
+                "RUSTFS_NEW_BUCKET_DURABILITY_MODE",
+            ] {
+                assert!(
+                    config
+                        .cluster
+                        .rustfs_env
+                        .contains(&(name.into(), mode.into()))
+                );
+            }
+            let directory = tempfile::tempdir().unwrap();
+            let plan = directory.path().join("plan.json");
+            std::fs::write(&plan, expansion.plan.to_json().unwrap()).unwrap();
+            let output = std::process::Command::new("bash").args([
+                "-c", r#"
+source "$1"
+plan="$2"
+ensure_inherited_kubeconfig() { :; }
+s3chaos_cli() { cat "$plan"; }
+preflight() { printf 'preflight:%s\n' "$1"; }
+require_command() { :; }
+preflight_suite "$3" "$4" ack-calibration
+! (preflight_suite "$3" "$4" general) 2>/dev/null
+! (preflight_suite "$3" "$4" chaos) 2>/dev/null
+for filter in '.attempts += .attempts' '.attempts[0].ackTrigger = null' '.attempts[0].expectedBackend = "chaos-mesh-io-chaos"' '.attempts[0].ackTrigger.calibration_mode = "unknown"' '.budgets.continueOnSeverities = ["fail_correctness"]' '.budgets.stopOnFirstFailure = false'; do
+  jq "$filter" "$plan" >"$4"
+  ! (require_ack_calibration_suite_plan "$4") 2>/dev/null || exit 21
+done
+"#, "ack-preflight-test", concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh"),
+            ]).arg(&plan).arg(&suite_path).arg(directory.path().join("preview.json"))
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                "preflight:dm-drop-writes-after-ack-put\n"
+            );
+        }
+    }
+
+    #[test]
+    fn ack_calibration_requires_explicit_seed_and_stop_on_failure() {
+        let suite = crate::fault::suite::resolve_fault_suite_yaml(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("fault/examples/ack-put-strict.yaml"),
+        )
+        .unwrap();
+        let mut base = FaultTestConfig::for_test("lab", "dedicated-dm");
+        base.workload_seed = None;
+        assert!(validate_suite_runtime_contract(&suite, &base).is_err());
+        base.workload_seed = Some(424242);
+        validate_suite_runtime_contract(&suite, &base).unwrap();
+        let mut altered = suite.clone();
+        altered.budgets.stop_on_first_failure = false;
+        assert!(validate_suite_runtime_contract(&altered, &base).is_err());
+        let mut altered = suite;
+        altered
+            .budgets
+            .continue_on_severities
+            .push(crate::fault::reporting::FailureSeverity::FailCorrectness);
+        assert!(validate_suite_runtime_contract(&altered, &base).is_err());
+    }
 
     #[test]
     fn storage_examples_plan_without_inheriting_qualification_authorization() {

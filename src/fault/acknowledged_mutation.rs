@@ -51,6 +51,171 @@ impl AcknowledgedMutationKind {
     }
 }
 
+/// A calibration request selects both process and newly created bucket policy.
+/// It does not itself establish that the detector has been live-qualified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AckCalibrationMode {
+    Strict,
+    Relaxed,
+}
+
+impl AckCalibrationMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Relaxed => "relaxed",
+        }
+    }
+
+    pub(crate) fn configure(self, server_env: &mut Vec<(String, String)>) -> Result<()> {
+        for name in [
+            "RUSTFS_DURABILITY_MODE",
+            "RUSTFS_NEW_BUCKET_DURABILITY_MODE",
+        ] {
+            let configured = server_env
+                .iter()
+                .filter(|(key, _)| key == name)
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                configured.len() <= 1 && configured.iter().all(|(_, value)| value == self.as_str()),
+                "ACK calibration requires exactly one unambiguous {name}={} value",
+                self.as_str()
+            );
+            if configured.is_empty() {
+                server_env.push((name.to_string(), self.as_str().to_string()));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn require_calibration_image(image: &str) -> Result<()> {
+    anyhow::ensure!(
+        image
+            .rsplit_once("@sha256:")
+            .is_some_and(|(name, digest)| !name.is_empty()
+                && !name.chars().any(char::is_whitespace)
+                && digest.len() == 64
+                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())),
+        "ACK calibration requires a RustFS image pinned as name@sha256:<64 hex digits>"
+    );
+    Ok(())
+}
+
+pub(crate) const ACK_CALIBRATION_ARTIFACT: &str = "ack-calibration-mode.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AckCalibrationPod {
+    pub name: String,
+    pub uid: String,
+    pub image: String,
+    pub image_id: String,
+    pub container_id: String,
+    pub process_mode: String,
+    pub new_bucket_mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AckBucketMode {
+    pub bucket: String,
+    pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AckCalibrationEvidence {
+    pub scenario: String,
+    pub run_id: String,
+    pub mode: AckCalibrationMode,
+    pub observed_at_ms: u64,
+    pub bucket_response: AckBucketMode,
+    pub pods: Vec<AckCalibrationPod>,
+}
+
+pub(crate) fn calibration_pod(
+    pod: &serde_json::Value,
+    mode: AckCalibrationMode,
+    image: &str,
+) -> Result<AckCalibrationPod> {
+    use anyhow::{Context, ensure};
+    let containers = pod
+        .pointer("/spec/containers")
+        .and_then(serde_json::Value::as_array)
+        .context("calibration Pod lacks containers")?;
+    let container = containers
+        .iter()
+        .find(|container| container["name"] == "rustfs")
+        .context("calibration Pod lacks rustfs container")?;
+    let env = container["env"]
+        .as_array()
+        .context("calibration Pod lacks explicit modes")?;
+    let observed_mode = |name: &str| -> Result<String> {
+        let values = env
+            .iter()
+            .filter(|entry| entry["name"] == name)
+            .collect::<Vec<_>>();
+        ensure!(
+            values.len() == 1 && values[0]["valueFrom"].is_null(),
+            "calibration Pod requires one literal {name}"
+        );
+        let value = values[0]["value"]
+            .as_str()
+            .context("calibration mode is not literal")?;
+        ensure!(
+            value == mode.as_str(),
+            "calibration Pod {name} differs from requested mode"
+        );
+        Ok(value.to_string())
+    };
+    ensure!(
+        container["image"] == image,
+        "calibration Pod image differs from run image"
+    );
+    let statuses = pod
+        .pointer("/status/containerStatuses")
+        .and_then(serde_json::Value::as_array)
+        .context("calibration Pod lacks container statuses")?;
+    let status = statuses
+        .iter()
+        .find(|status| status["name"] == "rustfs")
+        .context("calibration Pod lacks rustfs image identity")?;
+    ensure!(status["ready"] == true, "calibration Pod is not Ready");
+    let image_id = status["imageID"]
+        .as_str()
+        .context("calibration Pod lacks imageID")?;
+    let digest = image_id
+        .rsplit_once("sha256:")
+        .map(|(_, digest)| digest)
+        .context("calibration requires a resolved sha256 image identity")?;
+    ensure!(
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "calibration image digest is invalid"
+    );
+    Ok(AckCalibrationPod {
+        name: pod
+            .pointer("/metadata/name")
+            .and_then(serde_json::Value::as_str)
+            .context("calibration Pod lacks name")?
+            .to_string(),
+        uid: pod
+            .pointer("/metadata/uid")
+            .and_then(serde_json::Value::as_str)
+            .context("calibration Pod lacks UID")?
+            .to_string(),
+        image: image.to_string(),
+        image_id: image_id.to_string(),
+        container_id: status["containerID"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .context("calibration Pod lacks containerID")?
+            .to_string(),
+        process_mode: observed_mode("RUSTFS_DURABILITY_MODE")?,
+        new_bucket_mode: observed_mode("RUSTFS_NEW_BUCKET_DURABILITY_MODE")?,
+    })
+}
+
 /// A single mutation with no concurrent traffic, post-ACK verification read,
 /// or retry. Avoiding activity after the ACK prevents the calibration workload
 /// from accidentally flushing the metadata whose loss it is meant to detect.
@@ -551,6 +716,63 @@ mod tests {
         history::{OperationKind, OperationOutcome, OperationRecord, Recorder},
         workload::{ObjectSpec, S3WorkloadClient, StagedMultipartCleanupGuard},
     };
+
+    #[test]
+    fn calibration_image_requires_an_immutable_digest_reference() {
+        assert!(
+            super::require_calibration_image(&format!("rustfs/rustfs@sha256:{}", "a".repeat(64)))
+                .is_ok()
+        );
+        for image in [
+            "rustfs/rustfs:latest",
+            "rustfs/rustfs@sha256:abc",
+            "@sha256:",
+            "rustfs/rustfs@sha512:abc",
+        ] {
+            assert!(super::require_calibration_image(image).is_err());
+        }
+    }
+
+    #[test]
+    fn calibration_sets_both_modes_and_rejects_conflicting_or_duplicate_policy() {
+        use super::AckCalibrationMode;
+        for mode in [AckCalibrationMode::Strict, AckCalibrationMode::Relaxed] {
+            let mut env = Vec::new();
+            mode.configure(&mut env).unwrap();
+            assert_eq!(env.len(), 2);
+            assert!(env.iter().all(|(_, value)| value == mode.as_str()));
+            mode.configure(&mut env).unwrap();
+            assert_eq!(env.len(), 2);
+            env.push(env[0].clone());
+            assert!(mode.configure(&mut env).is_err());
+        }
+        let mut env = vec![("RUSTFS_NEW_BUCKET_DURABILITY_MODE".into(), "relaxed".into())];
+        assert!(AckCalibrationMode::Strict.configure(&mut env).is_err());
+    }
+
+    #[test]
+    fn calibration_observation_rejects_bucket_policy_and_image_drift() {
+        use super::{AckCalibrationMode, calibration_pod};
+        let pod = serde_json::json!({
+            "metadata": {"name": "server-0", "uid": "pod-uid"},
+            "spec": {"containers": [{"name": "rustfs", "image": "candidate", "env": [
+                {"name": "RUSTFS_DURABILITY_MODE", "value": "strict"},
+                {"name": "RUSTFS_NEW_BUCKET_DURABILITY_MODE", "value": "strict"}
+            ]}]},
+            "status": {"containerStatuses": [{"name": "rustfs", "ready": true,
+                "containerID": "containerd://process-1",
+                "imageID": format!("containerd://sha256:{}", "a".repeat(64))}]}
+        });
+        assert!(calibration_pod(&pod, AckCalibrationMode::Strict, "candidate").is_ok());
+        let mut mismatch = pod.clone();
+        mismatch["spec"]["containers"][0]["env"][1]["value"] = serde_json::json!("relaxed");
+        assert!(calibration_pod(&mismatch, AckCalibrationMode::Strict, "candidate").is_err());
+        assert!(calibration_pod(&pod, AckCalibrationMode::Strict, "other-image").is_err());
+        let mut missing_digest = pod;
+        missing_digest["status"]["containerStatuses"][0]["imageID"] =
+            serde_json::json!("candidate:latest");
+        assert!(calibration_pod(&missing_digest, AckCalibrationMode::Strict, "candidate").is_err());
+    }
 
     enum MockReply {
         Ok,

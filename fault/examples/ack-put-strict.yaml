@@ -1,0 +1,15 @@
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: ack-put-strict-control
+budgets:
+  stopOnFirstFailure: true
+  continueOnSeverities: []
+artifacts:
+  required: strict
+scenarios:
+  - name: dm-drop-writes-after-ack-put
+    ackCalibration: strict
+    workload:
+      objects: 64
+      concurrency: 4

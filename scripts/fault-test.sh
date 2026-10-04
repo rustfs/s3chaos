@@ -67,6 +67,8 @@ Commands:
   chaos-plan <file>     Plan an ordinary Chaos Mesh-only suite.
   chaos-run <file>      Run an ordinary Chaos Mesh-only suite.
   dm-run <scenario>     Run exactly one supervised device-mapper scenario.
+  ack-calibration-run <file>
+                        Run one supervised strict or relaxed ACK control.
   list                  List catalog scenarios.
   qualify-list          List closed reliability qualification cases.
   qualify <case>        Run one supervised reliability qualification.
@@ -1716,6 +1718,8 @@ preflight_suite() {
   s3chaos_cli fault-suite-plan "$suite" >"$plan_path"
   if [[ "$mode" == "chaos" ]]; then
     require_ordinary_chaos_suite_plan "$plan_path"
+  elif [[ "$mode" == "ack-calibration" ]]; then
+    require_ack_calibration_suite_plan "$plan_path"
   else
     require_non_static_suite_plan "$plan_path"
   fi
@@ -1764,6 +1768,25 @@ require_ordinary_chaos_suite_plan() {
   local plan_path="$1"
   is_ordinary_chaos_suite_plan "$plan_path" \
     || die "fault-chaos-run accepts only ordinary Chaos Mesh scenarios; use fault-suite-run for Warp or fault-dm-run for one device-mapper scenario"
+}
+
+require_ack_calibration_suite_plan() {
+  local plan_path="$1"
+  jq -e '
+    .requiresStaticStorage == true
+    and .requiresChaosMesh == false
+    and .budgets.stopOnFirstFailure == true
+    and .budgets.continueOnSeverities == []
+    and (.attempts | length == 1)
+    and (.attempts[0] |
+      .expectedBackend == "device-mapper"
+      and .requiresStaticStorage == true
+      and .requiresChaosMesh == false
+      and .execution.type == "injection"
+      and .workload.mode == "ack-triggered-quiet-mutation"
+      and (.ackTrigger.calibration_mode == "strict" or .ackTrigger.calibration_mode == "relaxed"))
+  ' "$plan_path" >/dev/null \
+    || die "ACK calibration requires exactly one strict or relaxed device-mapper ACK attempt with stop-on-failure supervision"
 }
 
 plan_chaos_suite() {
@@ -1999,6 +2022,11 @@ case "${1:-help}" in
     [[ -n "${2:-}" ]] || die "device-mapper scenario is required"
     [[ -z "${3:-}" ]] || die "dm-run accepts exactly one scenario"
     run_dm "$2"
+    ;;
+  ack-calibration-run)
+    [[ -n "${2:-}" ]] || die "ACK calibration suite yaml path is required"
+    [[ -z "${3:-}" ]] || die "ack-calibration-run accepts exactly one suite yaml path"
+    run_suite "$2" ack-calibration
     ;;
   list)
     [[ -z "${2:-}" ]] || die "list does not accept arguments; run a named scenario with: fault-test.sh run <scenario>"

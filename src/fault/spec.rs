@@ -135,6 +135,8 @@ pub struct FaultRunScenarioSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FaultRunAckTriggerSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_mode: Option<crate::fault::acknowledged_mutation::AckCalibrationMode>,
     pub mutation: crate::fault::acknowledged_mutation::AcknowledgedMutationKind,
     pub operation_timeout_ms: u64,
     pub max_ack_to_fault_ms: u64,
@@ -275,6 +277,11 @@ impl FaultRunSpec {
                 .required
                 .push(DM_FILESYSTEM_CHECK_ARTIFACT.to_string());
         }
+        if config.ack_calibration.is_some() {
+            artifacts
+                .required
+                .push(crate::fault::acknowledged_mutation::ACK_CALIBRATION_ARTIFACT.to_string());
+        }
         Self {
             api_version: FAULT_RUN_API_VERSION.to_string(),
             kind: FAULT_RUN_KIND.to_string(),
@@ -306,6 +313,7 @@ impl FaultRunSpec {
                 ack_trigger: acknowledged_mutation_kind(&scenario.name).map(|mutation| {
                     FaultRunAckTriggerSpec {
                         mutation,
+                        calibration_mode: config.ack_calibration,
                         operation_timeout_ms: config.ack_operation_timeout.as_millis() as u64,
                         max_ack_to_fault_ms: config.max_ack_to_fault.as_millis() as u64,
                     }

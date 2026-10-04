@@ -12,7 +12,7 @@ FAULT_SCRIPT := $(CURDIR)/scripts/fault-test.sh
 PROTOCOL_SCRIPT := $(CURDIR)/scripts/protocol-test.sh
 PROTOCOL_COMPAT_SCRIPT := $(CURDIR)/scripts/protocol-compatibility.sh
 
-.PHONY: check fmt fmt-check clippy test fault-check fault-list fault-qualify-list fault-qualify fault-qualify-analyze fault-preflight fault-run fault-chaos-plan fault-chaos-run fault-dm-run fault-suite-template fault-suite-validate fault-suite-plan fault-suite-run fault-console-json fault-console-serve fault-dashboard-install fault-dashboard-port-forward fault-cleanup protocol-check protocol-list protocol-compatibility-mint protocol-mint-cleanup protocol-suite-template protocol-suite-validate protocol-suite-plan protocol-suite-run protocol-cleanup protocol-validate-artifacts protocol-validate-mint-artifacts protocol-validate-mint-session
+.PHONY: check fmt fmt-check clippy test fault-check fault-list fault-qualify-list fault-qualify fault-qualify-analyze fault-preflight fault-run fault-chaos-plan fault-chaos-run fault-dm-run fault-ack-calibration-run fault-suite-template fault-suite-validate fault-suite-plan fault-suite-run fault-console-json fault-console-serve fault-dashboard-install fault-dashboard-port-forward fault-cleanup protocol-check protocol-list protocol-compatibility-mint protocol-mint-cleanup protocol-suite-template protocol-suite-validate protocol-suite-plan protocol-suite-run protocol-cleanup protocol-validate-artifacts protocol-validate-mint-artifacts protocol-validate-mint-session
 
 check: fmt-check clippy test
 
@@ -63,6 +63,10 @@ fault-chaos-run:
 fault-dm-run:
 	@test -n "$(SCENARIO)" || (echo "SCENARIO is required, for example: make fault-dm-run SCENARIO=dm-flakey" >&2; exit 1)
 	+bash $(FAULT_SCRIPT) dm-run "$(SCENARIO)"
+
+fault-ack-calibration-run:
+	@test -n "$(SUITE)" || (echo "SUITE is required, for example: make fault-ack-calibration-run SUITE=fault/examples/ack-put-strict.yaml" >&2; exit 1)
+	+bash $(FAULT_SCRIPT) ack-calibration-run "$(SUITE)"
 
 fault-suite-template:
 	+@bash $(FAULT_SCRIPT) suite-template

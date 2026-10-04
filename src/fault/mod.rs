@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod ack_calibration;
 pub mod acknowledged_mutation;
 pub mod admin_decommission;
 pub mod admin_rebalance;
