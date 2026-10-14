@@ -35,12 +35,15 @@ use tokio::time::sleep as async_sleep;
 pub(crate) fn prepare_fault_fixture(
     config: &ClusterTestConfig,
     isolation: FaultIsolation,
+    volumes_per_server: u32,
 ) -> Result<()> {
     match isolation {
-        FaultIsolation::ReusableTenant => fixture::apply_tenant_resources(config)?,
+        FaultIsolation::ReusableTenant => {
+            fixture::apply_tenant_resources(config, volumes_per_server)?
+        }
         FaultIsolation::FreshTenant | FaultIsolation::DedicatedLinuxBlockDevice => {
             fixture::reset_tenant_resources(config)?;
-            fixture::apply_tenant_resources(config)?;
+            fixture::apply_tenant_resources(config, volumes_per_server)?;
         }
     }
     Ok(())

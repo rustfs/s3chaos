@@ -18,9 +18,10 @@
 //! signs requests, retains receipts, and tracks an operation identity owned by
 //! this attempt. Verdict policy remains in the storage-recovery runner.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::future::Future;
+use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as SyncMutex};
@@ -44,8 +45,13 @@ use crate::fault::{
     config::FaultTestConfig,
     events::{RunEventRecorder, RunEventStatus},
     fixture,
+    heal_partition::{
+        HEAL_PARTITION_HOLD_MILLIS, HEAL_PARTITION_PROOF_ARTIFACT, HEAL_PARTITION_TTL_SECONDS,
+        HealPartitionEvidence, require_moving_heal, validate_raw_heal_sample,
+    },
     history::{OperationKind, OperationOutcome, Recorder},
     plan::{FaultKind, StorageRecoveryExecutionPlan},
+    pod_network::{capture_connectivity, capture_pod_network_identities, validate_connectivity},
     pods::{RustfsTargetInventory, rustfs_target_inventory},
     preflight::{
         PreflightCheck, PreflightPhase, PreflightSummary, TargetErasureSetProof, TargetProof,
@@ -118,11 +124,11 @@ pub(crate) const FRESH_VOLUME_HEAL_START_ARTIFACT: &str = "fresh-volume-heal-sta
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ControllerSnapshotEvidence {
-    phase: String,
-    observed_at_ms: u64,
-    sha256: String,
-    body: String,
+pub(crate) struct ControllerSnapshotEvidence {
+    pub(crate) phase: String,
+    pub(crate) observed_at_ms: u64,
+    pub(crate) sha256: String,
+    pub(crate) body: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,8 +359,10 @@ impl FreshVolumeReadMatrixEvidence {
         self.shape.validate()?;
         self.membership.validate(&self.shape)?;
         ensure!(
-            self.identity.scenario == "fresh-volume-replacement"
-                && !self.identity.run_id.trim().is_empty()
+            matches!(
+                self.identity.scenario.as_str(),
+                "fresh-volume-replacement" | "network-partition-during-heal"
+            ) && !self.identity.run_id.trim().is_empty()
                 && !self.chaos_namespace.trim().is_empty()
                 && !self.object_key.trim().is_empty()
                 && !self.version_id.trim().is_empty()
@@ -869,6 +877,10 @@ impl FreshVolumeReadMatrixEvidence {
 
     pub(crate) fn chaos_namespace(&self) -> &str {
         &self.chaos_namespace
+    }
+
+    pub(crate) fn sealed_version(&self) -> (&str, &str, &str) {
+        (&self.object_key, &self.version_id, &self.expected_sha256)
     }
 }
 
@@ -1628,12 +1640,16 @@ async fn wait_rustfs_pods_absent(config: &FaultTestConfig) -> Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct HealWireReceipt {
-    observed_at_ms: u64,
-    method: String,
-    path: String,
-    status: u16,
-    request_id: Option<String>,
-    response_body: String,
+    pub(crate) observed_at_ms: u64,
+    pub(crate) method: String,
+    pub(crate) path: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) query: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) request_body: Option<String>,
+    pub(crate) status: u16,
+    pub(crate) request_id: Option<String>,
+    pub(crate) response_body: String,
 }
 
 pub(crate) fn validate_heal_transcript(
@@ -1659,7 +1675,8 @@ pub(crate) fn validate_heal_transcript(
                 .all(|receipt| receipt.method == "GET" && receipt.path == REPLACEMENT_STATUS_PATH),
             "automatic replacement transcript contains another admin operation"
         ),
-        StorageRecoveryCase::FreshVolumeReplacementAdminDeep => ensure!(
+        StorageRecoveryCase::FreshVolumeReplacementAdminDeep
+        | StorageRecoveryCase::FreshVolumeReplacementPartitionDuringHeal => ensure!(
             receipts.iter().all(|receipt| {
                 receipt.method == "POST"
                     && receipt
@@ -1859,11 +1876,7 @@ impl RustfsFreshHealAdapter {
         bucket: &str,
     ) -> Result<Self> {
         ensure!(
-            matches!(
-                case,
-                StorageRecoveryCase::FreshVolumeReplacementAutomaticReplacement
-                    | StorageRecoveryCase::FreshVolumeReplacementAdminDeep
-            ),
+            case.is_fresh_volume_replacement(),
             "fresh-volume heal adapter received another storage case"
         );
         ensure!(
@@ -1938,7 +1951,7 @@ impl RustfsFreshHealAdapter {
     }
 
     pub(crate) async fn register_start_intent(&self) -> Result<String> {
-        if self.case == StorageRecoveryCase::FreshVolumeReplacementAdminDeep {
+        if self.case.heal_mode() == Some(crate::fault::storage_recovery::HealMode::AdminDeep) {
             let bucket = self
                 .admin_heal_path
                 .strip_prefix(ADMIN_HEAL_PATH)
@@ -1966,7 +1979,8 @@ impl RustfsFreshHealAdapter {
                 );
                 Ok(())
             }
-            StorageRecoveryCase::FreshVolumeReplacementAdminDeep => {
+            StorageRecoveryCase::FreshVolumeReplacementAdminDeep
+            | StorageRecoveryCase::FreshVolumeReplacementPartitionDuringHeal => {
                 ensure!(
                     matches!(
                         *self.admin_start.lock().await,
@@ -2107,7 +2121,8 @@ impl RustfsFreshHealAdapter {
                     set_index: record.set_index.unwrap_or(self.set_index),
                 }))
             }
-            StorageRecoveryCase::FreshVolumeReplacementAdminDeep => {
+            StorageRecoveryCase::FreshVolumeReplacementAdminDeep
+            | StorageRecoveryCase::FreshVolumeReplacementPartitionDuringHeal => {
                 let observer = self
                     .owned_observer
                     .lock()
@@ -2203,6 +2218,11 @@ impl RustfsFreshHealAdapter {
         body: Vec<u8>,
         content_type: Option<&str>,
     ) -> Result<HealWireReceipt> {
+        let request_body = if body.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8(body.clone()).context("heal request body is not UTF-8")?)
+        };
         let response = self
             .transport
             .request(method.clone(), path, query, body, content_type)
@@ -2211,6 +2231,11 @@ impl RustfsFreshHealAdapter {
             observed_at_ms: now_ms(),
             method: method.as_str().to_string(),
             path: path.to_string(),
+            query: query
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            request_body,
             status: response.status,
             request_id: response.request_id,
             response_body: String::from_utf8(response.body)
@@ -2334,6 +2359,7 @@ pub(crate) struct FreshVolumeDriver<'a> {
     state: SyncMutex<FreshVolumeDriverState>,
     helper_guard: Mutex<Option<KubectlStorageRecoveryAttemptGuard>>,
     operator_pause: SyncMutex<Option<crate::fault::backends::lifecycle::OperatorPause>>,
+    heal_partition_guard: SyncMutex<Option<chaos_mesh::ChaosGuard>>,
 }
 
 struct FreshVolumeDriverState {
@@ -2354,6 +2380,7 @@ struct FreshVolumeDriverState {
     heal_started_at_ms: Option<u64>,
     heal_progress: Vec<HealProgressSample>,
     heal_summary: Option<HealSummary>,
+    heal_partition: Option<HealPartitionEvidence>,
     causal_read_proof: Option<FreshVolumeReadMatrixEvidence>,
     ordinary_after_replacement_operation_id: Option<String>,
     replacement_proof: Option<FreshVolumeReplacementProof>,
@@ -2563,6 +2590,16 @@ impl<'a> FreshVolumeDriver<'a> {
         run_id: &'a str,
         deadline: RunDeadline,
     ) -> Result<Self> {
+        ensure!(
+            plan.case.is_fresh_volume_replacement(),
+            "fresh-volume driver received another storage-recovery case"
+        );
+        if plan.case == StorageRecoveryCase::FreshVolumeReplacementPartitionDuringHeal {
+            ensure!(
+                config.expected_rustfs_pod_count == 4,
+                "partition-during-heal requires four one-volume RustFS Pods in one erasure set"
+            );
+        }
         let fixture = StaticLocalPvFixturePlan::parse(config)?;
         Ok(Self {
             config,
@@ -2590,6 +2627,7 @@ impl<'a> FreshVolumeDriver<'a> {
                 heal_started_at_ms: None,
                 heal_progress: Vec::new(),
                 heal_summary: None,
+                heal_partition: None,
                 causal_read_proof: None,
                 ordinary_after_replacement_operation_id: None,
                 replacement_proof: None,
@@ -2597,6 +2635,7 @@ impl<'a> FreshVolumeDriver<'a> {
             }),
             helper_guard: Mutex::new(None),
             operator_pause: SyncMutex::new(None),
+            heal_partition_guard: SyncMutex::new(None),
         })
     }
 
@@ -2757,6 +2796,406 @@ impl<'a> FreshVolumeDriver<'a> {
         Ok((workload_plan, history, proof_history, events, bucket))
     }
 
+    fn record_heal_observation(
+        &self,
+        observation: &NormalizedHealObservation,
+    ) -> Result<HealProgressSample> {
+        let normalized = RustfsHealStatusResponse {
+            observer: observation.observer.clone(),
+            observed_at_ms: observation.observed_at_ms,
+            state: observation.state,
+            scanned: observation.scanned,
+            repaired: observation.repaired,
+            failed: observation.failed,
+            cluster_definitive: observation.cluster_definitive,
+            target_drive_uuid: observation.target_drive_uuid.clone(),
+            pool_index: observation.pool_index,
+            set_index: observation.set_index,
+        };
+        let response_body = serde_json::to_string(&normalized)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
+        let identity = state
+            .owned_context
+            .as_ref()
+            .context("fresh-volume ownership is absent")?
+            .identity
+            .clone();
+        let sample = HealProgressSample {
+            schema_version: crate::fault::storage_recovery::STORAGE_RECOVERY_PROOF_SCHEMA_VERSION,
+            identity,
+            observer: observation.observer.clone(),
+            observed_at_ms: observation.observed_at_ms,
+            state: observation.state,
+            scanned: observation.scanned,
+            repaired: observation.repaired,
+            failed: observation.failed,
+            status_evidence: Some(HealStatusEvidence {
+                api_revision: match self.plan.case.heal_mode() {
+                    Some(crate::fault::storage_recovery::HealMode::AutomaticReplacement) => {
+                        "rustfs-admin-v4-replacement-recovery"
+                    }
+                    Some(crate::fault::storage_recovery::HealMode::AdminDeep) => {
+                        "rustfs-admin-v3-heal"
+                    }
+                    _ => bail!("fresh-volume case has another heal observer mode"),
+                }
+                .to_string(),
+                response_sha256: sha256_text(&response_body),
+                response_body,
+            }),
+        };
+        if observation.target_drive_uuid.is_some() {
+            let path = self
+                .collector
+                .case_dir(self.scenario.case_name)
+                .join(HEAL_PROGRESS_ARTIFACT);
+            let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+            serde_json::to_writer(&mut file, &sample)?;
+            file.write_all(b"\n")?;
+            file.sync_data()?;
+            state.heal_progress.push(sample.clone());
+        }
+        Ok(sample)
+    }
+
+    fn persist_heal_partition(&self) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
+        if let Some(evidence) = &state.heal_partition {
+            self.collector.write_text(
+                self.scenario.case_name,
+                HEAL_PARTITION_PROOF_ARTIFACT,
+                &serde_json::to_string_pretty(evidence)?,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn capture_heal_partition_snapshot(&self, phase: &str) -> Result<()> {
+        let evidence = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+            .heal_partition
+            .clone()
+            .context("heal partition evidence was not initialized")?;
+        let snapshot = {
+            let guard = self
+                .heal_partition_guard
+                .lock()
+                .map_err(|_| anyhow::anyhow!("heal partition guard lock poisoned"))?;
+            let guard = guard.as_ref().context("heal partition guard is absent")?;
+            guard.ensure_active(phase)?;
+            Self::controller_snapshot(guard, phase)?
+        };
+        let wrapper: Value = serde_json::from_str(&snapshot.body)?;
+        chaos_mesh::validate_scoped_network_partition_snapshot(
+            wrapper
+                .get("chaos_status")
+                .context("network controller status is absent")?,
+            &chaos_mesh::ScopedNetworkPartitionEvidenceContract {
+                chaos_namespace: &evidence.chaos_namespace,
+                target_namespace: &evidence.replacement.namespace,
+                tenant: &evidence.replacement.tenant,
+                run_id: &evidence.identity.run_id,
+                scenario: &evidence.identity.scenario,
+                source_pod_names: &evidence.source_pod_names,
+                peer_pod_names: &evidence.peer_pod_names,
+                duration_seconds: HEAL_PARTITION_TTL_SECONDS,
+            },
+        )?;
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+            .heal_partition
+            .as_mut()
+            .context("heal partition evidence is absent")?
+            .snapshots
+            .push(snapshot);
+        self.persist_heal_partition()
+    }
+
+    async fn restore_heal_partition(&self) -> Result<()> {
+        if self
+            .heal_partition_guard
+            .lock()
+            .map_err(|_| anyhow::anyhow!("heal partition guard lock poisoned"))?
+            .is_none()
+        {
+            return Ok(());
+        }
+        let started_at_ms = now_ms();
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+            .heal_partition
+            .as_mut()
+            .context("heal partition evidence is absent")?
+            .delete_started_at_ms = Some(started_at_ms);
+        self.persist_heal_partition()?;
+        {
+            let mut slot = self
+                .heal_partition_guard
+                .lock()
+                .map_err(|_| anyhow::anyhow!("heal partition guard lock poisoned"))?;
+            slot.as_mut()
+                .context("heal partition guard is absent")?
+                .delete(self.config.cluster.timeout)?;
+            slot.take();
+        }
+        let evidence = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
+            let evidence = state
+                .heal_partition
+                .as_mut()
+                .context("heal partition evidence is absent")?;
+            evidence.deleted_at_ms = Some(now_ms());
+            evidence.clone()
+        };
+        self.persist_heal_partition()?;
+        let restored = capture_connectivity(&self.config.cluster, &evidence.pods).await?;
+        validate_connectivity(
+            &restored,
+            &evidence.pods,
+            &evidence.source_pod_names,
+            &evidence.peer_pod_names,
+            false,
+        )?;
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+            .heal_partition
+            .as_mut()
+            .context("heal partition evidence is absent")?
+            .restored_connectivity = restored;
+        self.persist_heal_partition()
+    }
+
+    async fn partition_moving_heal(
+        &self,
+        adapter: &RustfsFreshHealAdapter,
+        replacement: &StorageVolumeIdentity,
+    ) -> Result<()> {
+        let (inventory, _, _, membership) = self.current_runtime_topology().await?;
+        let pods = capture_pod_network_identities(&self.config.cluster).await?;
+        ensure!(
+            pods.len() == 4
+                && pods.len() == inventory.pod_proofs.len()
+                && pods
+                    .iter()
+                    .all(|pod| inventory
+                        .pod_proofs
+                        .iter()
+                        .any(|proof| proof.name == pod.name
+                            && proof.uid == pod.uid
+                            && proof.rustfs_container_id.as_deref()
+                                == Some(pod.container_id.as_str())))
+                && pods
+                    .iter()
+                    .map(|pod| pod.name.clone())
+                    .collect::<BTreeSet<_>>()
+                    == membership
+                        .members
+                        .iter()
+                        .map(|member| member.pod_name.clone())
+                        .collect(),
+            "heal partition network identities differ from authenticated storage topology"
+        );
+        let source = pods
+            .iter()
+            .find(|pod| pod.name == replacement.pod)
+            .context("replacement Pod is absent from the network identity set")?;
+        ensure!(
+            source.uid == replacement.pod_uid
+                && source.container_id == replacement.rustfs_container_id,
+            "replacement Pod generation changed before the heal partition"
+        );
+        let source_pod_names = BTreeSet::from([replacement.pod.clone()]);
+        let peer_pod_names = pods
+            .iter()
+            .filter(|pod| pod.name != replacement.pod)
+            .map(|pod| pod.name.clone())
+            .collect::<BTreeSet<_>>();
+        let baseline = capture_connectivity(&self.config.cluster, &pods).await?;
+        validate_connectivity(&baseline, &pods, &source_pod_names, &peer_pod_names, false)?;
+        let trigger_deadline = Instant::now() + self.config.cluster.timeout;
+        let mut previous: Option<HealProgressSample> = None;
+        loop {
+            ensure!(
+                Instant::now() < trigger_deadline,
+                "owned heal did not produce moving nonterminal progress before the partition trigger timeout"
+            );
+            self.renew_owned_context().await?;
+            let observation = adapter
+                .observe()
+                .await?
+                .context("owned AdminDeep heal has no status")?;
+            let sample = self.record_heal_observation(&observation)?;
+            let receipts: Vec<HealWireReceipt> =
+                serde_json::from_str(&adapter.transcript_json().await?)?;
+            validate_raw_heal_sample(&sample, &receipts, &self.scenario_bucket()?, replacement)?;
+            if let Some(previous_sample) = &previous
+                && (sample.scanned > previous_sample.scanned
+                    || sample.repaired > previous_sample.repaired)
+            {
+                require_moving_heal(previous_sample, &sample)?;
+                break;
+            }
+            previous = Some(sample);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let (s3, history, sealed, identity) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?;
+            let session = state
+                .session
+                .as_ref()
+                .context("fresh-volume workload session is absent")?;
+            (
+                session.s3.clone(),
+                session.history.clone(),
+                session.sealed.clone(),
+                state
+                    .owned_context
+                    .as_ref()
+                    .context("fresh-volume ownership is absent")?
+                    .identity
+                    .clone(),
+            )
+        };
+        let spec = chaos_mesh::NetworkChaosSpec::partition_between_rustfs_pods(
+            &self.config.cluster,
+            &self.config.chaos_namespace,
+            self.run_id,
+            &self.scenario.name,
+            Duration::from_secs(HEAL_PARTITION_TTL_SECONDS),
+            &source_pod_names,
+            &peer_pod_names,
+        )?;
+        let manifest = spec.manifest();
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+            .heal_partition = Some(HealPartitionEvidence {
+            schema_version: 1,
+            identity,
+            replacement: replacement.clone(),
+            chaos_namespace: self.config.chaos_namespace.clone(),
+            pods,
+            source_pod_names,
+            peer_pod_names,
+            object_key: sealed.key.clone(),
+            version_id: sealed.version_id.clone(),
+            expected_sha256: sealed.sha256.clone(),
+            manifest,
+            baseline_connectivity: baseline,
+            apply_started_at_ms: Some(now_ms()),
+            snapshots: Vec::new(),
+            active_connectivity: Vec::new(),
+            read_operation_ids: Vec::new(),
+            delete_started_at_ms: None,
+            deleted_at_ms: None,
+            restored_connectivity: Vec::new(),
+        });
+        self.persist_heal_partition()?;
+        let guard = chaos_mesh::apply_networkchaos(&self.config.cluster, &spec)?;
+        *self
+            .heal_partition_guard
+            .lock()
+            .map_err(|_| anyhow::anyhow!("heal partition guard lock poisoned"))? = Some(guard);
+        {
+            let slot = self
+                .heal_partition_guard
+                .lock()
+                .map_err(|_| anyhow::anyhow!("heal partition guard lock poisoned"))?;
+            slot.as_ref()
+                .context("heal partition guard is absent")?
+                .wait_active(self.config.cluster.timeout)?;
+        }
+        self.capture_heal_partition_snapshot("heal-partition-active")?;
+        let holding_until = Instant::now() + Duration::from_millis(HEAL_PARTITION_HOLD_MILLIS);
+        let observation = adapter
+            .observe()
+            .await?
+            .context("owned AdminDeep heal has no status during partition")?;
+        let sample = self.record_heal_observation(&observation)?;
+        let receipts: Vec<HealWireReceipt> =
+            serde_json::from_str(&adapter.transcript_json().await?)?;
+        validate_raw_heal_sample(&sample, &receipts, &self.scenario_bucket()?, replacement)?;
+        let evidence = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+            .heal_partition
+            .clone()
+            .context("heal partition evidence is absent")?;
+        let active = capture_connectivity(&self.config.cluster, &evidence.pods).await?;
+        validate_connectivity(
+            &active,
+            &evidence.pods,
+            &evidence.source_pod_names,
+            &evidence.peer_pod_names,
+            true,
+        )?;
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+            .heal_partition
+            .as_mut()
+            .context("heal partition evidence is absent")?
+            .active_connectivity = active;
+        self.persist_heal_partition()?;
+        loop {
+            let read = s3
+                .get_object_version_recorded_result(&sealed.key, &sealed.version_id, &history)
+                .await?;
+            ensure!(
+                read.result.outcome != OperationOutcome::NotFound,
+                "committed sealed version disappeared during heal partition"
+            );
+            if read.result.outcome == OperationOutcome::Ok {
+                ensure!(
+                    read.result.body.as_deref().is_some_and(|body| {
+                        crate::fault::workload::sha256_hex(body) == sealed.sha256
+                    }),
+                    "successful heal-partition GET returned corrupt bytes"
+                );
+            }
+            self.state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+                .heal_partition
+                .as_mut()
+                .context("heal partition evidence is absent")?
+                .read_operation_ids
+                .push(read.operation_id);
+            let observation = adapter
+                .observe()
+                .await?
+                .context("owned AdminDeep heal has no status during partition")?;
+            let sample = self.record_heal_observation(&observation)?;
+            let receipts: Vec<HealWireReceipt> =
+                serde_json::from_str(&adapter.transcript_json().await?)?;
+            validate_raw_heal_sample(&sample, &receipts, &self.scenario_bucket()?, replacement)?;
+            self.capture_heal_partition_snapshot("heal-partition-after-probe")?;
+            if Instant::now() >= holding_until {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        self.restore_heal_partition().await
+    }
+
     fn ensure_fixture_pvs_absent(&self) -> Result<()> {
         let kubectl = Kubectl::new(&self.config.cluster);
         for volume in self
@@ -2912,6 +3351,7 @@ impl<'a> FreshVolumeDriver<'a> {
                 }),
                 membership: Some(membership.clone()),
                 volume_quorum: Some(volume_quorum),
+                same_pod_volumes: None,
                 observed_at_ms: now_ms(),
                 note: "exact-quorum siblings bound to live one-volume RustFS servers".to_string(),
             },
@@ -3526,13 +3966,16 @@ impl<'a> FreshVolumeDriver<'a> {
 #[async_trait(?Send)]
 impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
     async fn prepare_and_seal_dataset(&self) -> Result<()> {
+        if self.plan.case == StorageRecoveryCase::FreshVolumeReplacementPartitionDuringHeal {
+            chaos_mesh::require_networkchaos_crd(&self.config.cluster)?;
+        }
         ensure!(
             self.config.workload_versioning,
             "fresh-volume qualification requires a versioned workload"
         );
         self.ensure_fixture_pvs_absent()?;
         fixture::reset_tenant_resources(&self.config.cluster)?;
-        fixture::apply_tenant_resources(&self.config.cluster)?;
+        fixture::apply_tenant_resources(&self.config.cluster, 1)?;
         let kubectl = Kubectl::new(&self.config.cluster);
         for volume in self.fixture.initial() {
             kubectl
@@ -3843,6 +4286,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
             }),
             membership: Some(membership.clone()),
             volume_quorum: None,
+            same_pod_volumes: None,
             observed_at_ms: now_ms(),
             note: "single-set runtime membership bound to the run-owned Local PV fixture"
                 .to_string(),
@@ -4740,6 +5184,10 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
                     .context("fresh-volume replacement identity is absent")?,
             )
         };
+        if self.plan.case == StorageRecoveryCase::FreshVolumeReplacementPartitionDuringHeal {
+            self.with_lease_heartbeat(self.partition_moving_heal(&adapter, &replacement))
+                .await?;
+        }
         let mut next_lease_renewal = Instant::now();
         loop {
             if Instant::now() >= next_lease_renewal {
@@ -4750,50 +5198,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             };
-            let normalized = RustfsHealStatusResponse {
-                observer: observation.observer.clone(),
-                observed_at_ms: observation.observed_at_ms,
-                state: observation.state,
-                scanned: observation.scanned,
-                repaired: observation.repaired,
-                failed: observation.failed,
-                cluster_definitive: observation.cluster_definitive,
-                target_drive_uuid: observation.target_drive_uuid.clone(),
-                pool_index: observation.pool_index,
-                set_index: observation.set_index,
-            };
-            let response_body = serde_json::to_string(&normalized)?;
-            let sample = HealProgressSample {
-                schema_version:
-                    crate::fault::storage_recovery::STORAGE_RECOVERY_PROOF_SCHEMA_VERSION,
-                identity: identity.clone(),
-                observer: observation.observer.clone(),
-                observed_at_ms: observation.observed_at_ms,
-                state: observation.state,
-                scanned: observation.scanned,
-                repaired: observation.repaired,
-                failed: observation.failed,
-                status_evidence: Some(HealStatusEvidence {
-                    api_revision: match self.plan.case {
-                        StorageRecoveryCase::FreshVolumeReplacementAutomaticReplacement => {
-                            "rustfs-admin-v4-replacement-recovery".to_string()
-                        }
-                        StorageRecoveryCase::FreshVolumeReplacementAdminDeep => {
-                            "rustfs-admin-v3-heal".to_string()
-                        }
-                        _ => unreachable!("fresh-volume plan validated by constructor"),
-                    },
-                    response_sha256: sha256_text(&response_body),
-                    response_body,
-                }),
-            };
-            if observation.target_drive_uuid.is_some() {
-                self.state
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
-                    .heal_progress
-                    .push(sample.clone());
-            }
+            self.record_heal_observation(&observation)?;
             if observation.state == HealProgressState::Failed {
                 bail!("RustFS heal reported a failed terminal state")
             }
@@ -5011,6 +5416,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
         Ok(())
     }
     async fn persist_raw_evidence(&self) -> Result<()> {
+        self.persist_heal_partition()?;
         let (
             adapter,
             progress,
@@ -5164,6 +5570,35 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
                 &proof_history.records(),
                 &original_target_proof,
             )?;
+            if self.plan.case == StorageRecoveryCase::FreshVolumeReplacementPartitionDuringHeal {
+                let evidence = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+                    .heal_partition
+                    .clone()
+                    .context("partition-during-heal evidence is absent")?;
+                let records = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("fresh-volume driver state lock poisoned"))?
+                    .session
+                    .as_ref()
+                    .context("fresh-volume workload session is absent")?
+                    .history
+                    .records();
+                let receipts = serde_json::from_str::<Vec<HealWireReceipt>>(&transcript)?;
+                evidence.validate_chain(
+                    replacement_proof,
+                    summary
+                        .as_ref()
+                        .context("heal partition lacks terminal summary")?,
+                    &progress,
+                    &records,
+                    &receipts,
+                    causal_read_proof,
+                )?;
+            }
         }
         Ok(())
     }
@@ -5181,6 +5616,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
     }
 
     async fn cancel_owned_heal(&self) -> Result<OwnedHealCancel> {
+        self.restore_heal_partition().await?;
         let adapter = self
             .state
             .lock()
@@ -5194,6 +5630,7 @@ impl StorageRecoveryCaseDriver for FreshVolumeDriver<'_> {
     }
 
     async fn cleanup_or_quarantine(&self) -> Result<()> {
+        self.restore_heal_partition().await?;
         let (
             context,
             replacement,
@@ -5489,6 +5926,7 @@ mod tests {
             OFFLINE_XL2_INSPECTOR_REVISION, Xl2FormatProfile, Xl2ObjectVersionLayout,
         };
         let original = OfflineXl2InspectResponse {
+            selected_metadata: None,
             mount_device_id: "8:1".to_string(),
             drive_uuid: "old".to_string(),
             format_json_sha256: "a".repeat(64),
@@ -5844,6 +6282,8 @@ mod tests {
             observed_at_ms: 1_200,
             method: "POST".to_string(),
             path: "/rustfs/admin/v3/heal/rustfs-fault-run".to_string(),
+            query: BTreeMap::new(),
+            request_body: None,
             status: 200,
             request_id: Some("request-1".to_string()),
             response_body: r#"{"clientToken":"owned-token","startTime":"1970-01-01T00:00:01Z"}"#
@@ -5853,6 +6293,8 @@ mod tests {
             observed_at_ms: 1_500,
             method: "POST".to_string(),
             path: start.path.clone(),
+            query: BTreeMap::new(),
+            request_body: None,
             status: 200,
             request_id: Some("request-2".to_string()),
             response_body: r#"{"summary":"running","startTime":"1970-01-01T00:00:01.4Z","settings":{"recursive":false,"scanMode":0}}"#
@@ -5948,6 +6390,8 @@ mod tests {
             observed_at_ms: 1,
             method: "GET".to_string(),
             path: REPLACEMENT_STATUS_PATH.to_string(),
+            query: BTreeMap::new(),
+            request_body: None,
             status: 200,
             request_id: None,
             response_body: r#"{"cluster":{"definitive":true,"records":[{"taskId":"task-1","state":"completed","generation":null,"setDiskId":"pool_0_set_0","targetSlots":["http://rustfs-0/data"]}]}}"#.to_string(),
@@ -6001,6 +6445,8 @@ mod tests {
             observed_at_ms,
             method: "GET".to_string(),
             path: REPLACEMENT_STATUS_PATH.to_string(),
+            query: BTreeMap::new(),
+            request_body: None,
             status: 200,
             request_id: None,
             response_body: r#"{"cluster":{"definitive":true,"records":[]}}"#.to_string(),

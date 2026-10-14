@@ -1,0 +1,36 @@
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-network-clock
+budgets:
+  maxDuration: 2h
+  stopOnFirstFailure: true
+  continueOnSeverities: []
+  maxClientDisruptions: 1000
+  recoveryStableWindowSeconds: 60
+observability:
+  chaosDashboard: optional
+artifacts:
+  required: strict
+workloadProfiles:
+  network-clock:
+    objects: 300
+    concurrency: 12
+scenarios:
+  # Four symmetric servers in one erasure set; curl in every RustFS container.
+  - name: network-split-brain
+    faultDuration: 15m
+    workloadProfile: network-clock
+  # TimeChaos affects only CLOCK_REALTIME in the selected running container.
+  - name: clock-skew
+    faultDuration: 15m
+    workloadProfile: network-clock
+    params:
+      kind: clockSkew
+      offsetSeconds: 120
+  - name: clock-skew
+    faultDuration: 15m
+    workloadProfile: network-clock
+    params:
+      kind: clockSkew
+      offsetSeconds: -120

@@ -43,7 +43,7 @@ pub(crate) struct FaultStatusSnapshot {
     pub(crate) quorum_dm_status: Option<crate::fault::backends::quorum_dm::QuorumDmStatusSnapshot>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub(crate) struct PodIdentity {
     pub(crate) name: String,
     pub(crate) uid: String,
@@ -747,6 +747,7 @@ mod tests {
             "unexpected_listed_object",
             "data_corruption",
             "ambiguous_write_materialized",
+            "quorum_violation",
             "recovery_health_degraded",
             "post_recovery_write_failed",
             "availability_regression",
@@ -918,5 +919,39 @@ mod tests {
                     .expect("ref")
                     .ends_with("failure-summary.json"))
         );
+    }
+
+    #[test]
+    fn split_brain_ack_violation_reports_product_correctness_with_owned_evidence() {
+        let summary = FailureSummary::new(
+            "network-split-brain",
+            "split-brain-s3-probe",
+            "quorum_violation",
+            "write was acknowledged below write quorum",
+        )
+        .expect("summary");
+        assert_eq!(summary.severity(), FailureSeverity::FailCorrectness);
+        assert_eq!(
+            summary.responsibility_domain(),
+            Some(ResponsibilityDomain::Product)
+        );
+        assert_eq!(summary.phase(), Some(FailurePhase::Workload));
+        assert_eq!(summary.run_failure_reason(), Some("quorum_violation"));
+        assert_eq!(summary.s3_model_classification(), None);
+        assert!(
+            summary
+                .primary_evidence_refs()
+                .iter()
+                .any(|name| name == "network-split-brain.json")
+        );
+        assert!(
+            summary
+                .primary_evidence_refs()
+                .iter()
+                .any(|name| name == "network-split-brain-s3-history.jsonl")
+        );
+        summary
+            .validate_classification_projection()
+            .expect("correctness projection");
     }
 }

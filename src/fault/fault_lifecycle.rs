@@ -34,6 +34,9 @@ pub(super) trait FaultLifecyclePort: Send {
     }
     fn delete(&mut self, timeout: Duration) -> Result<()>;
     fn snapshot(&self, stage: &str) -> Result<FaultStatusSnapshot>;
+    fn snapshots(&self, stage: &str) -> Result<Vec<FaultStatusSnapshot>> {
+        self.snapshot(stage).map(|snapshot| vec![snapshot])
+    }
 
     /// Harness-time slot the runner fills when the first fault-phase S3
     /// request starts; a backend whose disruption must land under load waits

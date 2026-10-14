@@ -144,6 +144,108 @@ pub struct QuorumVolumeBinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SamePodVolumeTargetProof {
+    pub bindings: [QuorumVolumeBinding; 2],
+    pub runtime_drive_paths: std::collections::BTreeMap<String, String>,
+}
+
+impl SamePodVolumeTargetProof {
+    pub fn validate(
+        &self,
+        shape: &ErasureSetShape,
+        membership: &ErasureSetMembership,
+    ) -> Result<()> {
+        shape.validate()?;
+        membership.validate(shape)?;
+        shape.require_volume_availability_boundary(2)?;
+        crate::fault::scenarios::assess_same_pod_two_volume_geometry(
+            shape.volumes_per_server,
+            self.bindings.len(),
+            Some(true),
+        )?;
+        let [first, second] = &self.bindings;
+        ensure!(
+            first.pod_name == second.pod_name
+                && first.pod_uid == second.pod_uid
+                && first.container_id == second.container_id
+                && first.mount_path != second.mount_path
+                && first.persistent_volume_claim != second.persistent_volume_claim
+                && first.persistent_volume != second.persistent_volume
+                && first.drive_uuid != second.drive_uuid,
+            "same-Pod EIO must bind two distinct volumes on one Pod/container generation"
+        );
+        let member = membership
+            .members
+            .iter()
+            .find(|member| member.pod_name == first.pod_name)
+            .context("same-Pod volume target is absent from runtime membership")?;
+        ensure!(
+            self.runtime_drive_paths.len() == 2,
+            "same-Pod proof must name exactly two runtime drive paths"
+        );
+        for binding in &self.bindings {
+            ensure!(
+                binding.pool_index == shape.pool_index
+                    && binding.set_index == shape.set_index
+                    && member.shard_ids.contains(&binding.drive_uuid)
+                    && self.runtime_drive_paths.get(&binding.drive_uuid)
+                        == Some(&binding.mount_path)
+                    && !binding.pod_uid.is_empty()
+                    && !binding.container_id.is_empty()
+                    && !binding.persistent_volume_claim.is_empty()
+                    && !binding.persistent_volume.is_empty(),
+                "same-Pod volume binding does not match its authenticated runtime drive path/set"
+            );
+            crate::fault::config::validate_rustfs_volume_path(&binding.mount_path)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn same_pod_volume_proof_fixture() -> (
+    ErasureSetShape,
+    ErasureSetMembership,
+    SamePodVolumeTargetProof,
+) {
+    let shape =
+        ErasureSetShape::from_runtime_single_set(4, 2, &[1], &[8], 4).expect("two-volume shape");
+    let membership = ErasureSetMembership::from_runtime(
+        &shape,
+        (0..4)
+            .map(|pod| ErasureSetMember {
+                pod_name: format!("rustfs-{pod}"),
+                server_endpoint: format!("http://rustfs-{pod}:9000"),
+                shard_ids: (0..2)
+                    .map(|volume| format!("drive-{pod}-{volume}"))
+                    .collect(),
+            })
+            .collect(),
+    )
+    .expect("two-volume membership");
+    let bindings = [0, 1].map(|volume| QuorumVolumeBinding {
+        pod_name: "rustfs-3".to_string(),
+        pod_uid: "pod-uid-3".to_string(),
+        container_id: "containerd://container-3".to_string(),
+        mount_path: format!("/data/rustfs{volume}"),
+        persistent_volume_claim: format!("data-{volume}-rustfs-3"),
+        persistent_volume: format!("pv-3-{volume}"),
+        drive_uuid: format!("drive-3-{volume}"),
+        pool_index: 0,
+        set_index: 0,
+    });
+    let proof = SamePodVolumeTargetProof {
+        runtime_drive_paths: bindings
+            .iter()
+            .map(|binding| (binding.drive_uuid.clone(), binding.mount_path.clone()))
+            .collect(),
+        bindings,
+    };
+    (shape, membership, proof)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuorumVolumeTargetProof {
     pub boundary: QuorumVolumeBoundary,
@@ -794,6 +896,46 @@ mod tests {
         QuorumMutationClass, QuorumRequirements, QuorumVolumeBinding, QuorumVolumeBoundary,
         QuorumVolumeTargetProof, require_fresh_runtime_observation,
     };
+
+    #[test]
+    fn same_pod_volume_proof_requires_distinct_mounts_in_one_runtime_set() {
+        let (shape, membership, proof) = super::same_pod_volume_proof_fixture();
+        proof
+            .validate(&shape, &membership)
+            .expect("same-Pod two-volume proof");
+        for field in ["pod", "container", "set", "volume", "path", "runtime_path"] {
+            let mut invalid = proof.clone();
+            match field {
+                "pod" => invalid.bindings[1].pod_name = "rustfs-2".to_string(),
+                "container" => {
+                    invalid.bindings[1].container_id = "containerd://replacement".to_string()
+                }
+                "set" => invalid.bindings[1].set_index = 1,
+                "volume" => {
+                    invalid.bindings[1].persistent_volume =
+                        invalid.bindings[0].persistent_volume.clone()
+                }
+                "path" => invalid.bindings[1].mount_path = invalid.bindings[0].mount_path.clone(),
+                "runtime_path" => {
+                    invalid.runtime_drive_paths.insert(
+                        invalid.bindings[1].drive_uuid.clone(),
+                        "/data/unproved".to_string(),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                invalid.validate(&shape, &membership).is_err(),
+                "changed {field} must reject the same-Pod target"
+            );
+        }
+        let insufficient = ErasureSetShape::from_runtime_single_set(4, 2, &[1], &[8], 1)
+            .expect("low-redundancy shape");
+        assert!(
+            proof.validate(&insufficient, &membership).is_err(),
+            "two volume failures must preserve read and write quorum"
+        );
+    }
 
     #[test]
     fn semantic_volume_boundaries_resolve_from_runtime_geometry() {

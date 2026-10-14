@@ -222,7 +222,9 @@ impl FaultRun<'_> {
             };
         let volume_quorum_scenario = matches!(
             plan.scenario.as_str(),
-            QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+            QUORUM_P_IO_FAULT_SCENARIO
+                | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+                | crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO
         );
         let (fixed_volume_targets, quorum_activation, activation_plan) = if volume_quorum_scenario {
             events.record(
@@ -251,10 +253,10 @@ impl FaultRun<'_> {
             let pods = evidence
                 .targets
                 .iter()
-                .map(|target| PodIdentity {
-                    name: target.pod_name.clone(),
-                    uid: target.pod_uid.clone(),
-                })
+                .map(|target| (target.pod_name.clone(), target.pod_uid.clone()))
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .map(|(name, uid)| PodIdentity { name, uid })
                 .collect();
             let fixed_volume_targets = FixedVolumeTargets {
                 pods,
@@ -499,11 +501,18 @@ impl FaultRun<'_> {
                 "checking S3 access while faults are active",
                 Some(serde_json::json!({ "endpoint": endpoint })),
             )?;
-            if let Err(error) = self
-                .deadline
-                .run(ensure_s3_access(port_forward, cluster, endpoint))
-                .await
-            {
+            let access = async {
+                if plan.scenario == crate::fault::scenarios::CLOCK_SKEW_SCENARIO {
+                    let guard = port_forward
+                        .as_mut()
+                        .context("clock workload lost its direct Pod forward")?;
+                    guard.ensure_running()?;
+                    wait_for_tenant_s3(guard, endpoint, cluster.timeout).await
+                } else {
+                    ensure_s3_access(port_forward, cluster, endpoint).await
+                }
+            };
+            if let Err(error) = self.deadline.run(access).await {
                 self.record_failure(
                     "s3-access-under-fault",
                     "environment_or_workload",
@@ -727,14 +736,24 @@ impl FaultRun<'_> {
             "workload-summary.json",
             &serde_json::to_string_pretty(&workload.summary)?,
         )?;
-        let require_client_disruption = self.require_workload_impact(
-            &workload,
-            target,
-            fault,
-            prefilled,
-            active.fault_active_at_ms,
-            workload_started_at_ms,
-        )?;
+        let require_client_disruption = if plan.scenario
+            == crate::fault::scenarios::NETWORK_SPLIT_BRAIN_SCENARIO
+            && active.deferred_failure.is_some()
+        {
+            // The independently proved S3 defect already fails this run.
+            // Preserve the configured impact policy while completing recovery.
+            self.config.require_client_disruption
+                || self.context.spec.impact_policy.requires_client_disruption()
+        } else {
+            self.require_workload_impact(
+                &workload,
+                target,
+                fault,
+                prefilled,
+                active.fault_active_at_ms,
+                workload_started_at_ms,
+            )?
+        };
         self.require_availability(&workload, fault, availability_read_probe, served_by_pod)?;
         events.record(
             "fault-snapshot-after-workload",
@@ -742,10 +761,7 @@ impl FaultRun<'_> {
             "capturing fault status snapshots after workload",
             None,
         )?;
-        let workload_snapshots = match fault
-            .snapshot("after-workload")
-            .map(|snapshot| vec![snapshot])
-        {
+        let workload_snapshots = match fault.snapshots("after-workload") {
             Ok(snapshots) => snapshots,
             Err(error) => {
                 self.record_failure(
@@ -860,8 +876,7 @@ impl FaultRun<'_> {
         )?;
         let workload_snapshots = active
             .fault
-            .snapshot("after-workload")
-            .map(|snapshot| vec![snapshot])
+            .snapshots("after-workload")
             .unwrap_or_else(|error| {
                 self.context
                     .events
@@ -1357,7 +1372,7 @@ impl FaultRun<'_> {
             "capturing active fault status snapshots",
             None,
         )?;
-        let active_snapshots = match fault.snapshot("active").map(|snapshot| vec![snapshot]) {
+        let active_snapshots = match fault.snapshots("active") {
             Ok(snapshots) => snapshots,
             Err(error) => {
                 self.record_failure(
@@ -2090,7 +2105,9 @@ mod availability_endpoint_tests {
 pub(super) fn requires_independent_quorum_probe(scenario: &str) -> bool {
     matches!(
         scenario,
-        QUORUM_P_IO_FAULT_SCENARIO | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+        QUORUM_P_IO_FAULT_SCENARIO
+            | QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+            | crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO
     )
 }
 

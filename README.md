@@ -63,7 +63,7 @@ scenario:
 
 ```bash
 make fault-list                                      # executable scenario list
-make fault-chaos-run                                 # canonical 20-attempt suite
+make fault-chaos-run                                 # canonical 29-attempt suite
 make fault-dm-run SCENARIO=dm-flakey-versioned-hot  # one supervised DM run
 make fault-dm-run SCENARIO=node-crash-proxy         # DM crash + node held down
 make fault-console-serve                             # browse run artifacts
@@ -84,18 +84,19 @@ starting the suite. Override the canonical suite with
 Warp plans. The generic `fault-suite-*` targets remain available for custom
 non-static suites, single-attempt storage-recovery suites, and the separate Warp campaign.
 
-Runnable scenario families (37 executable entries): I/O faults (`io-eio`,
+Runnable scenario families (44 executable entries): I/O faults (`io-eio`,
 `io-eio-during-multipart`, `io-read-mistake`, `io-read-only`, `io-latency`,
 `disk-full`, `dm-flakey*`, and the five typed `dm-drop-writes-after-ack-*`
-cases), network faults (`network-partition-one`,
+cases, and `io-eio-same-pod-two-volumes`), network faults (`network-partition-one`,
 `network-asymmetric-partition`, `network-partition-write-quorum-loss`,
-`network-delay/loss/flaky/corrupt/duplicate`), pod faults (`pod-kill-one`,
+`network-delay/loss/flaky/corrupt/duplicate`, and `network-split-brain`), pod faults (`pod-kill-one`,
 `pod-restart-storm`, `pod-failure`, `pod-crash-versioned-hot`),
 kubectl-driven lifecycle restarts (`pod-graceful-restart-one`,
 `rolling-restart-all`, `cluster-cold-restart`), stress (`stress-cpu`,
 `stress-memory`), typed volume quorum (`quorum-p-io-fault`,
 `quorum-p-plus-one-io-fault`), the `warp-under-chaos` benchmark campaign,
-fresh-volume replacement, and on-disk bitrot.
+fresh-volume replacement, on-disk bitrot, partition during replacement heal,
+metadata corruption, clock skew, and credential rotation during load.
 Each typed volume quorum run captures bounded RustFS admin health samples before
 its probes/workload and after the workload/controller recheck; both samples
 require every non-target drive to be healthy and do not claim continuous health.
@@ -105,7 +106,7 @@ Fresh-volume replacement and bitrot are executable through `fault-run` or a
 single-attempt `fault-suite-run`, with an explicit recovery case. Their four
 suite examples are in `fault/examples/`; each still requires dedicated storage,
 target proofs, destructive authorization, and the existing cleanup contracts.
-The existing `fault-qualify` interface remains available for all seven cases.
+The existing `fault-qualify` interface remains available for all nine cases.
 
 ```bash
 # After preparing the dedicated target and environment described below:
@@ -115,12 +116,17 @@ make fault-run SCENARIO=fresh-volume-replacement
 make fault-suite-run SUITE=fault/examples/on-disk-bitrot-admin-deep.yaml
 ```
 
-Six further `Planned` entries record Mac Mini families that have no safe
-actuator yet (`io-eio-same-pod-two-volumes`, `network-partition-during-heal`,
-`clock-skew`, `credential-rotation-mid-load`, `network-split-brain`,
-`metadata-shard-corruption`). They are catalog-only and are not qualification
-cases. The coverage matrix is
-[`docs/MAC_MINI_CHAOS_COVERAGE.md`](docs/MAC_MINI_CHAOS_COVERAGE.md).
+The additional fault families use the same `fault-run` and `fault-suite-run`
+entrypoints. Single-attempt suites declare their typed parameters and recovery
+case; static validation is available without a cluster. The
+[coverage matrix](docs/MAC_MINI_CHAOS_COVERAGE.md) records supported scopes.
+See [network and clock faults](docs/NETWORK_CLOCK_FAULTS.md),
+[credential rotation](docs/CREDENTIAL_ROTATION.md), and
+[partition during heal](docs/HEAL_PARTITION.md) for prerequisites and evidence.
+The [storage-fault guide](docs/STORAGE_FAULT_SCENARIOS.md) covers same-Pod EIO
+and the prepared metadata-corruption target.
+Credential rotation covers a run-owned IAM access key; TLS certificate rotation
+has no executor. New executors require live qualification before release gating.
 
 Heal is a recovery mode of replacement and bitrot rather than a standalone
 healthy-cluster scenario. Long-running campaigns remain suite orchestration,
@@ -136,7 +142,7 @@ required native helper image, multi-operation IOChaos probes, and dedicated
 
 ### Reliability qualification
 
-List the seven closed qualification cases, derived from the Rust typed catalog,
+List the nine closed qualification cases, derived from the Rust typed catalog,
 and run exactly one through the same health watcher, evidence capture, artifact
 validation, and interruption-safe supervision used by executable fault
 scenarios:

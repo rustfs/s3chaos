@@ -405,6 +405,9 @@ pub enum StorageRecoveryHostOperation {
         part_number: u32,
         byte_offset: u64,
     },
+    MutateMetadata {
+        inspection_operation_id: String,
+    },
     PrepareFreshVolume {
         replacement_persistent_volume: String,
         replacement_persistent_volume_claim: String,
@@ -475,6 +478,13 @@ impl StorageRecoveryHostOperation {
                     *part_number > 0,
                     "storage-recovery selected part number is zero"
                 );
+                Ok(())
+            }
+            Self::MutateMetadata {
+                inspection_operation_id,
+            } => {
+                uuid::Uuid::parse_str(inspection_operation_id)
+                    .context("metadata inspection operation id is not a UUID")?;
                 Ok(())
             }
             Self::PrepareFreshVolume {
@@ -1203,7 +1213,11 @@ impl KubectlStorageRecoveryAttemptGuard {
         operation: &StorageRecoveryHostOperation,
     ) -> Result<StorageRecoveryOperationReceipt> {
         ensure!(
-            matches!(operation, StorageRecoveryHostOperation::MutateShard { .. }),
+            matches!(
+                operation,
+                StorageRecoveryHostOperation::MutateShard { .. }
+                    | StorageRecoveryHostOperation::MutateMetadata { .. }
+            ),
             "explicit helper operationId is restricted to shard mutation"
         );
         uuid::Uuid::parse_str(operation_id)
@@ -2121,6 +2135,7 @@ mod tests {
             expected_drive_uuid: "drive-1".to_string(),
         };
         let response_body = serde_json::to_string(&OfflineXl2InspectResponse {
+            selected_metadata: None,
             mount_device_id: "259:0".to_string(),
             drive_uuid: "drive-1".to_string(),
             format_json_sha256: HASH.to_string(),

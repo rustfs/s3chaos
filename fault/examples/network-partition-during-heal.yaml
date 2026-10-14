@@ -1,0 +1,22 @@
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-network-partition-during-heal
+budgets:
+  maxDuration: 1h
+  stopOnFirstFailure: true
+  continueOnSeverities: []
+  maxClientDisruptions: 0
+observability:
+  chaosDashboard: optional
+artifacts:
+  required: strict
+workloadProfiles:
+  recovery:
+    objects: 2000
+    concurrency: 16
+scenarios:
+  - name: network-partition-during-heal
+    storageRecoveryCase: network-partition-during-heal-admin-deep
+    faultDuration: 30m
+    workloadProfile: recovery

@@ -21,12 +21,13 @@ use crate::framework::{config::ClusterTestConfig, kubectl::Kubectl};
 
 use super::{
     IoChaosSpec, MANAGED_BY_LABEL, MANAGED_BY_VALUE, NetworkChaosSpec, PodChaosSpec, RUN_ID_LABEL,
-    ScheduleSpec, StressChaosSpec,
+    ScheduleSpec, StressChaosSpec, TimeChaosSpec,
 };
 
 const IOCHAOS_CRD: &str = "iochaos.chaos-mesh.org";
 const PODCHAOS_CRD: &str = "podchaos.chaos-mesh.org";
 const NETWORKCHAOS_CRD: &str = "networkchaos.chaos-mesh.org";
+const TIMECHAOS_CRD: &str = "timechaos.chaos-mesh.org";
 const STRESSCHAOS_CRD: &str = "stresschaos.chaos-mesh.org";
 const SCHEDULE_CRD: &str = "schedules.chaos-mesh.org";
 
@@ -49,6 +50,10 @@ pub fn require_podchaos_crd(config: &ClusterTestConfig) -> Result<()> {
 
 pub fn require_networkchaos_crd(config: &ClusterTestConfig) -> Result<()> {
     require_crd(config, NETWORKCHAOS_CRD, "Chaos Mesh NetworkChaos")
+}
+
+pub fn require_timechaos_crd(config: &ClusterTestConfig) -> Result<()> {
+    require_crd(config, TIMECHAOS_CRD, "Chaos Mesh TimeChaos")
 }
 
 pub fn require_stresschaos_crd(config: &ClusterTestConfig) -> Result<()> {
@@ -78,8 +83,12 @@ pub fn cleanup_run(config: &ClusterTestConfig, namespace: &str, run_id: &str) ->
         "iochaos",
         "podchaos",
         "networkchaos",
+        "timechaos",
         "stresschaos",
     ] {
+        if kind == "timechaos" && !timechaos_is_served(config)? {
+            continue;
+        }
         Kubectl::new(config)
             .namespaced(namespace)
             .command([
@@ -101,6 +110,9 @@ pub fn cleanup_run_kind(
     run_id: &str,
     kind: &str,
 ) -> Result<()> {
+    if kind == "timechaos" && !timechaos_is_served(config)? {
+        return Ok(());
+    }
     let selector = format!("{RUN_ID_LABEL}={run_id}");
     Kubectl::new(config)
         .namespaced(namespace)
@@ -122,6 +134,7 @@ pub fn cleanup_managed_chaos(config: &ClusterTestConfig, namespace: &str) -> Res
         "iochaos",
         "podchaos",
         "networkchaos",
+        "timechaos",
         "stresschaos",
     ] {
         cleanup_managed_kind(config, namespace, kind)?;
@@ -146,6 +159,9 @@ pub fn cleanup_managed_stresschaos(config: &ClusterTestConfig, namespace: &str) 
 }
 
 fn cleanup_managed_kind(config: &ClusterTestConfig, namespace: &str, kind: &str) -> Result<()> {
+    if kind == "timechaos" && !timechaos_is_served(config)? {
+        return Ok(());
+    }
     let selector = format!("{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}");
     Kubectl::new(config)
         .namespaced(namespace)
@@ -159,6 +175,38 @@ fn cleanup_managed_kind(config: &ClusterTestConfig, namespace: &str, kind: &str)
         ])
         .run_checked()?;
     Ok(())
+}
+
+fn timechaos_is_served(config: &ClusterTestConfig) -> Result<bool> {
+    let output = Kubectl::new(config)
+        .command(["get", "--raw", "/apis/chaos-mesh.org/v1alpha1"])
+        .run_checked()?;
+    let discovery =
+        serde_json::from_str::<Value>(&output.stdout).context("parse Chaos Mesh API discovery")?;
+    discovery_serves_timechaos(&discovery)
+}
+
+fn discovery_serves_timechaos(discovery: &Value) -> Result<bool> {
+    ensure!(
+        discovery.get("kind").and_then(Value::as_str) == Some("APIResourceList")
+            && discovery.get("groupVersion").and_then(Value::as_str)
+                == Some("chaos-mesh.org/v1alpha1"),
+        "Chaos Mesh API discovery did not return its APIResourceList"
+    );
+    let resources = discovery
+        .get("resources")
+        .and_then(Value::as_array)
+        .context("Chaos Mesh API discovery has no resources array")?;
+    let mut served = false;
+    for resource in resources {
+        let name = resource
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .context("Chaos Mesh API discovery contains an invalid resource name")?;
+        served |= name == "timechaos";
+    }
+    Ok(served)
 }
 
 /// Bounds every label-selector cleanup delete so a chaos CR stuck on a
@@ -197,6 +245,16 @@ pub fn apply_networkchaos(
         &spec.namespace,
         spec.manifest(),
         "networkchaos",
+        &spec.name,
+    )
+}
+
+pub fn apply_timechaos(config: &ClusterTestConfig, spec: &TimeChaosSpec) -> Result<ChaosGuard> {
+    apply_manifest(
+        config,
+        &spec.namespace,
+        spec.manifest(),
+        "timechaos",
         &spec.name,
     )
 }
@@ -459,6 +517,39 @@ impl Drop for ChaosGuard {
                 kind = self.kind,
                 name = self.name,
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn timechaos_cleanup_skips_only_a_confirmed_unserved_resource() {
+        let mut discovery = serde_json::json!({
+            "kind": "APIResourceList", "groupVersion": "chaos-mesh.org/v1alpha1",
+            "resources": [{"name": "iochaos"}, {"name": "networkchaos"}]
+        });
+        assert!(!discovery_serves_timechaos(&discovery).expect("confirmed absent"));
+        discovery["resources"]
+            .as_array_mut()
+            .expect("resources")
+            .push(serde_json::json!({"name": "timechaos/status"}));
+        assert!(!discovery_serves_timechaos(&discovery).expect("subresource only"));
+        discovery["resources"]
+            .as_array_mut()
+            .expect("resources")
+            .push(serde_json::json!({"name": "timechaos"}));
+        assert!(discovery_serves_timechaos(&discovery).expect("served"));
+
+        for invalid in [
+            serde_json::json!({"kind": "Status", "reason": "Forbidden"}),
+            serde_json::json!({"kind": "APIResourceList", "groupVersion": "other/v1", "resources": []}),
+            serde_json::json!({"kind": "APIResourceList", "groupVersion": "chaos-mesh.org/v1alpha1"}),
+            serde_json::json!({"kind": "APIResourceList", "groupVersion": "chaos-mesh.org/v1alpha1", "resources": [{"kind": "TimeChaos"}]}),
+        ] {
+            assert!(discovery_serves_timechaos(&invalid).is_err());
         }
     }
 }

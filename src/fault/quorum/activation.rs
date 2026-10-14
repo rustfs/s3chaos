@@ -113,6 +113,8 @@ impl QuorumFaultActivationEvidence {
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
+        let same_pod =
+            self.scenario == crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO;
         ensure!(
             self.schema_version == ACTIVATION_SCHEMA_VERSION,
             "quorum activation evidence uses an unsupported schema version"
@@ -141,7 +143,8 @@ impl QuorumFaultActivationEvidence {
                     && !target.container_id.trim().is_empty()
                     && !target.persistent_volume_claim.trim().is_empty()
                     && !target.persistent_volume.trim().is_empty()
-                    && target.mount_path == self.volume_path
+                    && (target.mount_path == self.volume_path
+                        || (same_pod && target.mount_path.starts_with('/')))
                     && !target.drive_uuid.trim().is_empty()
                     && !target.controller_record_id.trim().is_empty()
                     && target.started_at_ms >= self.started_at_ms
@@ -150,23 +153,11 @@ impl QuorumFaultActivationEvidence {
             }),
             "quorum activation target identity, path, or timing is invalid"
         );
-        for values in [
-            self.targets
-                .iter()
-                .map(|target| target.pod_name.as_str())
-                .collect::<Vec<_>>(),
-            self.targets
-                .iter()
-                .map(|target| target.pod_uid.as_str())
-                .collect(),
-            self.targets
-                .iter()
-                .map(|target| target.container_id.as_str())
-                .collect(),
+        let mut unique_identities = vec![
             self.targets
                 .iter()
                 .map(|target| target.persistent_volume_claim.as_str())
-                .collect(),
+                .collect::<Vec<_>>(),
             self.targets
                 .iter()
                 .map(|target| target.persistent_volume.as_str())
@@ -183,7 +174,38 @@ impl QuorumFaultActivationEvidence {
                 .iter()
                 .map(|target| target.canary_path.as_str())
                 .collect(),
-        ] {
+        ];
+        if same_pod {
+            ensure!(
+                self.expected_targets == 2,
+                "same-Pod activation must expect two volumes"
+            );
+            if let [first, second] = self.targets.as_slice() {
+                ensure!(
+                    first.pod_name == second.pod_name
+                        && first.pod_uid == second.pod_uid
+                        && first.container_id == second.container_id
+                        && first.mount_path != second.mount_path,
+                    "same-Pod activation must exercise two distinct mounts on one container generation"
+                );
+            }
+        } else {
+            unique_identities.extend([
+                self.targets
+                    .iter()
+                    .map(|target| target.pod_name.as_str())
+                    .collect::<Vec<_>>(),
+                self.targets
+                    .iter()
+                    .map(|target| target.pod_uid.as_str())
+                    .collect(),
+                self.targets
+                    .iter()
+                    .map(|target| target.container_id.as_str())
+                    .collect(),
+            ]);
+        }
+        for values in unique_identities {
             ensure!(
                 values
                     .iter()
@@ -417,6 +439,120 @@ pub(crate) fn validate_runtime_provenance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_pod_activation_requires_independent_eio_on_both_mounts() {
+        let (_, _, proof) = crate::fault::quorum::same_pod_volume_proof_fixture();
+        let run_id = "same-pod-run";
+        let targets = proof
+            .bindings
+            .iter()
+            .enumerate()
+            .map(|(index, binding)| {
+                let path = quorum_canary_path(&binding.mount_path, &binding.pod_name, run_id);
+                QuorumFaultActivationTargetEvidence {
+                    pod_name: binding.pod_name.clone(),
+                    pod_uid: binding.pod_uid.clone(),
+                    container_id: binding.container_id.clone(),
+                    persistent_volume_claim: binding.persistent_volume_claim.clone(),
+                    persistent_volume: binding.persistent_volume.clone(),
+                    mount_path: binding.mount_path.clone(),
+                    drive_uuid: binding.drive_uuid.clone(),
+                    controller_record_id: format!(
+                        "same-pod-{index}/resource-{index}:faults/{}/rustfs",
+                        binding.pod_name
+                    ),
+                    canary_path: path.clone(),
+                    started_at_ms: 110,
+                    completed_at_ms: 2200,
+                    outcome: QuorumCanaryOutcome::IoErrorObserved,
+                    exit_code: Some(1),
+                    stdout: format!("s3chaos-canary-write-v1:{path}:1\n"),
+                    stderr: "write error: Input/output error".to_string(),
+                    probe: Some(crate::fault::quorum::probe::test_receipt(
+                        format!("{path}.operations"),
+                        probe_nonce(run_id, &binding.pod_uid, &binding.container_id),
+                        120,
+                    )),
+                    cleanup: None,
+                    probe_cleanup: None,
+                    continuity: None,
+                }
+            })
+            .collect();
+        let activation = QuorumFaultActivationEvidence {
+            schema_version: ACTIVATION_SCHEMA_VERSION,
+            scenario: crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO.to_string(),
+            run_id: run_id.to_string(),
+            backend: "chaos-mesh-iochaos".to_string(),
+            iochaos_resource_name: "same-pod-0,same-pod-1".to_string(),
+            iochaos_snapshot_sha256: "a".repeat(64),
+            volume_path: "/data/rustfs0".to_string(),
+            expected_targets: 2,
+            controller_records: 2,
+            started_at_ms: 100,
+            completed_at_ms: 3000,
+            qualified: true,
+            failure_reasons: vec![],
+            cleanup_failure_reason: None,
+            targets,
+        };
+        activation
+            .validate()
+            .expect("two proven mounts on one container");
+        assert_eq!(
+            activation.disposition(),
+            QuorumActivationDisposition::RunTypedOracle
+        );
+        assert_eq!(activation.selected_record_ids().len(), 2);
+        assert_eq!(activation.selected_containers().len(), 1);
+        for field in [
+            "pod",
+            "container",
+            "mount",
+            "pvc",
+            "record",
+            "probe",
+            "canary",
+        ] {
+            let mut changed = activation.clone();
+            match field {
+                "pod" => changed.targets[1].pod_name = "rustfs-2".to_string(),
+                "container" => {
+                    changed.targets[1].container_id = "containerd://replacement".to_string()
+                }
+                "mount" => changed.targets[1].mount_path = changed.targets[0].mount_path.clone(),
+                "pvc" => {
+                    changed.targets[1].persistent_volume_claim =
+                        changed.targets[0].persistent_volume_claim.clone()
+                }
+                "record" => {
+                    changed.targets[1].controller_record_id =
+                        changed.targets[0].controller_record_id.clone()
+                }
+                "probe" => changed.targets[1].probe = None,
+                "canary" => {
+                    changed.targets[1].outcome = QuorumCanaryOutcome::WriteSucceeded;
+                    changed.targets[1].exit_code = Some(0);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                changed.validate().is_err(),
+                "changed {field} cannot qualify"
+            );
+        }
+        let mut incomplete = activation.clone();
+        incomplete.targets.pop();
+        incomplete.qualified = incomplete.qualification();
+        incomplete
+            .validate()
+            .expect("unqualified partial evidence remains inspectable");
+        assert_eq!(
+            incomplete.disposition(),
+            QuorumActivationDisposition::SkipTypedOracleAndRecover
+        );
+    }
 
     #[test]
     fn transport_eio_is_not_disk_activation_evidence() {

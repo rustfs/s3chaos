@@ -1,0 +1,38 @@
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-metadata-shard-corruption
+workloadProfiles:
+  bounded-versioned-hot:
+    objects: 96
+    concurrency: 4
+    operationWeights:
+      put: 1
+      overwrite: 4
+      get: 1
+      list: 1
+      delete: 4
+      multipart: 1
+    payloadDistribution:
+      - sizeBytes: 4096
+        weight: 60
+      - sizeBytes: 65536
+        weight: 40
+    hotspot:
+      objectPercent: 10
+      operationPercent: 80
+budgets:
+  maxDuration: 90m
+  stopOnFirstFailure: true
+  continueOnSeverities: []
+  maxClientDisruptions: 200
+  recoveryStableWindowSeconds: 60
+observability:
+  chaosDashboard: disabled
+artifacts:
+  required: strict
+scenarios:
+  - name: metadata-shard-corruption
+    workloadProfile: bounded-versioned-hot
+    storageRecoveryCase: metadata-shard-corruption-admin-deep
+    faultDuration: 30m

@@ -227,6 +227,7 @@ pub struct S3WorkloadClient {
     client: Client,
     bucket: String,
     request_timeout: Duration,
+    request_deadline: Option<Instant>,
     mutation_deadline: Option<Instant>,
     mutation_max_attempts: u32,
 }
@@ -286,6 +287,8 @@ pub(crate) enum WriteProbeScope {
     PostRecovery,
     /// While a crashed node is still held down.
     NodeDown,
+    /// While two server groups cannot reach each other.
+    SplitBrain,
 }
 
 impl WriteProbeScope {
@@ -293,6 +296,7 @@ impl WriteProbeScope {
         match self {
             Self::PostRecovery => format!("fault-test-post-recovery/{run_id}/"),
             Self::NodeDown => format!("fault-test-node-down/{run_id}/"),
+            Self::SplitBrain => format!("fault-test-split-brain/{run_id}/"),
         }
     }
 
@@ -958,6 +962,7 @@ impl S3WorkloadClient {
             client: Client::from_conf(s3_config),
             bucket: bucket.into(),
             request_timeout,
+            request_deadline: None,
             mutation_deadline: None,
             mutation_max_attempts,
         })
@@ -990,11 +995,35 @@ impl S3WorkloadClient {
         client
     }
 
+    /// Bounds request headers and response-body reads to one absolute budget.
+    /// Completed and expired requests retain their terminal history record.
+    pub(crate) fn with_request_deadline(&self, deadline: Instant) -> Self {
+        let mut client = self.with_mutation_deadline(deadline);
+        client.request_deadline = Some(deadline);
+        client
+    }
+
+    fn bounded_request_timeout(&self) -> Duration {
+        self.request_deadline
+            .map_or(self.request_timeout, |deadline| {
+                self.request_timeout
+                    .min(deadline.saturating_duration_since(Instant::now()))
+            })
+    }
+
+    async fn read_request<F: Future>(&self, request: F) -> std::result::Result<F::Output, ()> {
+        let duration = self.bounded_request_timeout();
+        if duration.is_zero() {
+            return Err(());
+        }
+        timeout(duration, request).await.map_err(|_| ())
+    }
+
     async fn mutation_request<F: Future>(&self, request: F) -> std::result::Result<F::Output, ()> {
         let duration = self
             .mutation_deadline
-            .map_or(self.request_timeout, |deadline| {
-                self.request_timeout
+            .map_or(self.bounded_request_timeout(), |deadline| {
+                self.bounded_request_timeout()
                     .min(deadline.saturating_duration_since(Instant::now()))
             });
         if duration.is_zero() {
@@ -1012,7 +1041,7 @@ impl S3WorkloadClient {
             None,
         );
         let result = timeout(
-            self.request_timeout,
+            self.bounded_request_timeout(),
             self.client.create_bucket().bucket(&self.bucket).send(),
         )
         .await;
@@ -1121,7 +1150,7 @@ impl S3WorkloadClient {
             None,
         );
         let result = timeout(
-            self.request_timeout,
+            self.bounded_request_timeout(),
             self.client
                 .put_bucket_versioning()
                 .bucket(&self.bucket)
@@ -1187,6 +1216,15 @@ impl S3WorkloadClient {
             .result)
     }
 
+    pub(crate) async fn get_object_recorded_result(
+        &self,
+        key: &str,
+        recorder: &Recorder,
+    ) -> Result<RecordedGetObjectResult> {
+        self.get_object_result_inner(key, None, None, recorder)
+            .await
+    }
+
     pub async fn get_object_version_result(
         &self,
         key: &str,
@@ -1233,7 +1271,7 @@ impl S3WorkloadClient {
         record.range = Some(range);
         let end = range.offset + range.length - 1;
         let response = timeout(
-            self.request_timeout,
+            self.bounded_request_timeout(),
             self.client
                 .get_object()
                 .bucket(&self.bucket)
@@ -1276,7 +1314,7 @@ impl S3WorkloadClient {
             }
         };
 
-        let body = timeout(self.request_timeout, output.body.collect()).await;
+        let body = timeout(self.bounded_request_timeout(), output.body.collect()).await;
         match body {
             Ok(Ok(bytes)) => {
                 let body = bytes.into_bytes().to_vec();
@@ -1359,16 +1397,16 @@ impl S3WorkloadClient {
         let operation_id = record.id.clone();
         record.version_id = version_id.map(str::to_string);
         record.read_purpose = read_purpose;
-        let response = timeout(
-            self.request_timeout,
-            self.client
-                .get_object()
-                .bucket(&self.bucket)
-                .key(key)
-                .set_version_id(version_id.map(str::to_string))
-                .send(),
-        )
-        .await;
+        let response = self
+            .read_request(
+                self.client
+                    .get_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .set_version_id(version_id.map(str::to_string))
+                    .send(),
+            )
+            .await;
 
         let output = match response {
             Ok(Ok(output)) => output,
@@ -1409,7 +1447,7 @@ impl S3WorkloadClient {
             }
         };
 
-        let body = timeout(self.request_timeout, output.body.collect()).await;
+        let body = self.read_request(output.body.collect()).await;
         match body {
             Ok(Ok(bytes)) => {
                 let body = bytes.into_bytes().to_vec();
@@ -2002,7 +2040,7 @@ impl S3WorkloadClient {
             None,
         );
         let result = timeout(
-            self.request_timeout,
+            self.bounded_request_timeout(),
             self.client
                 .head_object()
                 .bucket(&self.bucket)
@@ -2061,7 +2099,7 @@ impl S3WorkloadClient {
             if let Some(token) = continuation_token.as_deref() {
                 request = request.continuation_token(token);
             }
-            let response = timeout(self.request_timeout, request.send()).await;
+            let response = timeout(self.bounded_request_timeout(), request.send()).await;
             let output = match response {
                 Ok(Ok(output)) => output,
                 Ok(Err(error)) => {
@@ -2135,7 +2173,7 @@ impl S3WorkloadClient {
                 .prefix(prefix)
                 .set_key_marker(key_marker.clone())
                 .set_version_id_marker(version_id_marker.clone());
-            let response = timeout(self.request_timeout, request.send()).await;
+            let response = timeout(self.bounded_request_timeout(), request.send()).await;
             let output = match response {
                 Ok(Ok(output)) => output,
                 Ok(Err(error)) => {
@@ -2308,6 +2346,85 @@ mod tests {
         WorkloadHotspot, WorkloadOperation, WorkloadOperationMix, WorkloadPayloadClass,
         WorkloadPayloadDistribution, WorkloadPlan, sha256_hex,
     };
+
+    #[tokio::test]
+    async fn absolute_read_deadline_finalizes_an_unsent_expired_get() {
+        use crate::fault::history::{OperationOutcome, Recorder};
+        let client = super::S3WorkloadClient::new_without_retries(
+            "http://127.0.0.1:1",
+            "bucket",
+            "test-access",
+            "test-secret",
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("client")
+        .with_request_deadline(tokio::time::Instant::now());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history = Recorder::create(
+            dir.path().join("history.jsonl"),
+            "credential-rotation-mid-load",
+            "run-1",
+        )
+        .expect("history");
+        let result = client
+            .get_object_recorded_result("key", &history)
+            .await
+            .expect("finalized get");
+        assert_eq!(result.result.outcome, OperationOutcome::Timeout);
+        let records = history.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, result.operation_id);
+        assert_eq!(records[0].outcome, OperationOutcome::Timeout);
+        assert!(records[0].ended_sequence.is_some());
+    }
+
+    #[tokio::test]
+    async fn read_body_does_not_receive_a_fresh_budget_after_headers() {
+        use crate::fault::history::{OperationOutcome, Recorder};
+        use axum::{Router, body::Body, http::StatusCode, routing::any};
+        let app = Router::new().fallback(any(|| async {
+            let body = Body::from_stream(futures::stream::once(async {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                Ok::<_, std::io::Error>("committed bytes")
+            }));
+            (StatusCode::OK, [("content-length", "15")], body)
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.expect("server") });
+        let client = super::S3WorkloadClient::new_without_retries(
+            endpoint,
+            "bucket",
+            "test-access",
+            "test-secret",
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("client")
+        .with_request_deadline(tokio::time::Instant::now() + std::time::Duration::from_millis(250));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history = Recorder::create(
+            dir.path().join("history.jsonl"),
+            "credential-rotation-mid-load",
+            "run-1",
+        )
+        .expect("history");
+        let started = tokio::time::Instant::now();
+        let result = client
+            .get_object_recorded_result("key", &history)
+            .await
+            .expect("finalized get");
+        assert_eq!(result.result.outcome, OperationOutcome::Timeout);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let records = history.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, result.operation_id);
+        assert!(records[0].ended_sequence.is_some());
+        server.abort();
+    }
 
     #[tokio::test]
     async fn mutation_history_counts_transmissions_instead_of_the_retry_ceiling() {

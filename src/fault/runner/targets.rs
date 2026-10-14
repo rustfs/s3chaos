@@ -17,13 +17,13 @@ use crate::{
     fault::{
         backends::chaos_mesh,
         config::FaultTestConfig,
-        plan::{FaultKind, FaultPlan, FaultSelection},
+        plan::{FaultInjection, FaultKind, FaultPlan, FaultSelection},
         pods::{fixed_volume_container_ids, rustfs_pod_identities, rustfs_target_inventory},
         preflight::{TargetProof, TargetResolvedPodProof, target_pod_has_fixed_volume},
         quorum::{
             ErasureSetHealth, ErasureSetMember, ErasureSetMembership, ErasureSetShape,
             QuorumDriveHealth, QuorumHealthObservation, QuorumVolumeBinding, QuorumVolumeBoundary,
-            QuorumVolumeTargetProof,
+            QuorumVolumeTargetProof, SamePodVolumeTargetProof,
         },
         reporting::{FaultStatusSnapshot, PodIdentity},
     },
@@ -53,6 +53,7 @@ pub(crate) struct ObservedErasureSet {
     pub(crate) health: ErasureSetHealth,
     pub(crate) membership: ErasureSetMembership,
     pub(crate) observed_at_ms: u64,
+    pub(crate) drive_paths: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -154,6 +155,12 @@ async fn observe_single_erasure_set_topology(
     )
     .context("RustFS runtime erasure set is not fully online before fault injection")?;
     let membership = runtime_single_set_membership(&runtime, &shape, pods)?;
+    let drive_paths = runtime
+        .servers
+        .iter()
+        .flat_map(|server| &server.drives)
+        .map(|drive| (drive.uuid.clone(), drive.path.clone()))
+        .collect();
     Ok(ObservedErasureSet {
         source: "rustfs-admin-server-info",
         deployment_id: runtime.deployment_id,
@@ -161,6 +168,7 @@ async fn observe_single_erasure_set_topology(
         health,
         membership,
         observed_at_ms,
+        drive_paths,
     })
 }
 
@@ -218,6 +226,12 @@ pub(crate) async fn require_volume_quorum_topology(
         bind_runtime_drives_to_volumes(&shape, &membership, resolved_pods, volume_path)?;
     let volume_quorum =
         QuorumVolumeTargetProof::from_runtime(&shape, &membership, boundary, candidates)?;
+    let drive_paths = runtime
+        .servers
+        .iter()
+        .flat_map(|server| &server.drives)
+        .map(|drive| (drive.uuid.clone(), drive.path.clone()))
+        .collect();
     Ok(ObservedVolumeQuorum {
         topology: ObservedErasureSet {
             source: "rustfs-admin-server-info",
@@ -226,9 +240,80 @@ pub(crate) async fn require_volume_quorum_topology(
             health,
             membership,
             observed_at_ms,
+            drive_paths,
         },
         volume_quorum,
     })
+}
+
+pub(super) async fn require_same_pod_volume_topology(
+    config: &FaultTestConfig,
+    endpoint: &str,
+    access_key: &str,
+    secret_key: &str,
+    injection: &FaultInjection,
+    resolved_pods: &[TargetResolvedPodProof],
+) -> Result<(ObservedErasureSet, SamePodVolumeTargetProof)> {
+    let identities = resolved_pods
+        .iter()
+        .map(|pod| PodIdentity {
+            name: pod.name.clone(),
+            uid: pod.uid.clone(),
+        })
+        .collect::<Vec<_>>();
+    let topology = observe_single_erasure_set_topology(
+        config,
+        endpoint,
+        access_key,
+        secret_key,
+        &identities,
+        "same-Pod two-volume topology proof",
+    )
+    .await?;
+    let pod = resolved_pods
+        .iter()
+        .max_by(|left, right| left.name.cmp(&right.name))
+        .context("same-Pod volume proof has no Ready Pod")?;
+    let member = topology
+        .membership
+        .members
+        .iter()
+        .find(|member| member.pod_name == pod.name)
+        .context("selected Pod is absent from runtime membership")?;
+    let paths = injection.same_pod_volume_paths()?;
+    let mut bindings = Vec::new();
+    for path in paths {
+        let matching = member
+            .shard_ids
+            .iter()
+            .filter(|uuid| {
+                topology
+                    .drive_paths
+                    .get(*uuid)
+                    .is_some_and(|runtime_path| runtime_path == path)
+            })
+            .collect::<Vec<_>>();
+        let [uuid] = matching.as_slice() else {
+            bail!("same-Pod mount {path:?} must match exactly one healthy runtime drive path")
+        };
+        bindings.push(bind_runtime_drive_to_mount(
+            &topology.shape,
+            pod,
+            path,
+            uuid,
+        )?);
+    }
+    let proof = SamePodVolumeTargetProof {
+        runtime_drive_paths: bindings
+            .iter()
+            .map(|binding| (binding.drive_uuid.clone(), binding.mount_path.clone()))
+            .collect(),
+        bindings: bindings
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("same-Pod proof needs exactly two volumes"))?,
+    };
+    proof.validate(&topology.shape, &topology.membership)?;
+    Ok((topology, proof))
 }
 
 pub(super) async fn observe_volume_quorum_health(
@@ -329,65 +414,77 @@ fn bind_runtime_drives_to_volumes(
             let pod = pods.get(member.pod_name.as_str()).with_context(|| {
                 format!("runtime drive member Pod {:?} has no resolved Kubernetes proof", member.pod_name)
             })?;
-            ensure!(
-                pod.ready && target_pod_has_fixed_volume(pod, volume_path),
-                "Pod {:?} lacks the Ready Pod/container/PVC/PV/mount proof required for volume quorum",
-                pod.name
-            );
-            let matching_mounts = pod
-                .volume_mounts
-                .iter()
-                .filter(|mount| mount.container_name == "rustfs" && mount.mount_path == volume_path)
-                .collect::<Vec<_>>();
-            let [mount] = matching_mounts.as_slice() else {
-                bail!(
-                    "Pod {:?} must expose exactly one RustFS mount at {volume_path:?}",
-                    pod.name
-                )
-            };
-            let claim_name = mount
-                .persistent_volume_claim
-                .as_deref()
-                .context("RustFS target mount is not backed by a PVC")?;
-            let matching_claims = pod
-                .persistent_volume_claims
-                .iter()
-                .filter(|claim| claim.name == claim_name)
-                .collect::<Vec<_>>();
-            let [claim] = matching_claims.as_slice() else {
-                bail!("Pod {:?} target mount must resolve to exactly one PVC", pod.name)
-            };
-            let pv = claim
-                .persistent_volume
-                .as_ref()
-                .context("RustFS target PVC has no bound PV proof")?;
-            ensure!(
-                claim.volume_name.as_deref() == Some(pv.name.as_str()),
-                "Pod {:?} target PVC/PV names are inconsistent",
-                pod.name
-            );
             let [drive_uuid] = member.shard_ids.as_slice() else {
                 bail!(
                     "Pod {:?} must own exactly one runtime drive UUID for one-volume-per-server proof",
                     pod.name
                 )
             };
-            Ok(QuorumVolumeBinding {
-                pod_name: pod.name.clone(),
-                pod_uid: pod.uid.clone(),
-                container_id: pod
-                    .rustfs_container_id
-                    .clone()
-                    .context("RustFS target Pod has no container ID")?,
-                mount_path: mount.mount_path.clone(),
-                persistent_volume_claim: claim.name.clone(),
-                persistent_volume: pv.name.clone(),
-                drive_uuid: drive_uuid.clone(),
-                pool_index: shape.pool_index,
-                set_index: shape.set_index,
-            })
+            bind_runtime_drive_to_mount(shape, pod, volume_path, drive_uuid)
         })
         .collect()
+}
+
+fn bind_runtime_drive_to_mount(
+    shape: &ErasureSetShape,
+    pod: &TargetResolvedPodProof,
+    volume_path: &str,
+    drive_uuid: &str,
+) -> Result<QuorumVolumeBinding> {
+    ensure!(
+        pod.ready && target_pod_has_fixed_volume(pod, volume_path),
+        "Pod {:?} lacks its Ready container/PVC/PV/mount proof at {volume_path:?}",
+        pod.name
+    );
+    let matching_mounts = pod
+        .volume_mounts
+        .iter()
+        .filter(|mount| mount.container_name == "rustfs" && mount.mount_path == volume_path)
+        .collect::<Vec<_>>();
+    let [mount] = matching_mounts.as_slice() else {
+        bail!(
+            "Pod {:?} must expose exactly one RustFS mount at {volume_path:?}",
+            pod.name
+        )
+    };
+    let claim_name = mount
+        .persistent_volume_claim
+        .as_deref()
+        .context("RustFS target mount is not PVC-backed")?;
+    let matching_claims = pod
+        .persistent_volume_claims
+        .iter()
+        .filter(|claim| claim.name == claim_name)
+        .collect::<Vec<_>>();
+    let [claim] = matching_claims.as_slice() else {
+        bail!(
+            "Pod {:?} target mount must resolve to exactly one PVC",
+            pod.name
+        )
+    };
+    let pv = claim
+        .persistent_volume
+        .as_ref()
+        .context("RustFS target PVC has no bound PV proof")?;
+    ensure!(
+        claim.volume_name.as_deref() == Some(pv.name.as_str()),
+        "Pod {:?} target PVC/PV names differ",
+        pod.name
+    );
+    Ok(QuorumVolumeBinding {
+        pod_name: pod.name.clone(),
+        pod_uid: pod.uid.clone(),
+        container_id: pod
+            .rustfs_container_id
+            .clone()
+            .context("RustFS target Pod has no container ID")?,
+        mount_path: mount.mount_path.clone(),
+        persistent_volume_claim: claim.name.clone(),
+        persistent_volume: pv.name.clone(),
+        drive_uuid: drive_uuid.to_string(),
+        pool_index: shape.pool_index,
+        set_index: shape.set_index,
+    })
 }
 
 fn runtime_single_set_membership(
@@ -572,6 +669,87 @@ pub(super) fn require_active_fixed_volume_targets(
     target_proof: &TargetProof,
     snapshots: &[FaultStatusSnapshot],
 ) -> Result<FixedVolumeTargets> {
+    if scenario == crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO {
+        let erasure = target_proof
+            .faults
+            .iter()
+            .find_map(|fault| fault.erasure_set.as_ref())
+            .context("same-Pod target proof lacks erasure evidence")?;
+        let volumes = erasure
+            .same_pod_volumes
+            .as_ref()
+            .context("same-Pod target proof lacks two volume bindings")?;
+        volumes.validate(
+            erasure
+                .shape
+                .as_ref()
+                .context("same-Pod geometry missing")?,
+            erasure
+                .membership
+                .as_ref()
+                .context("same-Pod runtime membership missing")?,
+        )?;
+        target_proof.validate_volume_bindings(&volumes.bindings, true)?;
+        let inventory = rustfs_target_inventory(&config.cluster, true, true)?;
+        ensure!(
+            unique_runtime_pod_identities("same-Pod active RustFS Pods", &inventory.identities)?
+                == unique_runtime_pod_identities("same-Pod pre-fault RustFS Pods", pods_before)?,
+            "RustFS Pod generation changed while both volume faults were active"
+        );
+        let mut current = target_proof.clone();
+        current.resolved_pods = inventory.pod_proofs;
+        validate_same_pod_runtime_generations(target_proof, &current, volumes)?;
+        let resources = snapshots
+            .iter()
+            .map(|snapshot| {
+                ensure!(
+                    snapshot.resource_kind.as_deref() == Some("iochaos"),
+                    "same-Pod snapshot is not IOChaos"
+                );
+                let resource = snapshot
+                    .chaos_status
+                    .as_ref()
+                    .context("same-Pod snapshot lacks its resource")?;
+                ensure!(
+                    snapshot.resource_name.as_deref()
+                        == resource
+                            .pointer("/metadata/name")
+                            .and_then(serde_json::Value::as_str),
+                    "same-Pod snapshot resource name differs"
+                );
+                Ok(resource)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let runtime = chaos_mesh::volume_fault_runtime_contract(injection, scenario)?;
+        let records = chaos_mesh::validate_same_pod_volume_resources(
+            &resources,
+            volumes,
+            &chaos_mesh::VolumeTargetEvidenceContract {
+                chaos_namespace: &config.chaos_namespace,
+                target_namespace: &config.cluster.test_namespace,
+                tenant: &config.cluster.tenant_name,
+                run_id,
+                scenario,
+                volume_path: injection.rustfs_volume_path()?,
+                path: None,
+                exact_pod_names: None,
+                expected_targets: 1,
+                candidate_pod_ids: &BTreeSet::new(),
+                runtime: &runtime,
+            },
+        )?;
+        return Ok(FixedVolumeTargets {
+            pods: vec![PodIdentity {
+                name: volumes.bindings[0].pod_name.clone(),
+                uid: volumes.bindings[0].pod_uid.clone(),
+            }],
+            records: records.into_values().collect(),
+            containers: BTreeMap::from([(
+                volumes.bindings[0].pod_name.clone(),
+                volumes.bindings[0].container_id.clone(),
+            )]),
+        });
+    }
     let expected_targets = match injection.selection() {
         FaultSelection::FixedTargets(count) => count,
         FaultSelection::Percent(_) | FaultSelection::RuntimeQuorum(_) => {
@@ -698,6 +876,45 @@ pub(super) fn require_active_fixed_volume_targets(
         records: record_ids,
         containers,
     })
+}
+
+fn validate_same_pod_runtime_generations(
+    original: &TargetProof,
+    current: &TargetProof,
+    volumes: &SamePodVolumeTargetProof,
+) -> Result<()> {
+    original.validate_volume_bindings(&volumes.bindings, true)?;
+    current.validate_volume_bindings(&volumes.bindings, false)?;
+    for binding in &volumes.bindings {
+        let baseline = original
+            .resolved_pods
+            .iter()
+            .find(|pod| pod.name == binding.pod_name)
+            .context("same-Pod target generation missing")?;
+        let observed = current
+            .resolved_pods
+            .iter()
+            .find(|pod| pod.name == binding.pod_name)
+            .context("same-Pod current generation missing")?;
+        let original_claim = baseline
+            .persistent_volume_claims
+            .iter()
+            .find(|claim| claim.name == binding.persistent_volume_claim)
+            .context("same-Pod original PVC missing")?;
+        let current_claim = observed
+            .persistent_volume_claims
+            .iter()
+            .find(|claim| claim.name == binding.persistent_volume_claim)
+            .context("same-Pod current PVC missing")?;
+        ensure!(
+            baseline.node == observed.node
+                && original_claim.uid == current_claim.uid
+                && original_claim.persistent_volume.as_ref().map(|pv| &pv.uid)
+                    == current_claim.persistent_volume.as_ref().map(|pv| &pv.uid),
+            "same-Pod PVC/PV or node generation changed during the workload"
+        );
+    }
+    Ok(())
 }
 
 fn unique_runtime_pod_identities(
@@ -1002,6 +1219,96 @@ mod tests {
     }
 
     #[test]
+    fn same_pod_active_identity_allows_readiness_change_and_rejects_replacement() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO.to_string();
+        let scenario = FaultScenario::from_config(&config).expect("same-Pod scenario");
+        let catalog = scenario_spec(&scenario.name).expect("catalog");
+        let plan = FaultPlan::from_scenario(&scenario, catalog).expect("same-Pod plan");
+        let (_, _, volumes) = crate::fault::quorum::same_pod_volume_proof_fixture();
+        let mut selected = volume_pod(3);
+        selected.uid = "pod-uid-3".to_string();
+        selected.volume_mounts = volumes
+            .bindings
+            .iter()
+            .map(|binding| TargetVolumeMountProof {
+                container_name: "rustfs".to_string(),
+                mount_path: binding.mount_path.clone(),
+                volume_name: binding.persistent_volume_claim.clone(),
+                persistent_volume_claim: Some(binding.persistent_volume_claim.clone()),
+            })
+            .collect();
+        selected.persistent_volume_claims = volumes
+            .bindings
+            .iter()
+            .enumerate()
+            .map(|(index, binding)| TargetPersistentVolumeClaimProof {
+                name: binding.persistent_volume_claim.clone(),
+                uid: format!("pvc-uid-3-{index}"),
+                volume_name: Some(binding.persistent_volume.clone()),
+                storage_class: Some("fast-csi".to_string()),
+                persistent_volume: Some(TargetPersistentVolumeProof {
+                    name: binding.persistent_volume.clone(),
+                    uid: format!("pv-uid-3-{index}"),
+                    source: Some("csi".to_string()),
+                    required_node_affinity: None,
+                    node: None,
+                    device_or_path: Some(format!("csi://3-{index}")),
+                }),
+            })
+            .collect();
+        let original = crate::fault::preflight::TargetProof::from_plan(
+            &config, &scenario, catalog, &plan, "run-1",
+        )
+        .with_resolved_pod_proofs([selected]);
+        let mut current = original.clone();
+        current.resolved_pods[0].ready = false;
+        super::validate_same_pod_runtime_generations(&original, &current, &volumes)
+            .expect("unchanged running container during EIO");
+        assert!(
+            current
+                .validate_volume_bindings(&volumes.bindings, true)
+                .is_err(),
+            "baseline still requires Ready"
+        );
+        for field in [
+            "pod",
+            "container",
+            "not_running",
+            "pvc",
+            "pv",
+            "mount",
+            "node",
+        ] {
+            let mut changed = current.clone();
+            let pod = &mut changed.resolved_pods[0];
+            match field {
+                "pod" => pod.uid = "replacement-pod".to_string(),
+                "container" => {
+                    pod.rustfs_container_id = Some("containerd://replacement".to_string())
+                }
+                "not_running" => pod.rustfs_container_id = None,
+                "pvc" => pod.persistent_volume_claims[1].uid = "replacement-pvc".to_string(),
+                "pv" => {
+                    pod.persistent_volume_claims[1]
+                        .persistent_volume
+                        .as_mut()
+                        .expect("PV")
+                        .uid = "replacement-pv".to_string()
+                }
+                "mount" => pod.volume_mounts[1].mount_path = "/data/unproved".to_string(),
+                "node" => pod.node = Some("replacement-node".to_string()),
+                _ => unreachable!(),
+            }
+            assert!(
+                super::validate_same_pod_runtime_generations(&original, &changed, &volumes)
+                    .is_err(),
+                "changed {field}"
+            );
+        }
+    }
+
+    #[test]
     fn legacy_io_percent_is_one_volume_with_partial_io_sampling() {
         let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
         config.scenario = IO_EIO_SCENARIO.to_string();
@@ -1144,6 +1451,7 @@ mod tests {
                 endpoint: format!("http://rustfs-{index}.rustfs.test.svc:9000"),
                 drives: (0..2)
                     .map(|drive| RustfsDriveLayout {
+                        path: format!("/data/rustfs{drive}"),
                         uuid: format!("drive-{index}-{drive}"),
                         state: "ok".to_string(),
                         pool_index: 0,

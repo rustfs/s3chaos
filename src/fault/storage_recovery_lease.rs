@@ -79,8 +79,10 @@ impl StorageRecoveryCleanupProof {
                         context.case,
                         StorageRecoveryCase::FreshVolumeReplacementAutomaticReplacement
                             | StorageRecoveryCase::FreshVolumeReplacementAdminDeep
+                            | StorageRecoveryCase::FreshVolumeReplacementPartitionDuringHeal
                             | StorageRecoveryCase::OnDiskBitrotAutomaticScanner
                             | StorageRecoveryCase::OnDiskBitrotAdminDeep
+                            | StorageRecoveryCase::MetadataShardCorruptionAdminDeep
                             | StorageRecoveryCase::StaleDiskReturn
                     ) && *observed_at_ms
                         >= context.exclusive_access.kubernetes_lease.acquired_at_ms,
@@ -98,6 +100,7 @@ impl StorageRecoveryCleanupProof {
                         context.case,
                         StorageRecoveryCase::OnDiskBitrotAutomaticScanner
                             | StorageRecoveryCase::OnDiskBitrotAdminDeep
+                            | StorageRecoveryCase::MetadataShardCorruptionAdminDeep
                     ),
                     "bitrot cleanup proof is bound to another recovery case"
                 );
@@ -137,6 +140,7 @@ impl StorageRecoveryCleanupProof {
                         context.case,
                         StorageRecoveryCase::OnDiskBitrotAutomaticScanner
                             | StorageRecoveryCase::OnDiskBitrotAdminDeep
+                            | StorageRecoveryCase::MetadataShardCorruptionAdminDeep
                     ),
                     "bitrot superseded cleanup proof is bound to another recovery case"
                 );
@@ -227,11 +231,7 @@ impl StorageRecoveryCleanupProof {
                 observed_at_ms,
             } => {
                 ensure!(
-                    matches!(
-                        context.case,
-                        StorageRecoveryCase::FreshVolumeReplacementAutomaticReplacement
-                            | StorageRecoveryCase::FreshVolumeReplacementAdminDeep
-                    ),
+                    context.case.is_fresh_volume_replacement(),
                     "fresh-volume cleanup proof is bound to another recovery case"
                 );
                 validate_receipt_operation(

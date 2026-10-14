@@ -460,6 +460,7 @@ mod tests {
                 .map(|index| RustfsServerLayout {
                     endpoint: format!("http://rustfs-{index}.rustfs:9000"),
                     drives: vec![RustfsDriveLayout {
+                        path: "/data/rustfs0".to_string(),
                         uuid: format!("drive-{index}"),
                         state: "ok".to_string(),
                         pool_index: 0,

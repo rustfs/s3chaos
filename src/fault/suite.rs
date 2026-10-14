@@ -529,7 +529,9 @@ impl ResolvedFaultSuiteScenario {
                 == matches!(
                     scenario.name.as_str(),
                     crate::fault::scenarios::FRESH_VOLUME_REPLACEMENT_SCENARIO
+                        | crate::fault::scenarios::NETWORK_PARTITION_DURING_HEAL_SCENARIO
                         | ON_DISK_BITROT_SCENARIO
+                        | crate::fault::scenarios::METADATA_SHARD_CORRUPTION_SCENARIO
                 ),
             "scenario {} requires storageRecoveryCase exactly for storage recovery",
             scenario.name
@@ -998,6 +1000,14 @@ scenarios:
                 "../../fault/examples/quorum-reliability.yaml"
             ))
             .expect("quorum suite yaml"),
+            serde_yaml_ng::from_str::<FaultSuite>(include_str!(
+                "../../fault/examples/network-clock.yaml"
+            ))
+            .expect("network clock suite yaml"),
+            serde_yaml_ng::from_str::<FaultSuite>(include_str!(
+                "../../fault/examples/io-eio-same-pod-two-volumes.yaml"
+            ))
+            .expect("same-Pod volume suite yaml"),
         ];
         let expected_profiles = focused
             .iter()
@@ -1018,7 +1028,7 @@ scenarios:
                 .iter()
                 .map(|scenario| scenario.repetitions)
                 .sum::<usize>(),
-            25
+            29
         );
         assert!(
             suite.scenarios.iter().all(|scenario| {
@@ -1620,7 +1630,12 @@ scenarios:
 
     #[test]
     fn storage_suites_require_case_budget_and_one_attempt() {
-        for name in ["fresh-volume-replacement-automatic", "on-disk-bitrot"] {
+        for name in [
+            "fresh-volume-replacement-automatic",
+            "on-disk-bitrot",
+            "metadata-shard-corruption",
+            "network-partition-during-heal",
+        ] {
             let suite =
                 FaultSuite::from_yaml_path(format!("fault/examples/{name}.yaml")).expect("suite");
             let mut missing_case = suite.clone();
@@ -1654,7 +1669,7 @@ scenarios:
     }
 
     #[test]
-    fn executable_bitrot_templates_resolve_both_cases() {
+    fn executable_corruption_templates_preserve_selected_cases() {
         for (yaml, expected_case) in [
             (
                 include_str!("../../fault/examples/on-disk-bitrot.yaml"),
@@ -1664,11 +1679,15 @@ scenarios:
                 include_str!("../../fault/examples/on-disk-bitrot-admin-deep.yaml"),
                 StorageRecoveryCase::OnDiskBitrotAdminDeep,
             ),
+            (
+                include_str!("../../fault/examples/metadata-shard-corruption.yaml"),
+                StorageRecoveryCase::MetadataShardCorruptionAdminDeep,
+            ),
         ] {
             let suite = serde_yaml_ng::from_str::<FaultSuite>(yaml)
                 .expect("planned on-disk-bitrot suite syntax");
             assert_eq!(suite.scenarios.len(), 1);
-            assert_eq!(suite.scenarios[0].name, ON_DISK_BITROT_SCENARIO);
+            assert_eq!(suite.scenarios[0].name, expected_case.scenario());
             assert_eq!(
                 suite.scenarios[0].storage_recovery_case,
                 Some(expected_case)
@@ -1677,6 +1696,41 @@ scenarios:
             let resolved = suite.resolve().expect("executable bitrot suite");
             assert_eq!(resolved.scenarios[0].execution_type, "storage-recovery");
             assert!(resolved.scenarios[0].requires_static_storage);
+        }
+    }
+
+    #[test]
+    fn focused_storage_fault_suites_keep_bounded_workloads_and_deadlines() {
+        for (yaml, objects, concurrency, fault_seconds, budget_seconds) in [
+            (
+                include_str!("../../fault/examples/io-eio-same-pod-two-volumes.yaml"),
+                600,
+                30,
+                480,
+                1800,
+            ),
+            (
+                include_str!("../../fault/examples/metadata-shard-corruption.yaml"),
+                96,
+                4,
+                1800,
+                5400,
+            ),
+        ] {
+            let suite = serde_yaml_ng::from_str::<FaultSuite>(yaml).expect("focused suite YAML");
+            let resolved = suite.resolve().expect("bounded focused suite");
+            assert_eq!(resolved.scenarios.len(), 1);
+            let scenario = &resolved.scenarios[0];
+            let workload = scenario.workload.as_ref().expect("explicit workload");
+            assert_eq!(workload.objects, Some(objects));
+            assert_eq!(workload.concurrency, Some(concurrency));
+            assert_eq!(scenario.fault_duration_seconds, Some(fault_seconds));
+            assert_eq!(resolved.budgets.max_duration_seconds, Some(budget_seconds));
+            if scenario.storage_recovery_case.is_some() {
+                assert!(workload.operation_weights.is_some());
+                assert!(workload.payload_distribution.is_some());
+                assert!(workload.hotspot.is_some());
+            }
         }
     }
 
@@ -2050,6 +2104,10 @@ scenarios:
             (
                 "fault/examples/fresh-volume-replacement-admin-deep.yaml",
                 crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementAdminDeep,
+            ),
+            (
+                "fault/examples/network-partition-during-heal.yaml",
+                crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementPartitionDuringHeal,
             ),
         ] {
             let suite = FaultSuite::from_yaml_path(path)

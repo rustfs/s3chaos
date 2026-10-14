@@ -1,0 +1,25 @@
+apiVersion: rustfs.com/s3chaos/v1alpha1
+kind: FaultSuite
+metadata:
+  name: rustfs-io-eio-same-pod-two-volumes
+workloadProfiles:
+  bounded:
+    objects: 600
+    concurrency: 30
+budgets:
+  maxDuration: 30m
+  stopOnFirstFailure: true
+  continueOnSeverities: []
+  maxClientDisruptions: 200
+  recoveryStableWindowSeconds: 60
+observability:
+  chaosDashboard: optional
+artifacts:
+  required: strict
+scenarios:
+  - name: io-eio-same-pod-two-volumes
+    workloadProfile: bounded
+    params:
+      kind: samePodIo
+      secondVolumePath: /data/rustfs1
+    faultDuration: 8m

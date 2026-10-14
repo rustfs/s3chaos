@@ -8,8 +8,8 @@ matrix maps the local `C-*` ids onto the typed catalog in
 backends that can actually apply them.
 
 `Planned` entries are visible in `fault-catalog-json` and are rejected by
-ordinary preflight. The six Mac Mini rows marked Planned below are not
-qualification cases: `make fault-qualify-list` does not select them.
+ordinary preflight. Executable status identifies available execution code;
+live qualification remains specific to the candidate image and prepared layout.
 `Deferred` rows have no catalog scenario.
 
 Peer A/B against Pigsty SILO or MinIO is an optional offline lab procedure.
@@ -32,21 +32,21 @@ time-to-baseline are what `warp-powerloss-metrics.json` records.
 | C-DISK-04 full | `disk-full` | Covered |
 | C-DISK-05 remount read-only | `io-read-only` | Partial. IOChaos returns `EROFS` (errno 30) on `WRITE`. It does not remount the volume. |
 | C-DISK-06 slow disk | `io-latency` | Covered |
-| C-DISK-07 two volumes, one Pod, one erasure set | `io-eio-same-pod-two-volumes` | Planned. `assess_same_pod_two_volume_geometry` fails closed. The runner still binds one volume per server. |
+| C-DISK-07 two volumes, one Pod, one erasure set | `io-eio-same-pod-two-volumes` | Executable. A four-server/two-volume fixture binds two authenticated same-set mounts on one exact Pod generation; separate IOChaos resources and native syscall receipts prove both EIO faults. |
 | C-PROC-01 crash storm | `pod-restart-storm` | Covered. Chaos Mesh `Schedule` kills the highest-ordinal Pod every 15s. Activation is one kill plus the schedule staying armed. |
 | C-PROC-02 OOM | `stress-memory` | Partial. Memory pressure, not a cgroup `OOMKilled` proof. |
 | C-PROC-03 CPU | `stress-cpu` | Covered |
 | C-PROC-04 FD exhaustion | none | Deferred. No catalog entry. |
-| C-TIME-01 clock skew | `clock-skew` | Planned. TimeChaos is not wired. |
-| C-CERT-01 credential rotation mid-load | `credential-rotation-mid-load` | Planned. No rotation actuator. |
-| C-TOPO-01 split-brain dual partition | `network-split-brain` | Planned. Overlapping selectors isolate selected Pods from each other instead of leaving two live pairs. |
+| C-TIME-01 clock skew | `clock-skew` | Executable TimeChaos. The already-running RustFS process must expose the requested HTTP Date shift and restoration, with an unchanged control Pod. |
+| C-CERT-01 credential rotation mid-load | `credential-rotation-mid-load` | Executable for a run-owned IAM access key. Workload overlap, per-Pod old-key rejection and new-key success, full version checking, and owned-user cleanup are required. TLS certificates remain outside this executor. |
+| C-TOPO-01 split-brain dual partition | `network-split-brain` | Executable for two live pairs in one four-Pod erasure set. Complementary selectors, cross-group TCP failure, within-group connectivity and quorum-unavailable PUT/committed-read probes are required. |
 | C-TOPO-02 rolling restart | `rolling-restart-all` | Covered |
 | C-TOPO-03 2/4 quorum loss | `pod-failure-quorum-edge`, `network-partition-write-quorum-loss` | Covered |
 | C-TOPO-04 cold restart | `cluster-cold-restart` | Covered |
-| C-META-01/02/03 metadata corruption | `metadata-shard-corruption` | Planned. Distinct from object-shard `on-disk-bitrot`. |
+| C-META-01/02/03 metadata corruption | `metadata-shard-corruption` | Executable for the inspected owned object-version `xl.meta` header. Receipt-bound mutation, unchanged data shard, journal recovery, AdminDeep heal and causal repaired-drive reads are required. Bucket/system metadata and arbitrary byte targets are outside this scope. |
 | C-LOAD-01 Warp under power loss | `warp-under-chaos` | Partial. `warp-powerloss-metrics.json` records in-run baseline ops/s, degraded ops/s, drop percent, fault-window error percent, and time-to-baseline (REACHED or NOT_REACHED). Node ready lag is `NOT_APPLICABLE` because the campaign is IOChaos EIO, not a node stop. Peer compare is `not-in-ci`. `NOT_REACHED` does not fail the run. |
 | C-LOAD-02 disk fault during multipart PUT | `io-eio-during-multipart` | Covered. Same single-volume EIO proof as `io-eio`, with the multipart-heavy workload profile. |
-| C-LOAD-03 partition during heal | `network-partition-during-heal` | Planned. Heal progress is recorded inside storage-recovery workflows and is not composable with NetworkChaos. |
+| C-LOAD-03 partition during heal | `network-partition-during-heal` | Executable replacement/AdminDeep case. Moving owned-token progress triggers isolation of the replacement Pod, with actual Pod-network probes, bounded nonterminal heal/read overlap, restoration and full repaired-drive verification. |
 
 `fault/examples/warp-powerloss.yaml` is the suite that runs `warp-under-chaos`
 for the metrics artifact. `fault/examples/chaos-mesh.yaml` includes the new

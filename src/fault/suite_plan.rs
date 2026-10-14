@@ -448,6 +448,19 @@ impl FaultSuitePlan {
                         attempt.scenario
                     );
                 }
+                Some(FaultRunExecutionSpec::CredentialRotation {
+                    operation_timeout_seconds,
+                }) => {
+                    ensure!(
+                        attempt.faults.is_empty()
+                            && attempt.scenario
+                                == crate::fault::scenarios::CREDENTIAL_ROTATION_MID_LOAD_SCENARIO
+                            && *operation_timeout_seconds > 0
+                            && attempt.workload.versioning
+                            && attempt.workload.objects >= 4,
+                        "fault suite plan has an invalid credential-rotation execution"
+                    );
+                }
             }
             let run_id = attempt.run_id.as_deref().with_context(|| {
                 format!(
@@ -613,6 +626,11 @@ impl FaultSuitePlanAttempt {
                     topology: plan.topology.clone(),
                     operation_timeout_seconds: plan.operation_timeout.as_secs(),
                 },
+                ExecutionPlan::CredentialRotation(plan) => {
+                    FaultRunExecutionSpec::CredentialRotation {
+                        operation_timeout_seconds: plan.operation_timeout.as_secs(),
+                    }
+                }
                 ExecutionPlan::StorageRecovery(plan) => FaultRunExecutionSpec::StorageRecovery {
                     case: plan.case,
                     operation_timeout_seconds: plan.operation_timeout.as_secs(),
@@ -926,6 +944,7 @@ fn workload_mode_name(mode: FaultWorkloadMode) -> &'static str {
         FaultWorkloadMode::S3Mixed => "s3-mixed",
         FaultWorkloadMode::S3MixedWithWarp => "s3-mixed-with-warp",
         FaultWorkloadMode::AckTriggeredQuietMutation => "ack-triggered-quiet-mutation",
+        FaultWorkloadMode::CredentialRotation => "credential-rotation",
     }
 }
 
@@ -1900,7 +1919,7 @@ scenarios:
             build_fault_suite_plan_expansion(suite, base, "chaos-suite-test".to_string())
                 .expect("canonical Chaos Mesh suite plan");
 
-        assert_eq!(expansion.plan.attempts.len(), 25);
+        assert_eq!(expansion.plan.attempts.len(), 29);
         assert!(expansion.plan.requires_chaos_mesh);
         assert!(!expansion.plan.requires_static_storage);
         assert!(expansion.plan.required_tools.is_empty());
@@ -1911,6 +1930,32 @@ scenarios:
                     .budgets
                     .max_duration_seconds
                     .expect("canonical suite maxDuration")
+        );
+    }
+
+    #[test]
+    fn network_clock_example_fits_its_budget() {
+        let suite = serde_yaml_ng::from_str::<FaultSuite>(include_str!(
+            "../../fault/examples/network-clock.yaml"
+        ))
+        .expect("network/clock example")
+        .resolve()
+        .expect("resolved network/clock example");
+        let mut base = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        base.workload_seed = Some(42);
+        let expansion =
+            build_fault_suite_plan_expansion(suite, base, "network-clock-test".to_string())
+                .expect("network/clock suite plan");
+        assert_eq!(expansion.plan.attempts.len(), 3);
+        assert!(expansion.plan.requires_chaos_mesh);
+        assert!(!expansion.plan.requires_static_storage);
+        assert!(
+            expansion.plan.budgets.minimum_required_seconds
+                <= expansion
+                    .plan
+                    .budgets
+                    .max_duration_seconds
+                    .expect("max duration")
         );
     }
 

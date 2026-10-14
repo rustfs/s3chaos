@@ -3,7 +3,7 @@ kind: FaultSuite
 metadata:
   name: rustfs-chaos-mesh-regression
 budgets:
-  maxDuration: 9h
+  maxDuration: 10h
   stopOnFirstFailure: true
   continueOnSeverities: []
   maxClientDisruptions: 9200
@@ -22,6 +22,12 @@ workloadProfiles:
   quorum:
     objects: 240
     concurrency: 16
+  network-clock:
+    objects: 300
+    concurrency: 12
+  bounded:
+    objects: 600
+    concurrency: 30
 scenarios:
   - name: io-eio
     faultDuration: 8m
@@ -151,3 +157,24 @@ scenarios:
   - name: pod-failure-quorum-edge
     faultDuration: 15m
     workloadProfile: quorum
+  - name: network-split-brain
+    faultDuration: 15m
+    workloadProfile: network-clock
+  - name: clock-skew
+    faultDuration: 15m
+    workloadProfile: network-clock
+    params:
+      kind: clockSkew
+      offsetSeconds: 120
+  - name: clock-skew
+    faultDuration: 15m
+    workloadProfile: network-clock
+    params:
+      kind: clockSkew
+      offsetSeconds: -120
+  - name: io-eio-same-pod-two-volumes
+    workloadProfile: bounded
+    params:
+      kind: samePodIo
+      secondVolumePath: /data/rustfs1
+    faultDuration: 8m

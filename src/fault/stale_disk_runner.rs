@@ -1667,7 +1667,11 @@ pub(crate) async fn run_stale_disk_case(
         .events
         .completion_guard("run", "stale-disk run did not complete");
     deadline.check()?;
-    prepare_fault_fixture(&config.cluster, FaultIsolation::DedicatedLinuxBlockDevice)?;
+    prepare_fault_fixture(
+        &config.cluster,
+        FaultIsolation::DedicatedLinuxBlockDevice,
+        1,
+    )?;
     let mut tenant_cleanup = TenantCleanupGuard::new(&config.cluster);
     deadline.run(wait_for_ready_tenant(&config.cluster)).await?;
 

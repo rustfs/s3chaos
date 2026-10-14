@@ -13,6 +13,9 @@
 // limitations under the License.
 
 use crate::rustfs::RustfsAdminTransport;
+use crate::rustfs::identity_admin::{
+    RustfsAdminError, RustfsIdentityAdminClient, checked_admin_request,
+};
 use anyhow::{Context, Result};
 use http::Method;
 use serde::Deserialize;
@@ -32,6 +35,7 @@ type AdminResult<T> = std::result::Result<T, ProtocolAdminError>;
 pub struct RustfsAdminClient {
     endpoint: String,
     transport: RustfsAdminTransport,
+    identity: RustfsIdentityAdminClient,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +71,7 @@ impl RustfsAdminClient {
         )?;
         Ok(Self {
             endpoint,
+            identity: RustfsIdentityAdminClient::from_transport(transport.clone()),
             transport,
         })
     }
@@ -90,53 +95,24 @@ impl RustfsAdminClient {
     }
 
     pub async fn users_with_prefix(&self, prefix: &str) -> AdminResult<Vec<String>> {
-        let response = self
-            .request(Method::GET, "/list-users", &[], Vec::new(), None)
-            .await?;
-        let value: Value = serde_json::from_slice(&response)
-            .map_err(|_| ProtocolAdminError::protocol("InvalidListUsersResponse"))?;
-        let users = value
-            .as_object()
-            .ok_or_else(|| ProtocolAdminError::protocol("InvalidListUsersResponse"))?
-            .keys()
-            .filter(|name| name.starts_with(prefix))
-            .cloned()
-            .collect();
-        Ok(users)
+        self.identity
+            .users_with_prefix(prefix)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn create_user(&self, credential: &ActorCredential) -> AdminResult<()> {
-        let body = serde_json::to_vec(&json!({
-            "secretKey": credential.secret_key(),
-            "status": "enabled"
-        }))
-        .map_err(|_| ProtocolAdminError::protocol("EncodeCreateUserRequest"))?;
-        self.request(
-            Method::PUT,
-            "/add-user",
-            &[("accessKey", credential.access_key())],
-            body,
-            Some("application/json"),
-        )
-        .await?;
-        Ok(())
+        self.identity
+            .create_user(credential.access_key(), credential.secret_key())
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn remove_user(&self, access_key: &str) -> AdminResult<()> {
-        match self
-            .request(
-                Method::DELETE,
-                "/remove-user",
-                &[("accessKey", access_key)],
-                Vec::new(),
-                None,
-            )
+        self.identity
+            .remove_user(access_key)
             .await
-        {
-            Ok(_) => Ok(()),
-            Err(error) if error.is_not_found() => Ok(()),
-            Err(error) => Err(error),
-        }
+            .map_err(Into::into)
     }
 
     pub async fn revoke_sts_sessions_for_provider(
@@ -165,31 +141,10 @@ impl RustfsAdminClient {
         principal: &str,
         is_group: bool,
     ) -> AdminResult<bool> {
-        let (path, query) = if is_group {
-            ("/group", vec![("group", principal)])
-        } else {
-            ("/list-users", Vec::new())
-        };
-        let response = match self
-            .request(Method::GET, path, &query, Vec::new(), None)
+        self.identity
+            .policy_attached(policy, principal, is_group)
             .await
-        {
-            Ok(response) => response,
-            Err(error) if error.is_not_found() => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        let value: Value = serde_json::from_slice(&response)
-            .map_err(|_| ProtocolAdminError::protocol("InvalidPolicyAttachmentReadback"))?;
-        let policy_names = if is_group {
-            value.get("policy").and_then(Value::as_str)
-        } else {
-            value
-                .get(principal)
-                .and_then(|user| user.get("policyName"))
-                .and_then(Value::as_str)
-        };
-        Ok(policy_names
-            .is_some_and(|names| names.split(',').map(str::trim).any(|name| name == policy)))
+            .map_err(Into::into)
     }
 
     pub async fn group_contains_member(&self, group: &str, member: &str) -> AdminResult<bool> {
@@ -244,19 +199,10 @@ impl RustfsAdminClient {
     }
 
     pub async fn policies_with_prefix(&self, prefix: &str) -> AdminResult<Vec<String>> {
-        let response = self
-            .request(Method::GET, "/list-canned-policies", &[], Vec::new(), None)
-            .await?;
-        let policies: Value = serde_json::from_slice(&response)
-            .map_err(|_| ProtocolAdminError::protocol("InvalidListPoliciesResponse"))?;
-        let policies = policies
-            .as_object()
-            .ok_or_else(|| ProtocolAdminError::protocol("InvalidListPoliciesResponse"))?
-            .keys()
-            .filter(|name| name.starts_with(prefix))
-            .cloned()
-            .collect();
-        Ok(policies)
+        self.identity
+            .policies_with_prefix(prefix)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn groups_with_prefix(&self, prefix: &str) -> AdminResult<Vec<String>> {
@@ -272,32 +218,14 @@ impl RustfsAdminClient {
     }
 
     pub async fn create_policy(&self, name: &str, document: &str) -> AdminResult<()> {
-        self.request(
-            Method::PUT,
-            "/add-canned-policy",
-            &[("name", name)],
-            document.as_bytes().to_vec(),
-            Some("application/json"),
-        )
-        .await?;
-        Ok(())
+        self.identity
+            .create_policy(name, document)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn remove_policy(&self, name: &str) -> AdminResult<()> {
-        match self
-            .request(
-                Method::DELETE,
-                "/remove-canned-policy",
-                &[("name", name)],
-                Vec::new(),
-                None,
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(error) if error.is_not_found() => Ok(()),
-            Err(error) => Err(error),
-        }
+        self.identity.remove_policy(name).await.map_err(Into::into)
     }
 
     pub async fn attach_policy(
@@ -306,8 +234,10 @@ impl RustfsAdminClient {
         principal: &str,
         is_group: bool,
     ) -> AdminResult<()> {
-        self.change_policy_attachment("/idp/builtin/policy/attach", policy, principal, is_group)
+        self.identity
+            .attach_policy(policy, principal, is_group)
             .await
+            .map_err(Into::into)
     }
 
     pub async fn detach_policy(
@@ -316,21 +246,10 @@ impl RustfsAdminClient {
         principal: &str,
         is_group: bool,
     ) -> AdminResult<()> {
-        self.change_policy_attachment("/idp/builtin/policy/detach", policy, principal, is_group)
+        self.identity
+            .detach_policy(policy, principal, is_group)
             .await
-    }
-
-    async fn change_policy_attachment(
-        &self,
-        path: &str,
-        policy: &str,
-        principal: &str,
-        is_group: bool,
-    ) -> AdminResult<()> {
-        let body = policy_attachment_body(policy, principal, is_group)?;
-        self.request(Method::POST, path, &[], body, Some("application/json"))
-            .await?;
-        Ok(())
+            .map_err(Into::into)
     }
 
     pub async fn update_group_members(
@@ -388,40 +307,23 @@ impl RustfsAdminClient {
         body: Vec<u8>,
         content_type: Option<&str>,
     ) -> AdminResult<Vec<u8>> {
-        if !path.starts_with('/') {
-            return Err(ProtocolAdminError::protocol("InvalidAdminRequestPath"));
-        }
-        let response = self
-            .transport
-            .request(
-                method,
-                &format!("{ADMIN_PREFIX}{path}"),
-                query,
-                body,
-                content_type,
-            )
-            .await
-            .map_err(|_| ProtocolAdminError::transport("AdminTransportError"))?;
-        if !(200..300).contains(&response.status) {
-            let code = protocol_error_code(&response.body)
-                .unwrap_or_else(|| "AdminRequestFailed".to_string());
-            return Err(ProtocolAdminError::service(
-                code,
-                response.status,
-                response.request_id,
-            ));
-        }
-        Ok(response.body)
+        Ok(
+            checked_admin_request(&self.transport, method, path, query, body, content_type)
+                .await
+                .map_err(ProtocolAdminError::from)?
+                .body,
+        )
     }
 }
 
-fn policy_attachment_body(policy: &str, principal: &str, is_group: bool) -> AdminResult<Vec<u8>> {
-    let target_field = if is_group { "group" } else { "user" };
-    serde_json::to_vec(&json!({
-        "policies": [policy],
-        (target_field): principal,
-    }))
-    .map_err(|_| ProtocolAdminError::protocol("EncodePolicyAttachmentRequest"))
+impl From<RustfsAdminError> for ProtocolAdminError {
+    fn from(error: RustfsAdminError) -> Self {
+        match error.status {
+            Some(status) => Self::service(error.code, status, error.request_id),
+            None if error.transient => Self::transport(error.code),
+            None => Self::protocol(error.code),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -616,24 +518,11 @@ impl ProtocolAdminCleanupPort for RustfsAdminClient {
     }
 }
 
-fn protocol_error_code(body: &[u8]) -> Option<String> {
-    if let Ok(value) = serde_json::from_slice::<Value>(body)
-        && let Some(code) = value
-            .get("Code")
-            .or_else(|| value.get("code"))
-            .and_then(Value::as_str)
-    {
-        return Some(code.to_string());
-    }
-    let text = std::str::from_utf8(body).ok()?;
-    let start = text.find("<Code>")? + "<Code>".len();
-    let end = text[start..].find("</Code>")? + start;
-    Some(text[start..end].to_string())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{policy_attachment_body, protocol_error_code};
+    use crate::rustfs::identity_admin::{
+        admin_error_code as protocol_error_code, policy_attachment_body,
+    };
 
     #[test]
     fn extracts_only_structured_admin_error_code() {

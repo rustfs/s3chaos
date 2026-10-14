@@ -22,7 +22,10 @@ use std::{
 use crate::fault::{
     config::FaultTestConfig,
     plan::{FaultKind, FaultPlan, FaultTarget},
-    quorum::{ErasureSetHealth, ErasureSetMembership, ErasureSetShape, QuorumVolumeTargetProof},
+    quorum::{
+        ErasureSetHealth, ErasureSetMembership, ErasureSetShape, QuorumVolumeBinding,
+        QuorumVolumeTargetProof, SamePodVolumeTargetProof,
+    },
     reporting::ResponsibilityDomain,
     scenarios::{FaultBackend, FaultScenario, FaultScenarioSpec},
 };
@@ -284,6 +287,8 @@ pub struct TargetErasureSetProof {
     pub membership: Option<ErasureSetMembership>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_quorum: Option<QuorumVolumeTargetProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub same_pod_volumes: Option<SamePodVolumeTargetProof>,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub observed_at_ms: u64,
     pub note: String,
@@ -450,6 +455,14 @@ impl TargetProof {
             })
             .collect::<Vec<_>>();
         let mut requirements = target_requirements(config, spec, plan);
+        if scenario.name == crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO {
+            requirements.push(TargetProofRequirement {
+                name: "same_pod_two_volume_bindings".to_string(),
+                status: PreflightStatus::Failed,
+                message: "two same-Pod runtime drive paths and volume bindings are pending"
+                    .to_string(),
+            });
+        }
         if erasure_set_proof(spec).is_some() {
             requirements.push(TargetProofRequirement {
                 name: ERASURE_SET_PROOF_REQUIREMENT.to_string(),
@@ -600,6 +613,7 @@ impl TargetProof {
                 proof.health = Some(health);
                 proof.membership = Some(membership.clone());
                 proof.volume_quorum = None;
+                proof.same_pod_volumes = None;
                 proof.observed_at_ms = observed_at_ms;
                 proof.note = ERASURE_SET_PROOF_RESOLVED_NOTE.to_string();
             }
@@ -747,6 +761,16 @@ impl TargetProof {
                 "volume quorum binding for Pod {:?} does not use the fault target mount path",
                 binding.pod_name
             );
+        }
+        self.validate_volume_bindings(&quorum.candidates, true)
+    }
+
+    pub(crate) fn validate_volume_bindings(
+        &self,
+        bindings: &[QuorumVolumeBinding],
+        require_ready: bool,
+    ) -> Result<()> {
+        for binding in bindings {
             let matches = self
                 .resolved_pods
                 .iter()
@@ -794,8 +818,68 @@ impl TargetProof {
                 "volume quorum binding for Pod {:?} does not match exactly one resolved PVC/PV",
                 binding.pod_name
             );
+            if self.scenario == crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO {
+                anyhow::ensure!(
+                    (!require_ready || pod.ready)
+                        && target_pod_has_fixed_volume(pod, &binding.mount_path)
+                        && pod
+                            .persistent_volume_claims
+                            .iter()
+                            .find(|claim| claim.name == binding.persistent_volume_claim)
+                            .is_some_and(|claim| !claim.uid.is_empty()
+                                && claim
+                                    .persistent_volume
+                                    .as_ref()
+                                    .is_some_and(|pv| !pv.uid.is_empty())),
+                    "same-Pod volume proof lacks its mount, exact PVC/PV generations, or required readiness"
+                );
+            }
         }
         Ok(())
+    }
+
+    pub(crate) fn with_same_pod_volumes_proven(
+        mut self,
+        volumes: SamePodVolumeTargetProof,
+    ) -> Result<Self> {
+        let erasure = self
+            .faults
+            .iter()
+            .find_map(|fault| fault.erasure_set.as_ref())
+            .context("same-Pod target proof lacks erasure-set evidence")?;
+        volumes.validate(
+            erasure
+                .shape
+                .as_ref()
+                .context("same-Pod target proof lacks erasure geometry")?,
+            erasure
+                .membership
+                .as_ref()
+                .context("same-Pod target proof lacks runtime membership")?,
+        )?;
+        self.validate_volume_bindings(&volumes.bindings, true)?;
+        self.faults
+            .iter_mut()
+            .find_map(|fault| fault.erasure_set.as_mut())
+            .context("same-Pod target proof lacks erasure-set evidence")?
+            .same_pod_volumes = Some(volumes);
+        for requirement in &mut self.requirements {
+            if requirement.name == "same_pod_two_volume_bindings" {
+                requirement.status = PreflightStatus::Passed;
+                requirement.message = "two distinct same-Pod PVC/PV mounts match authenticated runtime drive paths in one erasure set".to_string();
+            }
+        }
+        self.generated_at_ms = now_ms();
+        self.status = if self
+            .requirements
+            .iter()
+            .any(|requirement| requirement.status == PreflightStatus::Failed)
+        {
+            TargetProofStatus::Missing
+        } else {
+            TargetProofStatus::Satisfied
+        };
+        Ok(self)
     }
 
     pub fn preflight_check(&self) -> PreflightCheck {
@@ -1193,6 +1277,7 @@ fn erasure_set_proof(spec: &FaultScenarioSpec) -> Option<TargetErasureSetProof> 
             health: None,
             membership: None,
             volume_quorum: None,
+            same_pod_volumes: None,
             observed_at_ms: 0,
             note: ERASURE_SET_PROOF_PENDING_NOTE.to_string(),
         })

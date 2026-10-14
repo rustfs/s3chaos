@@ -32,10 +32,11 @@ mod runtime;
 
 pub use runtime::{
     ChaosGuard, apply_iochaos, apply_networkchaos, apply_podchaos, apply_schedule,
-    apply_stresschaos, chaos_schedule_is_armed, cleanup_managed_chaos, cleanup_managed_iochaos,
-    cleanup_managed_networkchaos, cleanup_managed_podchaos, cleanup_managed_stresschaos,
-    cleanup_run, cleanup_run_kind, require_iochaos_crd, require_networkchaos_crd,
-    require_podchaos_crd, require_schedule_crd, require_stresschaos_crd,
+    apply_stresschaos, apply_timechaos, chaos_schedule_is_armed, cleanup_managed_chaos,
+    cleanup_managed_iochaos, cleanup_managed_networkchaos, cleanup_managed_podchaos,
+    cleanup_managed_stresschaos, cleanup_run, cleanup_run_kind, require_iochaos_crd,
+    require_networkchaos_crd, require_podchaos_crd, require_schedule_crd, require_stresschaos_crd,
+    require_timechaos_crd,
 };
 
 pub(crate) const RUN_ID_LABEL: &str = "rustfs-fault-test/run-id";
@@ -51,6 +52,28 @@ pub(crate) struct NetworkPartitionEvidenceContract<'a> {
     pub scenario: &'a str,
     pub expected_source_targets: u32,
     pub candidate_pod_ids: &'a BTreeSet<String>,
+}
+
+pub(crate) struct ScopedNetworkPartitionEvidenceContract<'a> {
+    pub chaos_namespace: &'a str,
+    pub target_namespace: &'a str,
+    pub tenant: &'a str,
+    pub run_id: &'a str,
+    pub scenario: &'a str,
+    pub source_pod_names: &'a BTreeSet<String>,
+    pub peer_pod_names: &'a BTreeSet<String>,
+    pub duration_seconds: u64,
+}
+
+pub(crate) struct TimeChaosEvidenceContract<'a> {
+    pub chaos_namespace: &'a str,
+    pub target_namespace: &'a str,
+    pub tenant: &'a str,
+    pub run_id: &'a str,
+    pub scenario: &'a str,
+    pub pod_name: &'a str,
+    pub offset_seconds: i64,
+    pub duration_seconds: u64,
 }
 
 pub(crate) struct PodFailureEvidenceContract<'a> {
@@ -92,6 +115,7 @@ fn quorum_eio_methods(scenario: &str) -> Vec<String> {
         scenario,
         crate::fault::scenarios::QUORUM_P_IO_FAULT_SCENARIO
             | crate::fault::scenarios::QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+            | crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO
     ) {
         ["READ", "WRITE", "FSYNC", "RENAME", "UNLINK"]
             .into_iter()
@@ -314,6 +338,96 @@ pub(crate) fn validate_fixed_volume_snapshot(
     Ok(record_ids)
 }
 
+pub(crate) fn validate_same_pod_volume_resources(
+    resources: &[&Value],
+    volumes: &crate::fault::quorum::SamePodVolumeTargetProof,
+    contract: &VolumeTargetEvidenceContract<'_>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    ensure!(
+        resources.len() == 2,
+        "same-Pod volume fault requires two IOChaos resources"
+    );
+    let pod = volumes.bindings[0].pod_name.clone();
+    let exact_pods = BTreeSet::from([pod]);
+    let candidates = BTreeSet::from([format!(
+        "{}/{}",
+        contract.target_namespace, volumes.bindings[0].pod_name
+    )]);
+    let mut selected = std::collections::BTreeMap::new();
+    let mut resource_uids = BTreeSet::new();
+    let mut resource_names = BTreeSet::new();
+    for resource in resources {
+        let path = resource
+            .pointer("/spec/volumePath")
+            .and_then(Value::as_str)
+            .context("same-Pod IOChaos lacks its volume path")?;
+        ensure!(
+            volumes
+                .bindings
+                .iter()
+                .any(|binding| binding.mount_path == path),
+            "same-Pod IOChaos selects an unproved volume path"
+        );
+        let uid = resource
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .filter(|uid| !uid.is_empty())
+            .context("same-Pod IOChaos lacks its resource UID")?;
+        let name = resource
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .context("same-Pod IOChaos lacks its resource name")?;
+        ensure!(
+            resource_uids.insert(uid) && resource_names.insert(name),
+            "same-Pod IOChaos resources must have distinct identities"
+        );
+        let records = validate_fixed_volume_snapshot(
+            resource,
+            &VolumeTargetEvidenceContract {
+                chaos_namespace: contract.chaos_namespace,
+                target_namespace: contract.target_namespace,
+                tenant: contract.tenant,
+                run_id: contract.run_id,
+                scenario: contract.scenario,
+                volume_path: path,
+                path: None,
+                exact_pod_names: Some(&exact_pods),
+                expected_targets: 1,
+                candidate_pod_ids: &candidates,
+                runtime: contract.runtime,
+            },
+        )?;
+        let record = records
+            .first()
+            .context("same-Pod IOChaos has no injected controller record")?;
+        ensure!(
+            selected
+                .insert(
+                    path.to_string(),
+                    same_pod_volume_record_id(resource, record)?
+                )
+                .is_none(),
+            "same-Pod resources selected the same mount twice"
+        );
+    }
+    Ok(selected)
+}
+
+pub(crate) fn same_pod_volume_record_id(resource: &Value, record: &str) -> Result<String> {
+    let name = resource
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("same-Pod IOChaos resource name missing")?;
+    let uid = resource
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("same-Pod IOChaos resource UID missing")?;
+    Ok(format!("{name}/{uid}:{record}"))
+}
+
 fn validate_iochaos_behavior(resource: &Value, expected: &IoChaosRuntimeContract) -> Result<()> {
     let spec = resource
         .pointer("/spec")
@@ -501,6 +615,197 @@ pub(crate) fn validate_network_partition_snapshot(
         "runtime NetworkChaos peer records do not cover the proved Ready Pod set"
     );
     Ok(source_ids)
+}
+
+pub(crate) fn validate_scoped_network_partition_snapshot(
+    resource: &Value,
+    contract: &ScopedNetworkPartitionEvidenceContract<'_>,
+) -> Result<()> {
+    ensure!(
+        resource.get("apiVersion").and_then(Value::as_str) == Some("chaos-mesh.org/v1alpha1")
+            && resource.get("kind").and_then(Value::as_str) == Some("NetworkChaos"),
+        "runtime fault snapshot is not a Chaos Mesh NetworkChaos"
+    );
+    validate_partition_groups(contract.source_pod_names, contract.peer_pod_names)?;
+    validate_run_metadata(
+        resource,
+        "NetworkChaos",
+        contract.chaos_namespace,
+        contract.run_id,
+        contract.scenario,
+    )?;
+    ensure!(
+        resource.pointer("/spec/action").and_then(Value::as_str) == Some("partition")
+            && resource.pointer("/spec/direction").and_then(Value::as_str) == Some("both")
+            && resource.pointer("/spec/duration").and_then(Value::as_str)
+                == Some(format!("{}s", contract.duration_seconds).as_str()),
+        "runtime NetworkChaos does not match the scoped bidirectional partition"
+    );
+    validate_exact_selector(
+        resource
+            .pointer("/spec")
+            .context("NetworkChaos spec is missing")?,
+        "NetworkChaos",
+        contract.target_namespace,
+        contract.tenant,
+        contract.source_pod_names,
+    )?;
+    validate_exact_selector(
+        resource
+            .pointer("/spec/target")
+            .context("NetworkChaos target is missing")?,
+        "NetworkChaos",
+        contract.target_namespace,
+        contract.tenant,
+        contract.peer_pod_names,
+    )?;
+    let records = require_injected_records(resource, "NetworkChaos", &[".", ".Target"])?;
+    let expected = |names: &BTreeSet<String>| {
+        names
+            .iter()
+            .map(|name| format!("{}/{name}", contract.target_namespace))
+            .collect::<BTreeSet<_>>()
+    };
+    ensure!(
+        injected_record_ids(records, ".", "NetworkChaos")? == expected(contract.source_pod_names)
+            && injected_record_ids(records, ".Target", "NetworkChaos")?
+                == expected(contract.peer_pod_names),
+        "NetworkChaos controller records do not match the exact complementary Pod groups"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_timechaos_snapshot(
+    resource: &Value,
+    contract: &TimeChaosEvidenceContract<'_>,
+) -> Result<()> {
+    ensure!(
+        resource.get("apiVersion").and_then(Value::as_str) == Some("chaos-mesh.org/v1alpha1")
+            && resource.get("kind").and_then(Value::as_str) == Some("TimeChaos"),
+        "runtime fault snapshot is not a Chaos Mesh TimeChaos"
+    );
+    validate_run_metadata(
+        resource,
+        "TimeChaos",
+        contract.chaos_namespace,
+        contract.run_id,
+        contract.scenario,
+    )?;
+    ensure!(
+        resource.pointer("/spec/timeOffset").and_then(Value::as_str)
+            == Some(format!("{}s", contract.offset_seconds).as_str())
+            && resource.pointer("/spec/clockIds") == Some(&serde_json::json!(["CLOCK_REALTIME"]))
+            && resource.pointer("/spec/containerNames") == Some(&serde_json::json!(["rustfs"]))
+            && resource.pointer("/spec/duration").and_then(Value::as_str)
+                == Some(format!("{}s", contract.duration_seconds).as_str()),
+        "runtime TimeChaos offset, clock, container, or duration does not match the plan"
+    );
+    validate_exact_selector(
+        resource
+            .pointer("/spec")
+            .context("TimeChaos spec is missing")?,
+        "TimeChaos",
+        contract.target_namespace,
+        contract.tenant,
+        &BTreeSet::from([contract.pod_name.to_string()]),
+    )?;
+    let records = require_injected_records(resource, "TimeChaos", &["."])?;
+    ensure!(
+        injected_record_ids(records, ".", "TimeChaos")?
+            == BTreeSet::from([format!(
+                "{}/{}/rustfs",
+                contract.target_namespace, contract.pod_name
+            )]),
+        "TimeChaos controller did not inject the exact RustFS container"
+    );
+    Ok(())
+}
+
+fn require_injected_records<'a>(
+    resource: &'a Value,
+    kind: &str,
+    selector_keys: &[&str],
+) -> Result<&'a [Value]> {
+    ensure!(
+        resource
+            .pointer("/metadata/deletionTimestamp")
+            .is_none_or(Value::is_null),
+        "runtime {kind} is already being deleted"
+    );
+    ensure!(
+        chaos_condition_is_true(resource, "Selected")
+            && chaos_condition_is_true(resource, "AllInjected")
+            && !chaos_condition_is_true(resource, "AllRecovered")
+            && resource
+                .pointer("/status/experiment/desiredPhase")
+                .and_then(Value::as_str)
+                == Some("Run"),
+        "runtime {kind} is not fully injected in phase Run"
+    );
+    let records = resource
+        .pointer("/status/experiment/containerRecords")
+        .and_then(Value::as_array)
+        .with_context(|| format!("runtime {kind} has no controller records"))?;
+    ensure!(
+        records.iter().all(|record| record
+            .get("selectorKey")
+            .and_then(Value::as_str)
+            .is_some_and(|key| selector_keys.contains(&key))),
+        "runtime {kind} contains an unexpected selector key"
+    );
+    Ok(records)
+}
+
+fn validate_exact_selector(
+    selector: &Value,
+    kind: &str,
+    namespace: &str,
+    tenant: &str,
+    names: &BTreeSet<String>,
+) -> Result<()> {
+    validate_pod_selector(selector, kind, namespace, tenant)?;
+    ensure!(
+        selector.get("mode").and_then(Value::as_str) == Some("all")
+            && selector.get("value").is_none(),
+        "runtime {kind} must select every exactly named Pod"
+    );
+    let pods = selector
+        .pointer("/selector/pods")
+        .and_then(Value::as_object)
+        .context("exact selector.pods is missing")?;
+    let values = pods
+        .get(namespace)
+        .and_then(Value::as_array)
+        .context("exact selector namespace is missing")?;
+    let actual = values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .context("exact selector Pod name is not a string")
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    ensure!(
+        pods.len() == 1 && values.len() == actual.len() && actual == *names,
+        "runtime {kind} exact Pod selector differs from the proven scope"
+    );
+    Ok(())
+}
+
+fn validate_partition_groups(source: &BTreeSet<String>, peers: &BTreeSet<String>) -> Result<()> {
+    ensure!(
+        !source.is_empty() && !peers.is_empty() && source.is_disjoint(peers),
+        "scoped network partition requires nonempty disjoint Pod groups"
+    );
+    ensure!(
+        source.iter().chain(peers).all(|name| !name.is_empty()
+            && name.bytes().all(|byte| byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || b".-".contains(&byte))),
+        "scoped partition contains an invalid Pod name"
+    );
+    Ok(())
 }
 
 /// Prove the live PodChaos really failed the plan-declared number of tenant
@@ -729,6 +1034,7 @@ enum FaultSpec {
     PodKill(PodChaosSpec),
     PodKillStorm(ScheduleSpec),
     Network(NetworkChaosSpec),
+    Time(TimeChaosSpec),
     Stress(StressChaosSpec),
 }
 
@@ -739,6 +1045,7 @@ impl FaultSpec {
             Self::Pod(chaos) | Self::PodKill(chaos) => chaos.manifest(),
             Self::PodKillStorm(chaos) => chaos.manifest(),
             Self::Network(chaos) => chaos.manifest(),
+            Self::Time(chaos) => chaos.manifest(),
             Self::Stress(chaos) => chaos.manifest(),
         }
     }
@@ -805,6 +1112,10 @@ pub(crate) fn apply_fault(request: &FaultApplyRequest<'_>) -> Result<AppliedFaul
         }
         FaultSpec::Network(chaos) => Ok(AppliedFault::Experiment {
             guard: apply_networkchaos(cluster, &chaos)?,
+            active_required: true,
+        }),
+        FaultSpec::Time(chaos) => Ok(AppliedFault::Experiment {
+            guard: apply_timechaos(cluster, &chaos)?,
             active_required: true,
         }),
         FaultSpec::Stress(chaos) => Ok(AppliedFault::Experiment {
@@ -973,6 +1284,46 @@ fn build_fault_spec(
             )?
             .with_name_suffix(resource_name_suffix),
         )),
+        FaultKind::RustfsServerNetworkSplitBrain => {
+            let mut pods = rustfs_pod_identities(cluster)?;
+            pods.sort_by(|left, right| left.name.cmp(&right.name));
+            ensure!(
+                pods.len() == 4,
+                "split-brain requires exactly four RustFS Pods"
+            );
+            Ok(FaultSpec::Network(
+                NetworkChaosSpec::partition_between_rustfs_pods(
+                    cluster,
+                    &config.chaos_namespace,
+                    run_id,
+                    &scenario.name,
+                    injection.duration(),
+                    &pods[..2].iter().map(|pod| pod.name.clone()).collect(),
+                    &pods[2..].iter().map(|pod| pod.name.clone()).collect(),
+                )?
+                .with_name_suffix(resource_name_suffix),
+            ))
+        }
+        FaultKind::RustfsServerClockSkew => {
+            let mut pods = rustfs_pod_identities(cluster)?;
+            pods.sort_by(|left, right| left.name.cmp(&right.name));
+            ensure!(
+                pods.len() >= 2,
+                "clock skew requires a target and control RustFS Pod"
+            );
+            Ok(FaultSpec::Time(
+                TimeChaosSpec::on_rustfs_pod(
+                    cluster,
+                    &config.chaos_namespace,
+                    run_id,
+                    &scenario.name,
+                    injection.duration(),
+                    &pods.last().context("clock skew target is missing")?.name,
+                    injection.parameters().clock_offset_seconds()?,
+                )?
+                .with_name_suffix(resource_name_suffix),
+            ))
+        }
         FaultKind::RustfsServerNetworkPartition => {
             // Honor the plan-declared blast radius: quorum-loss scenarios
             // partition more than one Pod, everything else stays single-target.
@@ -1247,6 +1598,20 @@ pub struct NetworkChaosSpec {
     /// N > 1 renders `mode: fixed` + `value: "N"` so the plan-declared blast
     /// radius is honored instead of silently narrowing to a single Pod.
     pub targets: u32,
+    pub partition_pods: Option<(BTreeSet<String>, BTreeSet<String>)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeChaosSpec {
+    pub name: String,
+    pub namespace: String,
+    pub run_id: String,
+    pub scenario: String,
+    pub target_namespace: String,
+    pub tenant_name: String,
+    pub pod_name: String,
+    pub offset_seconds: i64,
+    pub duration: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -1768,6 +2133,31 @@ spec:
 }
 
 impl NetworkChaosSpec {
+    /// Exactly named groups preserve all intra-group paths. The caller binds
+    /// these names to live Pod identities before and during injection.
+    pub fn partition_between_rustfs_pods(
+        config: &ClusterTestConfig,
+        chaos_namespace: impl Into<String>,
+        run_id: impl Into<String>,
+        scenario: impl Into<String>,
+        duration: Duration,
+        source_pods: &BTreeSet<String>,
+        peer_pods: &BTreeSet<String>,
+    ) -> Result<Self> {
+        validate_partition_groups(source_pods, peer_pods)?;
+        let mut spec = Self::one_rustfs_pod(
+            config,
+            chaos_namespace,
+            run_id,
+            scenario,
+            duration,
+            "net-partition",
+            NetworkChaosAction::Partition,
+        )?;
+        spec.targets = u32::try_from(source_pods.len())?;
+        spec.partition_pods = Some((source_pods.clone(), peer_pods.clone()));
+        Ok(spec)
+    }
     /// Partition `targets` tenant Pods from every peer (source and target
     /// selectors overlap, so the selected Pods are fully isolated — from the
     /// remaining peers and from each other). `targets` > 1 is how quorum-loss
@@ -1963,6 +2353,7 @@ impl NetworkChaosSpec {
             direction: NetworkChaosDirection::Both,
             duration,
             targets: 1,
+            partition_pods: None,
         })
     }
 
@@ -1980,6 +2371,18 @@ impl NetworkChaosSpec {
     }
 
     pub fn manifest(&self) -> String {
+        if let Some((source, peers)) = &self.partition_pods {
+            let mut manifest = serde_json::json!({
+                "apiVersion": "chaos-mesh.org/v1alpha1", "kind": "NetworkChaos",
+                "metadata": {"name": self.name, "namespace": self.namespace,
+                    "labels": {RUN_ID_LABEL: self.run_id, SCENARIO_LABEL: self.scenario, MANAGED_BY_LABEL: MANAGED_BY_VALUE}},
+                "spec": {"action": "partition", "direction": "both", "duration": format!("{}s", self.duration.as_secs()),
+                    "mode": "all", "selector": exact_pod_selector(&self.target_namespace, &self.tenant_name, source),
+                    "target": {"mode": "all", "selector": exact_pod_selector(&self.target_namespace, &self.tenant_name, peers)}}
+            });
+            // Serialize typed Kubernetes names without interpolation into YAML.
+            return serde_yaml_ng::to_string(&manifest.take()).expect("serializable NetworkChaos");
+        }
         let seconds = self.duration.as_secs();
         let action = self.action_manifest();
         let mode = self.mode_manifest();
@@ -2066,6 +2469,66 @@ spec:
     correlation: "{correlation}""#
             ),
         }
+    }
+}
+
+fn exact_pod_selector(namespace: &str, tenant: &str, names: &BTreeSet<String>) -> Value {
+    serde_json::json!({"namespaces": [namespace], "labelSelectors": {"rustfs.tenant": tenant}, "pods": {namespace: names}})
+}
+
+impl TimeChaosSpec {
+    pub fn on_rustfs_pod(
+        config: &ClusterTestConfig,
+        chaos_namespace: impl Into<String>,
+        run_id: impl Into<String>,
+        scenario: impl Into<String>,
+        duration: Duration,
+        pod_name: &str,
+        offset_seconds: i64,
+    ) -> Result<Self> {
+        ensure!(
+            duration > Duration::ZERO,
+            "TimeChaos duration must be positive"
+        );
+        ensure!(
+            (60..=600).contains(&offset_seconds.unsigned_abs()),
+            "TimeChaos offset must be bounded to 60..=600 seconds"
+        );
+        ensure!(
+            !pod_name.is_empty() && !pod_name.contains('/'),
+            "TimeChaos target must be one Pod name"
+        );
+        let run_id = run_id.into();
+        Ok(Self {
+            name: format!(
+                "rustfs-fault-time-{}",
+                run_id.chars().take(12).collect::<String>()
+            ),
+            namespace: chaos_namespace.into(),
+            run_id,
+            scenario: scenario.into(),
+            target_namespace: config.test_namespace.clone(),
+            tenant_name: config.tenant_name.clone(),
+            pod_name: pod_name.to_string(),
+            offset_seconds,
+            duration,
+        })
+    }
+    pub fn with_name_suffix(mut self, suffix: &str) -> Self {
+        self.name.push_str(suffix);
+        self
+    }
+    pub fn manifest(&self) -> String {
+        let manifest = serde_json::json!({
+            "apiVersion": "chaos-mesh.org/v1alpha1", "kind": "TimeChaos",
+            "metadata": {"name": self.name, "namespace": self.namespace,
+                "labels": {RUN_ID_LABEL: self.run_id, SCENARIO_LABEL: self.scenario, MANAGED_BY_LABEL: MANAGED_BY_VALUE}},
+            "spec": {"mode": "all", "timeOffset": format!("{}s", self.offset_seconds),
+                "clockIds": ["CLOCK_REALTIME"], "containerNames": ["rustfs"],
+                "duration": format!("{}s", self.duration.as_secs()),
+                "selector": exact_pod_selector(&self.target_namespace, &self.tenant_name, &BTreeSet::from([self.pod_name.clone()]))}
+        });
+        serde_yaml_ng::to_string(&manifest).expect("serializable TimeChaos")
     }
 }
 
@@ -2347,7 +2810,7 @@ mod tests {
         build_fault_spec, chaos_schedule_is_armed, highest_ordinal_pod_name,
         runtime::chaos_experiment_is_active, validate_fixed_volume_snapshot,
         validate_network_partition_snapshot, validate_pod_failure_snapshot,
-        volume_fault_runtime_contract,
+        validate_same_pod_volume_resources, volume_fault_runtime_contract,
     };
     use crate::fault::config::FaultTestConfig;
     use crate::fault::plan::{
@@ -2720,6 +3183,103 @@ mod tests {
             spec.manifest()
                 .contains("\n  mode: fixed\n  value: \"9\"\n")
         );
+    }
+
+    #[test]
+    fn same_pod_resources_require_two_paths_and_exact_container_records() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let (_, _, volumes) = crate::fault::quorum::same_pod_volume_proof_fixture();
+        let scenario = crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO;
+        let injection = FaultInjection::new_with_parameters(
+            FaultKind::RustfsVolumeIoError,
+            FaultBackend::ChaosMeshIoChaos,
+            FaultTarget::RustfsVolume {
+                path: "/data/rustfs0".to_string(),
+            },
+            FaultSelection::FixedTargets(1),
+            Duration::from_secs(60),
+            FaultInjectionParameters::SamePodIo {
+                second_volume_path: "/data/rustfs1".to_string(),
+            },
+        )
+        .expect("same-Pod injection");
+        let runtime =
+            volume_fault_runtime_contract(&injection, scenario).expect("five-method EIO contract");
+        let resources = volumes.bindings.iter().enumerate().map(|(index, binding)| {
+            let spec = IoChaosSpec::eio_on_rustfs_volume(
+                &config.cluster, "chaos-mesh", "run-1", scenario,
+                &binding.mount_path, 100, Duration::from_secs(60),
+            ).expect("volume spec").with_exact_pods(vec![binding.pod_name.clone()]).expect("exact Pod");
+            let mut resource: serde_json::Value = serde_yaml_ng::from_str(&spec.manifest()).expect("manifest");
+            resource["metadata"]["name"] = serde_json::json!(format!("same-pod-{index}"));
+            resource["metadata"]["uid"] = serde_json::json!(format!("iochaos-uid-{index}"));
+            resource["status"] = serde_json::json!({
+                "conditions": [{"type":"Selected", "status":"True"}, {"type":"AllInjected", "status":"True"}, {"type":"AllRecovered", "status":"False"}],
+                "experiment": {"desiredPhase":"Run", "containerRecords":[{
+                    "id":format!("{}/{}/rustfs", config.cluster.test_namespace, binding.pod_name),
+                    "selectorKey":".", "phase":"Injected", "injectedCount":1
+                }]}
+            });
+            resource
+        }).collect::<Vec<_>>();
+        let contract = VolumeTargetEvidenceContract {
+            chaos_namespace: "chaos-mesh",
+            target_namespace: &config.cluster.test_namespace,
+            tenant: &config.cluster.tenant_name,
+            run_id: "run-1",
+            scenario,
+            volume_path: "/data/rustfs0",
+            path: None,
+            exact_pod_names: None,
+            expected_targets: 1,
+            candidate_pod_ids: &BTreeSet::new(),
+            runtime: &runtime,
+        };
+        let records = validate_same_pod_volume_resources(
+            &resources.iter().collect::<Vec<_>>(),
+            &volumes,
+            &contract,
+        )
+        .expect("both volumes");
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records["/data/rustfs0"],
+            format!(
+                "same-pod-0/iochaos-uid-0:{}/rustfs-3/rustfs",
+                config.cluster.test_namespace
+            )
+        );
+        assert!(validate_same_pod_volume_resources(&[&resources[0]], &volumes, &contract).is_err());
+        for (pointer, value) in [
+            ("/metadata/uid", serde_json::json!("iochaos-uid-0")),
+            ("/metadata/name", serde_json::json!("same-pod-0")),
+            ("/spec/volumePath", serde_json::json!("/data/rustfs0")),
+            (
+                "/spec/path",
+                serde_json::json!("/data/rustfs1/another/**/*"),
+            ),
+            (
+                "/spec/selector/pods/rustfs-fault-test",
+                serde_json::json!(["rustfs-2"]),
+            ),
+            (
+                "/status/experiment/containerRecords/0/id",
+                serde_json::json!("rustfs-fault-test/rustfs-2/rustfs"),
+            ),
+            ("/spec/methods", serde_json::json!(["READ", "WRITE"])),
+        ] {
+            let mut changed = resources.clone();
+            *changed[1].pointer_mut(pointer).expect("fixture field") = value;
+            assert!(
+                validate_same_pod_volume_resources(
+                    &changed.iter().collect::<Vec<_>>(),
+                    &volumes,
+                    &contract
+                )
+                .is_err(),
+                "changed {pointer}"
+            );
+        }
     }
 
     #[test]
@@ -3499,5 +4059,145 @@ mod tests {
             !chaos_schedule_is_armed(r#"{"status":{"lastScheduleTime":"2026-09-24T00:00:00Z"}}"#)
                 .expect("json")
         );
+    }
+
+    #[test]
+    fn scoped_partition_proves_complement_selectors_and_real_injection() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let source = BTreeSet::from(["rustfs-0".to_string(), "rustfs-1".to_string()]);
+        let peers = BTreeSet::from(["rustfs-2".to_string(), "rustfs-3".to_string()]);
+        let spec = super::NetworkChaosSpec::partition_between_rustfs_pods(
+            &config.cluster,
+            "chaos-mesh",
+            "run-split",
+            "network-split-brain",
+            Duration::from_secs(60),
+            &source,
+            &peers,
+        )
+        .expect("spec");
+        let mut resource: serde_json::Value =
+            serde_yaml_ng::from_str(&spec.manifest()).expect("manifest");
+        let contract = super::ScopedNetworkPartitionEvidenceContract {
+            chaos_namespace: "chaos-mesh",
+            target_namespace: &config.cluster.test_namespace,
+            tenant: &config.cluster.tenant_name,
+            run_id: "run-split",
+            scenario: "network-split-brain",
+            source_pod_names: &source,
+            peer_pod_names: &peers,
+            duration_seconds: 60,
+        };
+        assert!(super::validate_scoped_network_partition_snapshot(&resource, &contract).is_err());
+        resource["status"] = serde_json::json!({"conditions": [
+            {"type": "Selected", "status": "True"}, {"type": "AllInjected", "status": "True"}, {"type": "AllRecovered", "status": "False"}],
+            "experiment": {"desiredPhase": "Run", "containerRecords": source.iter().map(|pod|
+                serde_json::json!({"id": format!("{}/{pod}", config.cluster.test_namespace), "selectorKey": ".", "phase": "Injected", "injectedCount": 1}))
+                .chain(peers.iter().map(|pod| serde_json::json!({"id": format!("{}/{pod}", config.cluster.test_namespace), "selectorKey": ".Target", "phase": "Injected", "injectedCount": 1}))).collect::<Vec<_>>()}});
+        super::validate_scoped_network_partition_snapshot(&resource, &contract)
+            .expect("injected exact groups");
+        assert_eq!(resource["spec"]["mode"], "all");
+        assert_eq!(resource["spec"]["target"]["mode"], "all");
+        for path in [
+            "/spec/direction",
+            "/spec/duration",
+            "/spec/selector/pods",
+            "/spec/target/selector/pods",
+            "/status/experiment/containerRecords",
+        ] {
+            let mut changed = resource.clone();
+            *changed.pointer_mut(path).expect("field") = serde_json::json!("invalid");
+            assert!(
+                super::validate_scoped_network_partition_snapshot(&changed, &contract).is_err(),
+                "{path}"
+            );
+        }
+        let mut not_injected = resource.clone();
+        not_injected["status"]["experiment"]["containerRecords"][2]["phase"] =
+            serde_json::json!("Not Injected");
+        assert!(
+            super::validate_scoped_network_partition_snapshot(&not_injected, &contract).is_err()
+        );
+        let mut overlap = peers.clone();
+        overlap.insert("rustfs-0".to_string());
+        assert!(
+            super::NetworkChaosSpec::partition_between_rustfs_pods(
+                &config.cluster,
+                "chaos-mesh",
+                "run-split",
+                "network-split-brain",
+                Duration::from_secs(60),
+                &source,
+                &overlap
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn timechaos_requires_the_exact_running_container_and_clock() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let spec = super::TimeChaosSpec::on_rustfs_pod(
+            &config.cluster,
+            "chaos-mesh",
+            "run-clock",
+            "clock-skew",
+            Duration::from_secs(60),
+            "rustfs-3",
+            -120,
+        )
+        .expect("spec");
+        let mut resource: serde_json::Value =
+            serde_yaml_ng::from_str(&spec.manifest()).expect("manifest");
+        let contract = super::TimeChaosEvidenceContract {
+            chaos_namespace: "chaos-mesh",
+            target_namespace: &config.cluster.test_namespace,
+            tenant: &config.cluster.tenant_name,
+            run_id: "run-clock",
+            scenario: "clock-skew",
+            pod_name: "rustfs-3",
+            offset_seconds: -120,
+            duration_seconds: 60,
+        };
+        assert!(super::validate_timechaos_snapshot(&resource, &contract).is_err());
+        resource["status"] = serde_json::json!({"conditions": [
+            {"type": "Selected", "status": "True"}, {"type": "AllInjected", "status": "True"}],
+            "experiment": {"desiredPhase": "Run", "containerRecords": [
+                {"id": format!("{}/rustfs-3/rustfs", config.cluster.test_namespace), "selectorKey": ".", "phase": "Injected", "injectedCount": 1}]}});
+        super::validate_timechaos_snapshot(&resource, &contract).expect("runtime proof");
+        for (path, value) in [
+            ("/spec/clockIds", serde_json::json!(["CLOCK_MONOTONIC"])),
+            ("/spec/containerNames", serde_json::json!(["sidecar"])),
+            ("/spec/timeOffset", serde_json::json!("120s")),
+            (
+                "/status/experiment/containerRecords/0/id",
+                serde_json::json!("elsewhere/rustfs-3/rustfs"),
+            ),
+            (
+                "/status/experiment/containerRecords/0/injectedCount",
+                serde_json::json!(0),
+            ),
+        ] {
+            let mut changed = resource.clone();
+            *changed.pointer_mut(path).expect("field") = value;
+            assert!(
+                super::validate_timechaos_snapshot(&changed, &contract).is_err(),
+                "{path}"
+            );
+        }
+        for offset in [0, 59, -59, 601, i64::MIN] {
+            assert!(
+                super::TimeChaosSpec::on_rustfs_pod(
+                    &config.cluster,
+                    "chaos-mesh",
+                    "run-clock",
+                    "clock-skew",
+                    Duration::from_secs(60),
+                    "rustfs-3",
+                    offset
+                )
+                .is_err()
+            );
+        }
     }
 }

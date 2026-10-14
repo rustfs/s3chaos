@@ -41,7 +41,10 @@ use uuid::Uuid;
 
 use crate::fault::{
     fresh_volume::{FreshVolumeHostProbeRequest, run_fresh_volume_host_probe},
-    storage_recovery::{FragmentReferenceState, RustfsShardInventoryResponse, ShardInventoryEntry},
+    storage_recovery::{
+        FragmentReferenceState, RustfsShardInventoryResponse, ShardInventoryEntry,
+        StorageRecoveryCase,
+    },
     storage_recovery_lease::StorageRecoveryCleanupProof,
     storage_recovery_runtime::{
         DeviceMapperCommandReceipt, HostGenerationIdentity, OwnedStorageContext,
@@ -883,7 +886,11 @@ impl MutationJournalLookup {
         ensure!(
             self.operation_id == operation_id
                 && self.operation == *operation
-                && matches!(operation, StorageRecoveryHostOperation::MutateShard { .. })
+                && matches!(
+                    operation,
+                    StorageRecoveryHostOperation::MutateShard { .. }
+                        | StorageRecoveryHostOperation::MutateMetadata { .. }
+                )
                 && self.observed_at_ms >= context.exclusive_access.kubernetes_lease.acquired_at_ms,
             "mutation lookup does not match the owned operation"
         );
@@ -952,6 +959,50 @@ pub struct OfflineXl2InspectResponse {
     pub xl_meta_sha256: String,
     pub layout: crate::fault::xl2_inspector::Xl2ObjectVersionLayout,
     pub selected_part: OfflineInspectedShard,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_metadata: Option<OfflineInspectedMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OfflineInspectedMetadata {
+    pub relative_metadata_path: String,
+    pub metadata_device_id: String,
+    pub metadata_inode: u64,
+    pub metadata_size_bytes: u64,
+    pub original_sha256: String,
+}
+
+impl OfflineXl2InspectResponse {
+    pub(crate) fn corruption_file(
+        &self,
+        case: StorageRecoveryCase,
+    ) -> Result<OfflineInspectedShard> {
+        if case == StorageRecoveryCase::MetadataShardCorruptionAdminDeep {
+            let metadata = self
+                .selected_metadata
+                .as_ref()
+                .context("XL2 inspection lacks the selected metadata identity")?;
+            ensure!(
+                metadata.relative_metadata_path.ends_with("/xl.meta")
+                    && metadata.metadata_device_id == self.mount_device_id
+                    && metadata.metadata_inode > 0
+                    && metadata.metadata_size_bytes >= 18
+                    && metadata.original_sha256 == self.xl_meta_sha256,
+                "metadata inspection does not bind the contained XL2 file"
+            );
+            Ok(OfflineInspectedShard {
+                part_number: 0,
+                relative_part_path: metadata.relative_metadata_path.clone(),
+                shard_device_id: metadata.metadata_device_id.clone(),
+                shard_inode: metadata.metadata_inode,
+                shard_size_bytes: metadata.metadata_size_bytes,
+                original_sha256: metadata.original_sha256.clone(),
+            })
+        } else {
+            Ok(self.selected_part.clone())
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1050,6 +1101,66 @@ pub struct OfflineShardMutationResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OfflineMetadataMutationResponse {
+    pub journal_operation_id: String,
+    pub relative_metadata_path: String,
+    pub metadata_device_id: String,
+    pub metadata_inode: u64,
+    pub metadata_size_bytes: u64,
+    pub byte_offset: u64,
+    pub original_byte: u8,
+    pub mutated_byte: u8,
+    pub original_sha256: String,
+    pub mutated_sha256: String,
+}
+
+impl From<OfflineShardMutationResponse> for OfflineMetadataMutationResponse {
+    fn from(value: OfflineShardMutationResponse) -> Self {
+        Self {
+            journal_operation_id: value.journal_operation_id,
+            relative_metadata_path: value.relative_part_path,
+            metadata_device_id: value.shard_device_id,
+            metadata_inode: value.shard_inode,
+            metadata_size_bytes: value.shard_size_bytes,
+            byte_offset: value.byte_offset,
+            original_byte: value.original_byte,
+            mutated_byte: value.mutated_byte,
+            original_sha256: value.original_sha256,
+            mutated_sha256: value.mutated_sha256,
+        }
+    }
+}
+
+impl From<OfflineMetadataMutationResponse> for OfflineShardMutationResponse {
+    fn from(value: OfflineMetadataMutationResponse) -> Self {
+        Self {
+            journal_operation_id: value.journal_operation_id,
+            relative_part_path: value.relative_metadata_path,
+            shard_device_id: value.metadata_device_id,
+            shard_inode: value.metadata_inode,
+            shard_size_bytes: value.metadata_size_bytes,
+            byte_offset: value.byte_offset,
+            original_byte: value.original_byte,
+            mutated_byte: value.mutated_byte,
+            original_sha256: value.original_sha256,
+            mutated_sha256: value.mutated_sha256,
+        }
+    }
+}
+
+pub(crate) fn decode_corruption_mutation(
+    case: StorageRecoveryCase,
+    body: &str,
+) -> Result<OfflineShardMutationResponse> {
+    if case == StorageRecoveryCase::MetadataShardCorruptionAdminDeep {
+        Ok(serde_json::from_str::<OfflineMetadataMutationResponse>(body)?.into())
+    } else {
+        Ok(serde_json::from_str(body)?)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OfflineShardRecoveryResponse {
     pub mutation_operation_id: String,
     pub outcome: crate::fault::storage_recovery_runtime::RestoreOutcome,
@@ -1134,6 +1245,7 @@ impl StorageHelperSession {
             matches!(
                 invocation.operation,
                 StorageRecoveryHostOperation::MutateShard { .. }
+                    | StorageRecoveryHostOperation::MutateMetadata { .. }
             ),
             "explicit helper operationId is restricted to shard mutation"
         );
@@ -1153,10 +1265,12 @@ impl StorageHelperSession {
         let is_shard_mutation = matches!(
             &invocation.operation,
             StorageRecoveryHostOperation::MutateShard { .. }
+                | StorageRecoveryHostOperation::MutateMetadata { .. }
         );
         if matches!(
             &invocation.operation,
             StorageRecoveryHostOperation::MutateShard { .. }
+                | StorageRecoveryHostOperation::MutateMetadata { .. }
                 | StorageRecoveryHostOperation::RestoreShard { .. }
                 | StorageRecoveryHostOperation::VerifySupersededShard { .. }
                 | StorageRecoveryHostOperation::DetachDeviceMapper { .. }
@@ -1227,7 +1341,8 @@ impl StorageHelperSession {
                 expected_drive_uuid,
                 started_at_ms,
             ),
-            StorageRecoveryHostOperation::MutateShard { .. } => mutate(
+            StorageRecoveryHostOperation::MutateShard { .. }
+            | StorageRecoveryHostOperation::MutateMetadata { .. } => mutate(
                 &invocation.context,
                 &self.volume_root,
                 &self.journal_root,
@@ -1307,6 +1422,7 @@ impl StorageHelperSession {
                 && matches!(
                     journal.operation,
                     StorageRecoveryHostOperation::MutateShard { .. }
+                        | StorageRecoveryHostOperation::MutateMetadata { .. }
                 ),
             "mutation lookup journal belongs to another operation or context"
         );
@@ -1859,6 +1975,13 @@ fn inspect_response(
             shard_size_bytes: part_metadata.len(),
             original_sha256: hash_file(&part, None)?,
         },
+        selected_metadata: Some(OfflineInspectedMetadata {
+            relative_metadata_path: xl_meta_path,
+            metadata_device_id: device_id(&xl_meta_metadata),
+            metadata_inode: xl_meta_metadata.ino(),
+            metadata_size_bytes: xl_meta_metadata.len(),
+            original_sha256: sha256_bytes(&xl_meta),
+        }),
     })
 }
 
@@ -1870,13 +1993,28 @@ fn mutate(
     operation_id: &str,
     started_at_ms: u64,
 ) -> Result<StorageRecoveryOperationReceipt> {
-    let StorageRecoveryHostOperation::MutateShard {
-        inspection_operation_id,
-        part_number,
-        byte_offset,
-    } = operation
-    else {
-        unreachable!("mutate receives only MutateShard")
+    let (inspection_operation_id, part_number, byte_offset) = match operation {
+        StorageRecoveryHostOperation::MutateShard {
+            inspection_operation_id,
+            part_number,
+            byte_offset,
+        } => {
+            ensure!(
+                context.case != StorageRecoveryCase::MetadataShardCorruptionAdminDeep,
+                "metadata recovery cannot mutate an object part"
+            );
+            (inspection_operation_id, *part_number, *byte_offset)
+        }
+        StorageRecoveryHostOperation::MutateMetadata {
+            inspection_operation_id,
+        } => {
+            ensure!(
+                context.case == StorageRecoveryCase::MetadataShardCorruptionAdminDeep,
+                "metadata mutation requires the exact metadata recovery case"
+            );
+            (inspection_operation_id, 0, 0)
+        }
+        _ => bail!("file mutation received an unsupported operation"),
     };
     let inspection = load_journal(journal_root, inspection_operation_id)?;
     inspection.operation.validate()?;
@@ -1895,6 +2033,9 @@ fn mutate(
     );
     let StorageRecoveryHostOperation::InspectXlMeta {
         selected_part_number,
+        object_directory,
+        bucket,
+        object_key,
         ..
     } = &inspection.operation
     else {
@@ -1910,23 +2051,37 @@ fn mutate(
     );
     let inspected: OfflineXl2InspectResponse =
         serde_json::from_str(inspection_body).context("decode sealed XL2 inspection response")?;
-    let shard = &inspected.selected_part;
     ensure!(
-        *selected_part_number == *part_number
-            && shard.part_number == *part_number
-            && inspected
-                .layout
-                .part_numbers
-                .iter()
-                .position(|number| number == part_number)
-                .and_then(|index| inspected.layout.relative_part_paths.get(index))
-                == Some(&shard.relative_part_path)
-            && shard
-                .relative_part_path
-                .ends_with(&format!("/part.{part_number}"))
+        context.case != StorageRecoveryCase::MetadataShardCorruptionAdminDeep
+            || (object_directory == &format!("{bucket}/{object_key}")
+                && bucket == &context.identity.bucket),
+        "file mutation inspection directory differs from the owned object"
+    );
+    let shard = inspected.corruption_file(context.case)?;
+    let selected_path_valid =
+        if context.case == StorageRecoveryCase::MetadataShardCorruptionAdminDeep {
+            shard.relative_part_path == format!("{object_directory}/xl.meta")
+                && part_number == 0
+                && byte_offset == 0
+        } else {
+            *selected_part_number == part_number
+                && shard.part_number == part_number
+                && inspected
+                    .layout
+                    .part_numbers
+                    .iter()
+                    .position(|number| *number == part_number)
+                    .and_then(|index| inspected.layout.relative_part_paths.get(index))
+                    == Some(&shard.relative_part_path)
+                && shard
+                    .relative_part_path
+                    .ends_with(&format!("/part.{part_number}"))
+        };
+    ensure!(
+        selected_path_valid
             && shard.shard_device_id == context.host_generation.device_major_minor
-            && *byte_offset < shard.shard_size_bytes,
-        "shard mutation does not match the selected part in the sealed inspection receipt"
+            && byte_offset < shard.shard_size_bytes,
+        "file mutation does not match the sealed inspection receipt"
     );
     let part = open_beneath(
         volume_root,
@@ -1947,11 +2102,11 @@ fn mutate(
     );
     let mut original = [0_u8; 1];
     ensure!(
-        part.read_at(&mut original, *byte_offset)? == 1,
+        part.read_at(&mut original, byte_offset)? == 1,
         "short read at shard mutation offset"
     );
     let mutated = original[0] ^ CONTROLLED_SHARD_XOR_MASK;
-    let expected_mutated_sha256 = hash_file(&part, Some((*byte_offset, mutated)))?;
+    let expected_mutated_sha256 = hash_file(&part, Some((byte_offset, mutated)))?;
     ensure!(
         expected_mutated_sha256 != observed_original,
         "controlled shard mutation would not change the shard digest"
@@ -1976,7 +2131,7 @@ fn mutate(
         shard_device_id: Some(shard.shard_device_id.clone()),
         shard_inode: Some(shard.shard_inode),
         shard_size_bytes: Some(shard.shard_size_bytes),
-        byte_offset: Some(*byte_offset),
+        byte_offset: Some(byte_offset),
         original_byte: Some(original[0]),
         mutated_byte: Some(mutated),
         original_sha256: Some(observed_original.clone()),
@@ -1991,7 +2146,7 @@ fn mutate(
     persist_journal(journal_root, &journal)?;
 
     ensure!(
-        part.write_at(&[mutated], *byte_offset)? == 1,
+        part.write_at(&[mutated], byte_offset)? == 1,
         "short pwrite during shard mutation"
     );
     part.sync_all().context("fsync mutated shard")?;
@@ -2003,7 +2158,7 @@ fn mutate(
     )?;
     let mut readback = [0_u8; 1];
     ensure!(
-        part.read_at(&mut readback, *byte_offset)? == 1 && readback[0] == mutated,
+        part.read_at(&mut readback, byte_offset)? == 1 && readback[0] == mutated,
         "mutated shard byte did not survive fsync/readback"
     );
     let mutated_sha256 = hash_file(&part, None)?;
@@ -2017,13 +2172,17 @@ fn mutate(
         shard_device_id: shard.shard_device_id.clone(),
         shard_inode: shard.shard_inode,
         shard_size_bytes: shard.shard_size_bytes,
-        byte_offset: *byte_offset,
+        byte_offset,
         original_byte: original[0],
         mutated_byte: mutated,
         original_sha256: observed_original,
         mutated_sha256,
     };
-    let response_body = serde_json::to_string(&response)?;
+    let response_body = if context.case == StorageRecoveryCase::MetadataShardCorruptionAdminDeep {
+        serde_json::to_string(&OfflineMetadataMutationResponse::from(response))?
+    } else {
+        serde_json::to_string(&response)?
+    };
     journal.state = JournalState::Mutated;
     let persisted_at_ms = persist_response(journal_root, &mut journal, &response_body)?;
     receipt(
@@ -2057,6 +2216,7 @@ fn restore(
             && matches!(
                 journal.operation,
                 StorageRecoveryHostOperation::MutateShard { .. }
+                    | StorageRecoveryHostOperation::MutateMetadata { .. }
             ),
         "mutation journal is not owned by this exact context"
     );
@@ -2229,6 +2389,7 @@ fn verify_superseded(
             && matches!(
                 mutation.operation,
                 StorageRecoveryHostOperation::MutateShard { .. }
+                    | StorageRecoveryHostOperation::MutateMetadata { .. }
             ),
         "superseded-shard source mutation is absent or not owned by this attempt"
     );
@@ -2261,14 +2422,7 @@ fn verify_superseded(
         ),
         "superseded-shard source mutation is not recoverable"
     );
-    let StorageRecoveryHostOperation::MutateShard {
-        inspection_operation_id,
-        part_number,
-        ..
-    } = &mutation.operation
-    else {
-        bail!("superseded-shard source journal is not a mutation")
-    };
+    let (inspection_operation_id, part_number) = mutation_inspection_source(&mutation.operation)?;
     let original_inspection = load_journal(journal_root, inspection_operation_id)?;
     let post_inspection = load_journal(journal_root, post_inspection_operation_id)?;
     ensure!(
@@ -2336,35 +2490,40 @@ fn verify_superseded(
         .shard_inode
         .context("mutation journal lacks shard inode")?;
     let original_sha256 = required(&mutation.original_sha256, "mutation original digest")?;
+    let original_file = original.corruption_file(context.case)?;
+    let post_file = post.corruption_file(context.case)?;
     ensure!(
         original_bucket == post_bucket
             && original_key == post_key
             && original_object_sha256 == post_object_sha256
             && original_version == post_version
-            && original_part == part_number
-            && post_part == part_number
+            && original_part == post_part
+            && part_number.is_none_or(|part| *original_part == part)
             && original_device == post_device
             && original_drive == post_drive
-            && original.selected_part.part_number == *part_number
-            && post.selected_part.part_number == *part_number
-            && post.selected_part.shard_inode != old_inode
-            && post.selected_part.original_sha256 == original_sha256,
+            && original_file.part_number == post_file.part_number
+            && post_file.shard_inode != old_inode
+            && post_file.original_sha256 == original_sha256
+            && (context.case != StorageRecoveryCase::MetadataShardCorruptionAdminDeep
+                || (post_file.relative_part_path == original_file.relative_part_path
+                    && post.selected_part.original_sha256
+                        == original.selected_part.original_sha256)),
         "post-heal inspection does not prove an exact repaired superseding shard"
     );
     let part = open_beneath(
         volume_root,
-        &post.selected_part.relative_part_path,
+        &post_file.relative_part_path,
         libc::O_RDONLY | libc::O_CLOEXEC,
         0,
     )?;
     validate_part_identity(
         &part,
-        &post.selected_part.shard_device_id,
-        post.selected_part.shard_inode,
-        post.selected_part.shard_size_bytes,
+        &post_file.shard_device_id,
+        post_file.shard_inode,
+        post_file.shard_size_bytes,
     )?;
     ensure!(
-        hash_file(&part, None)? == post.selected_part.original_sha256,
+        hash_file(&part, None)? == post_file.original_sha256,
         "superseding shard changed after the sealed post-heal inspection"
     );
     mutation.state = JournalState::VerifiedSuperseded;
@@ -2375,7 +2534,7 @@ fn verify_superseded(
     let response = OfflineShardRecoveryResponse {
         mutation_operation_id: mutation_operation_id.clone(),
         outcome: crate::fault::storage_recovery_runtime::RestoreOutcome::VerifiedSuperseded,
-        observed_sha256: Some(post.selected_part.original_sha256),
+        observed_sha256: Some(post_file.original_sha256),
     };
     completed_receipt_with_id(
         context,
@@ -2385,6 +2544,22 @@ fn verify_superseded(
         started_at_ms,
         terminal_cleanup_operation_id(operation),
     )
+}
+
+fn mutation_inspection_source(
+    operation: &StorageRecoveryHostOperation,
+) -> Result<(&str, Option<u32>)> {
+    match operation {
+        StorageRecoveryHostOperation::MutateShard {
+            inspection_operation_id,
+            part_number,
+            ..
+        } => Ok((inspection_operation_id, Some(*part_number))),
+        StorageRecoveryHostOperation::MutateMetadata {
+            inspection_operation_id,
+        } => Ok((inspection_operation_id, None)),
+        _ => bail!("source journal is not a supported file mutation"),
+    }
 }
 
 fn validate_terminal_repaired_shard(
@@ -2414,14 +2589,8 @@ fn validate_terminal_repaired_shard(
             );
         }
         JournalState::VerifiedSuperseded => {
-            let StorageRecoveryHostOperation::MutateShard {
-                inspection_operation_id,
-                part_number,
-                ..
-            } = &mutation.operation
-            else {
-                bail!("terminal superseded-shard journal is not a mutation")
-            };
+            let (inspection_operation_id, part_number) =
+                mutation_inspection_source(&mutation.operation)?;
             let post_operation_id = required(
                 &mutation.terminal_post_inspection_operation_id,
                 "terminal post inspection operationId",
@@ -2490,34 +2659,39 @@ fn validate_terminal_repaired_shard(
             else {
                 bail!("terminal post inspection has the wrong operation")
             };
+            let original_file = original_response.corruption_file(context.case)?;
+            let post_file = response.corruption_file(context.case)?;
             ensure!(
                 original_bucket == post_bucket
                     && original_key == post_key
                     && original_object_sha256 == post_object_sha256
                     && original_version == post_version
-                    && original_part == part_number
-                    && post_part == part_number
+                    && original_part == post_part
+                    && part_number.is_none_or(|part| *original_part == part)
                     && original_device == post_device
                     && original_drive == post_drive
-                    && original_response.selected_part.part_number == *part_number
-                    && response.selected_part.part_number == *part_number
+                    && original_file.part_number == post_file.part_number
                     && mutation
                         .shard_inode
-                        .is_some_and(|inode| response.selected_part.shard_inode != inode)
-                    && response.selected_part.original_sha256 == original_sha256,
+                        .is_some_and(|inode| post_file.shard_inode != inode)
+                    && post_file.original_sha256 == original_sha256
+                    && (context.case != StorageRecoveryCase::MetadataShardCorruptionAdminDeep
+                        || (post_file.relative_part_path == original_file.relative_part_path
+                            && response.selected_part.original_sha256
+                                == original_response.selected_part.original_sha256)),
                 "terminal post inspection does not prove the exact superseding shard"
             );
             let part = open_beneath(
                 volume_root,
-                &response.selected_part.relative_part_path,
+                &post_file.relative_part_path,
                 libc::O_RDONLY | libc::O_CLOEXEC,
                 0,
             )?;
             validate_part_identity(
                 &part,
-                &response.selected_part.shard_device_id,
-                response.selected_part.shard_inode,
-                response.selected_part.shard_size_bytes,
+                &post_file.shard_device_id,
+                post_file.shard_inode,
+                post_file.shard_size_bytes,
             )?;
             ensure!(
                 hash_file(&part, None)? == original_sha256,
@@ -3169,6 +3343,7 @@ mod tests {
                 expected_drive_uuid: context.volume.rustfs_drive_uuid.clone(),
             },
             &OfflineXl2InspectResponse {
+                selected_metadata: None,
                 mount_device_id: context.host_generation.device_major_minor.clone(),
                 drive_uuid: context.volume.rustfs_drive_uuid.clone(),
                 format_json_sha256: HASH.to_string(),
@@ -3296,96 +3471,198 @@ mod tests {
     }
 
     #[test]
-    fn inspection_seals_the_volume_relative_object_shard_path() {
+    fn inspection_seals_file_kind_and_recovers_completed_mutations() {
         const VERSION_ID: &str = "01234567-89ab-cdef-0123-456789abcdef";
         const DATA_DIRECTORY: &str = "fedcba98-7654-3210-fedc-ba9876543210";
 
-        let (_temporary, roots) = test_roots();
-        let context = context_for(&roots);
-        let object_directory = "bucket-1/object";
-        let relative_part_path = format!("{object_directory}/{DATA_DIRECTORY}/part.1");
-        let part_path = roots.volume.join(&relative_part_path);
-        fs::create_dir_all(part_path.parent().expect("part parent")).expect("part parent");
-        let original = vec![0x5a; 1024];
-        fs::write(&part_path, &original).expect("part");
-        fs::write(
-            roots.volume.join(object_directory).join("xl.meta"),
-            crate::fault::xl2_inspector::test_fixture(VERSION_ID, Some(DATA_DIRECTORY), &[1]),
-        )
-        .expect("xl.meta");
-        fs::create_dir_all(roots.volume.join(".rustfs.sys")).expect("system directory");
-        fs::write(
-            roots.volume.join(FORMAT_JSON_PATH),
-            serde_json::to_vec(&serde_json::json!({
-                "version": "1",
-                "format": "xl-single",
-                "id": context.volume.rustfs_deployment_id,
-                "xl": {
-                    "version": "3",
-                    "this": context.volume.rustfs_drive_uuid,
-                    "sets": [[context.volume.rustfs_drive_uuid]],
-                    "distributionAlgo": "SIPMOD+PARITY"
+        for (case, superseded) in [
+            (StorageRecoveryCase::OnDiskBitrotAutomaticScanner, false),
+            (StorageRecoveryCase::MetadataShardCorruptionAdminDeep, false),
+            (StorageRecoveryCase::MetadataShardCorruptionAdminDeep, true),
+        ] {
+            let (_temporary, roots) = test_roots();
+            let mut context = context_for(&roots);
+            context.case = case;
+            context.identity.scenario = case.scenario().to_string();
+            let object_directory = "bucket-1/object";
+            let relative_part_path = format!("{object_directory}/{DATA_DIRECTORY}/part.1");
+            let part_path = roots.volume.join(&relative_part_path);
+            fs::create_dir_all(part_path.parent().expect("part parent")).expect("part parent");
+            let original = vec![0x5a; 1024];
+            fs::write(&part_path, &original).expect("part");
+            let metadata_path = roots.volume.join(object_directory).join("xl.meta");
+            let original_metadata =
+                crate::fault::xl2_inspector::test_fixture(VERSION_ID, Some(DATA_DIRECTORY), &[1]);
+            fs::write(&metadata_path, &original_metadata).expect("xl.meta");
+            fs::create_dir_all(roots.volume.join(".rustfs.sys")).expect("system directory");
+            fs::write(
+                roots.volume.join(FORMAT_JSON_PATH),
+                serde_json::to_vec(&serde_json::json!({
+                    "version": "1",
+                    "format": "xl-single",
+                    "id": context.volume.rustfs_deployment_id,
+                    "xl": {
+                        "version": "3",
+                        "this": context.volume.rustfs_drive_uuid,
+                        "sets": [[context.volume.rustfs_drive_uuid]],
+                        "distributionAlgo": "SIPMOD+PARITY"
+                    }
+                }))
+                .expect("format.json body"),
+            )
+            .expect("format.json");
+
+            let mut session =
+                StorageHelperSession::begin(context.clone(), &roots).expect("session");
+            let inspection_operation = StorageRecoveryHostOperation::InspectXlMeta {
+                object_directory: object_directory.to_string(),
+                bucket: context.identity.bucket.clone(),
+                object_key: "object".to_string(),
+                object_sha256: HASH.to_string(),
+                version_id: VERSION_ID.to_string(),
+                selected_part_number: 1,
+                expected_mount_device_id: context.host_generation.device_major_minor.clone(),
+                expected_drive_uuid: context.volume.rustfs_drive_uuid.clone(),
+            };
+            let inspection = session
+                .execute(StorageHelperInvocation {
+                    context: context.clone(),
+                    operation: inspection_operation.clone(),
+                })
+                .expect("inspect real shard hierarchy");
+            let inspected: OfflineXl2InspectResponse =
+                serde_json::from_str(&inspection.response_body).expect("inspection response");
+            assert_eq!(
+                inspected.layout.relative_part_paths,
+                std::slice::from_ref(&relative_part_path)
+            );
+            assert_eq!(
+                inspected.selected_part.relative_part_path,
+                relative_part_path
+            );
+
+            let metadata_case = case == StorageRecoveryCase::MetadataShardCorruptionAdminDeep;
+            if metadata_case {
+                assert!(
+                    session
+                        .execute(StorageHelperInvocation {
+                            context: context.clone(),
+                            operation: StorageRecoveryHostOperation::MutateShard {
+                                inspection_operation_id: inspection.operation_id.clone(),
+                                part_number: 1,
+                                byte_offset: 0,
+                            },
+                        })
+                        .is_err(),
+                    "metadata recovery must reject an object part mutation"
+                );
+            }
+            let mutation_operation = if metadata_case {
+                StorageRecoveryHostOperation::MutateMetadata {
+                    inspection_operation_id: inspection.operation_id.clone(),
                 }
-            }))
-            .expect("format.json body"),
-        )
-        .expect("format.json");
-
-        let mut session = StorageHelperSession::begin(context.clone(), &roots).expect("session");
-        let inspection = session
-            .execute(StorageHelperInvocation {
-                context: context.clone(),
-                operation: StorageRecoveryHostOperation::InspectXlMeta {
-                    object_directory: object_directory.to_string(),
-                    bucket: context.identity.bucket.clone(),
-                    object_key: "object".to_string(),
-                    object_sha256: HASH.to_string(),
-                    version_id: VERSION_ID.to_string(),
-                    selected_part_number: 1,
-                    expected_mount_device_id: context.host_generation.device_major_minor.clone(),
-                    expected_drive_uuid: context.volume.rustfs_drive_uuid.clone(),
-                },
-            })
-            .expect("inspect real shard hierarchy");
-        let inspected: OfflineXl2InspectResponse =
-            serde_json::from_str(&inspection.response_body).expect("inspection response");
-        assert_eq!(
-            inspected.layout.relative_part_paths,
-            std::slice::from_ref(&relative_part_path)
-        );
-        assert_eq!(
-            inspected.selected_part.relative_part_path,
-            relative_part_path
-        );
-
-        let mutation = session
-            .execute(StorageHelperInvocation {
-                context: context.clone(),
-                operation: StorageRecoveryHostOperation::MutateShard {
-                    inspection_operation_id: inspection.operation_id,
+            } else {
+                StorageRecoveryHostOperation::MutateShard {
+                    inspection_operation_id: inspection.operation_id.clone(),
                     part_number: 1,
                     byte_offset: 1,
-                },
-            })
-            .expect("mutate inspected shard");
-        assert_ne!(fs::read(&part_path).expect("mutated part"), original);
-        let restored = session
-            .execute(StorageHelperInvocation {
-                context: context.clone(),
-                operation: StorageRecoveryHostOperation::RestoreShard {
-                    mutation_operation_id: mutation.operation_id,
-                },
-            })
-            .expect("restore inspected shard");
-        session
-            .finish(
-                &context,
-                &StorageRecoveryCleanupProof::BitrotRestored {
+                }
+            };
+            let mutation = session
+                .execute(StorageHelperInvocation {
+                    context: context.clone(),
+                    operation: mutation_operation.clone(),
+                })
+                .expect("mutate inspected shard");
+            if metadata_case {
+                let response: OfflineMetadataMutationResponse =
+                    serde_json::from_str(&mutation.response_body)
+                        .expect("metadata mutation receipt");
+                assert_eq!(
+                    response.relative_metadata_path,
+                    format!("{object_directory}/xl.meta")
+                );
+                assert_eq!(response.byte_offset, 0);
+                assert_eq!(response.original_sha256, sha256_bytes(&original_metadata));
+                assert_eq!(fs::read(&part_path).expect("unchanged part"), original);
+                assert!(
+                    inspect_xl_meta(
+                        &fs::read(&metadata_path).expect("corrupt metadata"),
+                        VERSION_ID
+                    )
+                    .is_err()
+                );
+            } else {
+                assert_ne!(fs::read(&part_path).expect("mutated part"), original);
+                assert_eq!(
+                    fs::read(&metadata_path).expect("metadata remains intact"),
+                    original_metadata
+                );
+            }
+            let lookup = session
+                .query_mutation(&context, &mutation.operation_id)
+                .expect("durable mutation lookup");
+            lookup
+                .validate_for(&context, &mutation.operation_id, &mutation_operation)
+                .expect("lookup owner");
+            assert_eq!(lookup.state, MutationRecoveryState::Mutated);
+            let recovered_receipt = lookup.receipt.as_ref().expect("recovered mutation receipt");
+            recovered_receipt
+                .validate_for(&context, &mutation_operation)
+                .expect("valid durable receipt");
+            assert_eq!(recovered_receipt.operation_id, mutation.operation_id);
+            assert_eq!(recovered_receipt.operation, mutation.operation);
+            assert_eq!(recovered_receipt.context_sha256, mutation.context_sha256);
+            assert_eq!(recovered_receipt.response_body, mutation.response_body);
+            assert_eq!(recovered_receipt.response_sha256, mutation.response_sha256);
+            assert_eq!(
+                recovered_receipt.journal_persisted_at_ms,
+                mutation.journal_persisted_at_ms
+            );
+            drop(session);
+            let mut session =
+                StorageHelperSession::begin(context.clone(), &roots).expect("reconnected session");
+            let recovery_operation = if superseded {
+                fs::rename(&metadata_path, metadata_path.with_extension("corrupt"))
+                    .expect("retain corrupt metadata inode");
+                fs::write(&metadata_path, &original_metadata).expect("healed metadata generation");
+                let post = session
+                    .execute(StorageHelperInvocation {
+                        context: context.clone(),
+                        operation: inspection_operation,
+                    })
+                    .expect("post-heal metadata inspection");
+                StorageRecoveryHostOperation::VerifySupersededShard {
+                    mutation_operation_id: mutation.operation_id.clone(),
+                    post_inspection_operation_id: post.operation_id,
+                }
+            } else {
+                StorageRecoveryHostOperation::RestoreShard {
+                    mutation_operation_id: mutation.operation_id.clone(),
+                }
+            };
+            let restored = session
+                .execute(StorageHelperInvocation {
+                    context: context.clone(),
+                    operation: recovery_operation,
+                })
+                .expect("restore inspected shard");
+            let cleanup = if superseded {
+                StorageRecoveryCleanupProof::BitrotVerifiedSuperseded {
+                    verification_receipt: Box::new(restored),
+                }
+            } else {
+                StorageRecoveryCleanupProof::BitrotRestored {
                     restore_receipt: Box::new(restored),
-                },
-            )
-            .expect("finish session");
-        assert_eq!(fs::read(part_path).expect("restored part"), original);
+                }
+            };
+            session.finish(&context, &cleanup).expect("finish session");
+            assert_eq!(fs::read(part_path).expect("restored part"), original);
+            assert_eq!(
+                fs::read(metadata_path).expect("repaired metadata"),
+                original_metadata
+            );
+        }
     }
 
     #[test]

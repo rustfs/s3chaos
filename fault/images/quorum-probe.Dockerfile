@@ -5,6 +5,7 @@ FROM ${BUILDER_IMAGE} AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --locked --release --bin s3chaos-quorum-probe
+RUN cargo build --locked --release --bin s3chaos-quorum-probe --bin s3chaos-storage-helper
 FROM ${RUSTFS_IMAGE}
 COPY --from=build /src/target/release/s3chaos-quorum-probe /usr/local/bin/s3chaos-quorum-probe
+COPY --from=build /src/target/release/s3chaos-storage-helper /usr/local/bin/s3chaos-storage-helper

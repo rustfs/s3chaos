@@ -401,6 +401,7 @@ struct RecorderState {
     fault_window: FaultWindow,
     records: Vec<OperationRecord>,
     writer: BufWriter<File>,
+    redactions: Vec<crate::rustfs::SecretString>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -431,6 +432,7 @@ impl Recorder {
                 fault_window: FaultWindow::default(),
                 records: Vec::new(),
                 writer,
+                redactions: Vec::new(),
             })),
         })
     }
@@ -495,9 +497,13 @@ impl Recorder {
         record.ended_at_ms = now_ms();
         record.outcome = outcome;
         record.http_status = http_status;
-        record.error = error.map(|message| truncate_error(&message));
-
         let mut state = self.state();
+        record.error = error.map(|mut message| {
+            for secret in &state.redactions {
+                message = message.replace(secret.expose(), "[REDACTED]");
+            }
+            truncate_error(&message)
+        });
         record.ended_sequence = Some(state.next_event_sequence);
         state.next_event_sequence += 1;
         record.durability_cohort = Some(state.durability_cohort);
@@ -517,6 +523,15 @@ impl Recorder {
 
     pub(crate) fn next_event_sequence(&self) -> u64 {
         self.state().next_event_sequence
+    }
+
+    pub(crate) fn redact_secrets(&self, secrets: &[&str]) -> Result<()> {
+        let values = secrets
+            .iter()
+            .map(|value| crate::rustfs::SecretString::new(*value))
+            .collect::<Result<Vec<_>>>()?;
+        self.state().redactions.extend(values);
+        Ok(())
     }
 
     pub fn scenario(&self) -> String {
@@ -617,6 +632,42 @@ mod tests {
         validate_successful_version_identity_uniqueness,
     };
     use std::collections::BTreeSet;
+
+    #[test]
+    fn configured_credentials_are_redacted_before_history_persistence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Recorder::create(
+            dir.path().join("history.jsonl"),
+            "credential-rotation-mid-load",
+            "run-1",
+        )
+        .expect("recorder");
+        recorder
+            .redact_secrets(&["generated-key", "old-private-secret", "new-private-secret"])
+            .expect("redactions");
+        let record = recorder.begin(
+            OperationKind::Get,
+            "bucket",
+            Some("key".to_string()),
+            None,
+            None,
+        );
+        recorder
+            .finish(
+                record,
+                OperationOutcome::Failed,
+                Some(403),
+                Some("generated-key old-private-secret new-private-secret".to_string()),
+            )
+            .expect("finish");
+        let raw = std::fs::read_to_string(recorder.path()).expect("history");
+        let debug = format!("{recorder:?}");
+        for value in ["generated-key", "old-private-secret", "new-private-secret"] {
+            assert!(!raw.contains(value));
+            assert!(!debug.contains(value));
+        }
+        assert!(raw.contains("[REDACTED] [REDACTED] [REDACTED]"));
+    }
 
     #[test]
     fn read_purpose_cannot_hide_a_mutation_from_workload_counts() {

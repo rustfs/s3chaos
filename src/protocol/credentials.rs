@@ -22,20 +22,7 @@ const ADMIN_ACCESS_KEY_ENV: &str = "RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY";
 const ADMIN_SECRET_KEY_ENV: &str = "RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY";
 const ADMIN_SESSION_TOKEN_ENV: &str = "RUSTFS_PROTOCOL_TEST_ADMIN_SESSION_TOKEN";
 
-#[derive(Clone)]
-pub struct SecretString(String);
-
-impl SecretString {
-    pub(crate) fn new(value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
-        ensure!(!value.is_empty(), "secret value must not be empty");
-        Ok(Self(value))
-    }
-
-    pub(crate) fn expose(&self) -> &str {
-        &self.0
-    }
-}
+pub use crate::rustfs::SecretString;
 
 #[derive(Clone)]
 pub struct ExternalIdentityCredential {
@@ -87,12 +74,6 @@ impl WebIdentityToken {
 }
 
 impl fmt::Debug for WebIdentityToken {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("[REDACTED]")
-    }
-}
-
-impl fmt::Debug for SecretString {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("[REDACTED]")
     }

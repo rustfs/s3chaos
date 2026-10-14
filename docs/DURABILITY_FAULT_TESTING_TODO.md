@@ -676,40 +676,53 @@ Reporting only projects this typed checker result into failure-summary fields.
   scenario. Mac Mini `C-PWR-03` stays Deferred; see
   `docs/MAC_MINI_CHAOS_COVERAGE.md`.
 
-### 14. Mac Mini Catalog Gaps That Still Lack A Safe Actuator
+### 14. Mac Mini Fault Executors And Live Qualification
 
-These entries are catalogued as `Planned` and are not qualification cases.
-`make fault-qualify-list` does not select them. Do not mark them executable
-until the blocker in each item is gone.
+These six catalog entries have executable runners and checked suite examples.
+Their evidence still requires live qualification on the prepared candidate
+image, fault backend and storage layout. The two storage-recovery families also
+appear in `make fault-qualify-list` with exact typed cases.
 
-- [ ] TODO: `io-eio-same-pod-two-volumes` (`C-DISK-07`).
-  Meaning: `assess_same_pod_two_volume_geometry` fails closed unless
-  `volumesPerServer >= 2`, the Pod has two data mounts, and those mounts are
-  proven to share one erasure set. The volume binder and the single-fault
-  IOChaos plan still assume one volume per server, so there is no executable
-  runner.
+- [ ] PARTIAL: `io-eio-same-pod-two-volumes` (`C-DISK-07`).
+  Meaning: a four-server/two-volume Tenant binds two mounts on one Pod to the
+  same authenticated erasure set. Two independently identified IOChaos resources
+  and per-volume native EIO observations feed the existing workload/checker and
+  recovery gates. Retain both activation windows and cleanup receipts in live
+  qualification.
 
-- [ ] TODO: `network-partition-during-heal` (`C-LOAD-03`).
-  Meaning: heal progress is captured only inside the planned fresh-volume and
-  bitrot qualification workflows. It is not a composable signal that a
-  NetworkChaos run can wait on.
+- [ ] PARTIAL: `network-partition-during-heal` (`C-LOAD-03`).
+  Meaning: the fresh-volume/AdminDeep workflow uses real moving owned-token
+  counters to trigger a complementary NetworkChaos partition. Actual Pod-network
+  receipts and nonterminal heal samples bracket exact-version reads; restoration,
+  terminal heal and repaired-drive force reads remain required. See
+  `docs/HEAL_PARTITION.md`.
 
-- [ ] TODO: `clock-skew` (`C-TIME-01`).
-  Meaning: Chaos Mesh TimeChaos is not wired, and shifting the clock of an
-  already-running RustFS process is version-dependent. No host clock actuator.
+- [ ] PARTIAL: `clock-skew` (`C-TIME-01`).
+  Meaning: TimeChaos targets CLOCK_REALTIME in the selected RustFS container.
+  HTTP Date observations from that unchanged process and an unaffected control
+  prove the requested shift and restoration. Unsupported interception fails
+  qualification. See `docs/NETWORK_CLOCK_FAULTS.md`.
 
-- [ ] TODO: `credential-rotation-mid-load` (`C-CERT-01`).
-  Meaning: no actuator rotates RustFS or Keycloak credentials while a workload
-  is in flight without inventing a second harness.
+- [ ] PARTIAL: `credential-rotation-mid-load` (`C-CERT-01`).
+  Meaning: the existing admin workflow creates one owned IAM identity, rotates
+  its secret during recorded workload requests, verifies old/new authorization
+  through every Pod, checks all committed versions, and removes the owned user
+  with root credentials. TLS certificate rotation remains unimplemented. See
+  `docs/CREDENTIAL_ROTATION.md`.
 
-- [ ] TODO: `network-split-brain` (`C-TOPO-01`).
-  Meaning: the current NetworkChaos renderer uses overlapping source and target
-  selectors, which isolates the selected Pods from each other instead of
-  leaving two live pairs. Complement selectors are not implemented.
+- [ ] PARTIAL: `network-split-brain` (`C-TOPO-01`).
+  Meaning: exact complementary selectors create two internally connected pairs
+  in one four-Pod erasure set. Native Pod-network probes verify isolation and
+  retained internal connectivity; direct S3 probes reject successful writes
+  without quorum and corrupt/disappearing committed reads. See
+  `docs/NETWORK_CLOCK_FAULTS.md`.
 
-- [ ] TODO: `metadata-shard-corruption` (`C-META-01`/`C-META-02`/`C-META-03`).
-  Meaning: `on-disk-bitrot` remains the planned object-shard case. It does not
-  target metadata shards, and the binder is still one volume. No host mutation.
+- [ ] PARTIAL: `metadata-shard-corruption` (`C-META-01`/`C-META-02`/`C-META-03`).
+  Meaning: the owned offline XL2 inspection selects the exact object-version
+  `xl.meta` header. A closed receipt-bound mutation records file generation and
+  original/mutated hashes, preserves the data shard, and uses the existing
+  journal, AdminDeep heal, exact-quorum force reads and full checker. Broader
+  bucket/system metadata corruption remains unimplemented.
 
 - [ ] DEFERRED: `C-PROC-04` file-descriptor exhaustion.
   Meaning: optional diagnostic pressure. No catalog entry until a cgroup or

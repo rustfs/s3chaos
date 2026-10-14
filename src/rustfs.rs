@@ -24,6 +24,29 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, SystemTime};
 
+pub(crate) mod identity_admin;
+
+#[derive(Clone)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub(crate) fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        ensure!(!value.is_empty(), "secret value must not be empty");
+        Ok(Self(value))
+    }
+
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
 const ADMIN_INFO_PATH: &str = "/rustfs/admin/v3/info";
 
 #[derive(Clone)]
@@ -195,6 +218,7 @@ pub(crate) struct RustfsServerLayout {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RustfsDriveLayout {
     pub uuid: String,
+    pub path: String,
     pub state: String,
     pub pool_index: i32,
     pub set_index: i32,
@@ -239,6 +263,8 @@ struct ServerInfoServer {
 #[derive(Debug, Deserialize)]
 struct ServerInfoDrive {
     uuid: String,
+    #[serde(default)]
+    path: String,
     state: String,
     pool_index: i32,
     set_index: i32,
@@ -352,6 +378,7 @@ fn parse_erasure_layout(response: &[u8]) -> Result<RustfsErasureLayout> {
                 .into_iter()
                 .map(|drive| RustfsDriveLayout {
                     uuid: drive.uuid,
+                    path: drive.path,
                     state: drive.state,
                     pool_index: drive.pool_index,
                     set_index: drive.set_index,

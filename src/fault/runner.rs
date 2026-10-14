@@ -48,6 +48,7 @@ pub(in crate::fault) mod access;
 mod ack;
 mod injection;
 mod node_down;
+pub(crate) mod pod_faults;
 mod post_recovery;
 mod quorum_activation;
 mod recovery;
@@ -83,14 +84,7 @@ pub async fn run_selected_scenario_from_env() -> Result<()> {
 pub async fn run_scenario_with_config(mut config: FaultTestConfig) -> Result<()> {
     scenarios::apply_catalog_defaults(&mut config)?;
     let reference_root = config.cluster.artifacts_dir.clone();
-    let deadline = if matches!(
-        config.scenario.as_str(),
-        scenarios::FRESH_VOLUME_REPLACEMENT_SCENARIO | scenarios::ON_DISK_BITROT_SCENARIO
-    ) {
-        RunDeadline::new(Some(config.duration.as_secs()))?
-    } else {
-        RunDeadline::default()
-    };
+    let deadline = standalone_run_deadline(&config)?;
     run_prepared_scenario_with_config_and_reference_root(
         config,
         reference_root,
@@ -98,6 +92,13 @@ pub async fn run_scenario_with_config(mut config: FaultTestConfig) -> Result<()>
         deadline,
     )
     .await
+}
+
+fn standalone_run_deadline(config: &FaultTestConfig) -> Result<RunDeadline> {
+    let bounded = config
+        .storage_recovery_case
+        .is_some_and(|case| case.is_fresh_volume_replacement() || case.is_corruption_recovery());
+    RunDeadline::new(bounded.then_some(config.duration.as_secs()))
 }
 
 pub(crate) async fn run_prepared_scenario_with_config_and_reference_root(
@@ -133,6 +134,18 @@ pub(crate) async fn run_prepared_scenario_with_config_and_reference_root(
         ExecutionPlan::Admin(admin_plan) => {
             crate::fault::admin_runner::run_admin_case(
                 &config, &collector, &scenario, &plan, admin_plan, &run_id, deadline,
+            )
+            .await
+        }
+        ExecutionPlan::CredentialRotation(rotation_plan) => {
+            crate::fault::credential_rotation::run_credential_rotation_case(
+                &config,
+                &collector,
+                &scenario,
+                &plan,
+                rotation_plan,
+                &run_id,
+                deadline,
             )
             .await
         }
@@ -246,7 +259,17 @@ async fn run_fault_case(
                 if plan.workload_mode.runs_warp() {
                     run.capture_warp_baseline(&prepared)?;
                 }
+                let mut pod_observations = deadline.run(run.prepare_pod_fault_observations(&target)).await?;
+                if let Some(evidence) = pod_observations.as_mut() {
+                    deadline.run(run.pin_clock_workload_endpoint(&mut prepared, evidence)).await?;
+                }
                 let mut active = run.activate_fault(&target, dm_prepared).await?;
+                if let Some(evidence) = pod_observations.as_mut() {
+                    deadline.run(run.observe_pod_fault(evidence, pod_faults::ObservationPhase::Active, Some(&active))).await?;
+                    if let Some(reason) = run.probe_split_brain_sides(evidence, &prepared, &active).await? {
+                        active.deferred_failure.get_or_insert(reason);
+                    }
+                }
                 let skip_typed_oracle = (plan.scenario == scenarios::QUORUM_P_DM_EIO_SCENARIO && active.deferred_failure.is_some()) || active.quorum_activation.as_ref().is_some_and(|evidence| {
                     evidence.evidence().disposition()
                         == crate::fault::quorum::activation::QuorumActivationDisposition::SkipTypedOracleAndRecover
@@ -273,16 +296,22 @@ async fn run_fault_case(
                     run.record_failure("fault-evidence", "fault_not_active", &error, None, None)?;
                     active.deferred_failure.get_or_insert_with(|| format!("{error:#}"));
                 }
+                if let Some(evidence) = pod_observations.as_mut() {
+                    deadline.run(run.observe_pod_fault(evidence, pod_faults::ObservationPhase::AfterWorkload, Some(&active))).await?;
+                }
                 run.prepare_crash_boundary(&mut active.fault, active.fault_active_at_ms)?;
                 run.hold_node_down(&mut prepared, &target, &active.fault)
                     .await?;
                 let removal = run.remove_fault(&mut active.fault)?;
+                if let Some(evidence) = pod_observations.as_mut() {
+                    deadline.run(run.observe_pod_fault(evidence, pod_faults::ObservationPhase::Restored, None)).await?;
+                }
                 run.cleanup_quorum_activation_canaries(&mut active).await;
                 if let Some(fixtures) = probe_fixtures.as_mut() {
                     if let Some(activation) = &active.quorum_activation {
                         for target in &activation.evidence().targets {
                             if target.probe_cleanup.as_ref().is_some_and(|cleanup| cleanup.outcome == crate::fault::quorum::activation::QuorumCanaryCleanupOutcome::Removed) {
-                                fixtures.fixtures.remove(&target.pod_name);
+                                fixtures.fixtures.remove(&quorum_activation::probe_fixture_key(&target.pod_name, &target.mount_path));
                             }
                         }
                     }
@@ -307,6 +336,9 @@ async fn run_fault_case(
                 // suite's failed-attempt accounting.
                 let mut evidence =
                     run.write_recovery_evidence(&target, &active, &workload, &removal, &recovered)?;
+                if let Some(observations) = pod_observations.as_mut() {
+                    deadline.run(run.verify_split_brain_probe_recovery(observations, &prepared.s3)).await?;
+                }
                 run.probe_post_recovery_writes(&prepared.s3).await?;
                 deadline
                     .run(run.verify_recovered(&prepared.s3, &mut workload.workload))
@@ -708,6 +740,27 @@ fn warp_recovery_bucket_name(run_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn standalone_replacement_and_corruption_cases_have_expiring_deadlines() {
+        let mut deadlines = Vec::new();
+        for case in crate::fault::storage_recovery::StorageRecoveryCase::ALL {
+            if case == crate::fault::storage_recovery::StorageRecoveryCase::StaleDiskReturn {
+                continue;
+            }
+            let mut config = FaultTestConfig::for_test("real-cluster", "local-static");
+            config.scenario = case.scenario().to_string();
+            config.storage_recovery_case = Some(case);
+            config.duration = std::time::Duration::from_secs(1);
+            deadlines.push(standalone_run_deadline(&config).unwrap());
+        }
+        let ordinary =
+            standalone_run_deadline(&FaultTestConfig::for_test("real-cluster", "fast-csi"))
+                .unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert!(deadlines.iter().all(|deadline| deadline.check().is_err()));
+        assert!(ordinary.check().is_ok());
+    }
 
     #[test]
     fn fault_bucket_name_is_s3_compatible_and_run_scoped() {

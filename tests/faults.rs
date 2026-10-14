@@ -17,6 +17,126 @@ use anyhow::Result;
 use std::process::{Command, Output};
 
 #[cfg(unix)]
+#[test]
+fn optional_timechaos_cleanup_uses_confirmed_api_discovery() {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
+    for served in [false, true] {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let calls = temporary.path().join("calls.txt");
+        let discovery = serde_json::json!({
+            "kind": "APIResourceList", "groupVersion": "chaos-mesh.org/v1alpha1",
+            "resources": if served { vec![serde_json::json!({"name": "timechaos"})] } else { Vec::new() }
+        })
+        .to_string();
+        let output = Command::new("bash")
+            .args([
+                "-c",
+                r#"
+source "$1"
+discovery_response="$2"
+calls="$3"
+kubectl_cluster() {
+  if [[ "$1" == "get" && "$2" == "--raw" && "$3" == "/apis/chaos-mesh.org/v1alpha1" ]]; then
+    printf '%s\n' "$discovery_response"
+  else
+    return 1
+  fi
+}
+kubectl_ns() { printf '%s\n' "$*" >>"$calls"; }
+cleanup_managed_chaos
+cleanup_fixture
+"#,
+                "optional-timechaos-cleanup-test",
+                script,
+                &discovery,
+                calls.to_str().expect("calls path"),
+            ])
+            .output()
+            .expect("run optional TimeChaos cleanup test");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let calls = std::fs::read_to_string(calls).expect("calls");
+        assert!(calls.contains("delete iochaos,podchaos,networkchaos,stresschaos"));
+        assert_eq!(calls.contains("delete timechaos"), served);
+        assert_eq!(calls.contains("get timechaos"), served);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn timechaos_cleanup_reports_discovery_delete_and_read_errors() {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
+    for failure in ["discovery", "invalid-discovery", "delete", "read"] {
+        let output = Command::new("bash")
+            .args([
+                "-c",
+                r#"
+source "$1"
+failure="$2"
+kubectl_cluster() {
+  if [[ "$2" != "--raw" ]]; then return 1; fi
+  case "$failure" in
+    discovery) return 7 ;;
+    invalid-discovery) printf '{"kind":"Status","reason":"Forbidden"}\n' ;;
+    *) printf '{"kind":"APIResourceList","groupVersion":"chaos-mesh.org/v1alpha1","resources":[{"name":"timechaos"}]}\n' ;;
+  esac
+}
+kubectl_ns() {
+  if [[ "$3" == "timechaos" && ( "$failure" == "delete" && "$2" == "delete" || "$failure" == "read" && "$2" == "get" ) ]]; then return 9; fi
+}
+if [[ "$failure" == "read" ]]; then
+  if cleanup_fixture; then exit 1; fi
+else
+  if cleanup_managed_chaos; then exit 1; fi
+fi
+printf 'rejected\n'
+"#,
+                "timechaos-cleanup-errors-test",
+                script,
+                failure,
+            ])
+            .output()
+            .expect("run TimeChaos cleanup error test");
+        assert!(
+            output.status.success(),
+            "{failure}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "rejected\n");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn chaos_cleanup_error_keeps_operator_and_fixture_cleanup_running() {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+source "$1"
+cleanup_managed_chaos() { return 9; }
+restore_paused_operators() { printf 'operator-restored\n'; }
+cleanup_fixture() { printf 'fixture-cleaned\n'; }
+cleanup
+"#,
+            "chaos-cleanup-error-test",
+            script,
+        ])
+        .output()
+        .expect("run cleanup continuation test");
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "operator-restored\nfixture-cleaned\n"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Chaos cleanup exit 9"));
+}
+
+#[cfg(unix)]
 fn fault_supervision_output(host_storage_mutation_active: bool) -> Output {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
     Command::new("bash")
@@ -356,8 +476,10 @@ list_qualification_cases
             "admin-rebalance\tadmin-rebalance\tadmin\t-\n",
             "fresh-volume-replacement-automatic-replacement\tfresh-volume-replacement\tstorage\tfresh-volume-replacement-automatic-replacement\n",
             "fresh-volume-replacement-admin-deep\tfresh-volume-replacement\tstorage\tfresh-volume-replacement-admin-deep\n",
+            "network-partition-during-heal-admin-deep\tnetwork-partition-during-heal\tstorage\tnetwork-partition-during-heal-admin-deep\n",
             "on-disk-bitrot-automatic-scanner\ton-disk-bitrot\tstorage\ton-disk-bitrot-automatic-scanner\n",
             "on-disk-bitrot-admin-deep\ton-disk-bitrot\tstorage\ton-disk-bitrot-admin-deep\n",
+            "metadata-shard-corruption-admin-deep\tmetadata-shard-corruption\tstorage\tmetadata-shard-corruption-admin-deep\n",
             "stale-disk-return\tstale-disk-return-detect\tstorage\tstale-disk-return\n",
         )
     );

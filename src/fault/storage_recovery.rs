@@ -89,24 +89,29 @@ impl StorageRecoveryArtifactIdentity {
     }
 }
 
-/// Closed set of storage-recovery cases. These are variants of three catalog
+/// Closed set of storage-recovery cases. These are variants of catalog
 /// families, not generic workflow steps or backend parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageRecoveryCase {
     FreshVolumeReplacementAutomaticReplacement,
     FreshVolumeReplacementAdminDeep,
+    #[serde(rename = "network-partition-during-heal-admin-deep")]
+    FreshVolumeReplacementPartitionDuringHeal,
     OnDiskBitrotAutomaticScanner,
     OnDiskBitrotAdminDeep,
+    MetadataShardCorruptionAdminDeep,
     StaleDiskReturn,
 }
 
 impl StorageRecoveryCase {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::FreshVolumeReplacementAutomaticReplacement,
         Self::FreshVolumeReplacementAdminDeep,
+        Self::FreshVolumeReplacementPartitionDuringHeal,
         Self::OnDiskBitrotAutomaticScanner,
         Self::OnDiskBitrotAdminDeep,
+        Self::MetadataShardCorruptionAdminDeep,
         Self::StaleDiskReturn,
     ];
 
@@ -114,7 +119,9 @@ impl StorageRecoveryCase {
         match self {
             Self::FreshVolumeReplacementAutomaticReplacement
             | Self::FreshVolumeReplacementAdminDeep => "fresh-volume-replacement",
+            Self::FreshVolumeReplacementPartitionDuringHeal => "network-partition-during-heal",
             Self::OnDiskBitrotAutomaticScanner | Self::OnDiskBitrotAdminDeep => "on-disk-bitrot",
+            Self::MetadataShardCorruptionAdminDeep => "metadata-shard-corruption",
             Self::StaleDiskReturn => "stale-disk-return-detect",
         }
     }
@@ -125,8 +132,12 @@ impl StorageRecoveryCase {
                 "fresh-volume-replacement-automatic-replacement"
             }
             Self::FreshVolumeReplacementAdminDeep => "fresh-volume-replacement-admin-deep",
+            Self::FreshVolumeReplacementPartitionDuringHeal => {
+                "network-partition-during-heal-admin-deep"
+            }
             Self::OnDiskBitrotAutomaticScanner => "on-disk-bitrot-automatic-scanner",
             Self::OnDiskBitrotAdminDeep => "on-disk-bitrot-admin-deep",
+            Self::MetadataShardCorruptionAdminDeep => "metadata-shard-corruption-admin-deep",
             Self::StaleDiskReturn => "stale-disk-return",
         }
     }
@@ -135,15 +146,26 @@ impl StorageRecoveryCase {
         Self::parse(value)
     }
 
+    pub(crate) fn default_for_scenario(scenario: &str) -> Option<Self> {
+        match scenario {
+            "network-partition-during-heal" => {
+                Some(Self::FreshVolumeReplacementPartitionDuringHeal)
+            }
+            "metadata-shard-corruption" => Some(Self::MetadataShardCorruptionAdminDeep),
+            _ => None,
+        }
+    }
+
     pub fn heal_mode(self) -> Option<HealMode> {
         match self {
             Self::FreshVolumeReplacementAutomaticReplacement => {
                 Some(HealMode::AutomaticReplacement)
             }
             Self::OnDiskBitrotAutomaticScanner => Some(HealMode::AutomaticScanner),
-            Self::FreshVolumeReplacementAdminDeep | Self::OnDiskBitrotAdminDeep => {
-                Some(HealMode::AdminDeep)
-            }
+            Self::FreshVolumeReplacementAdminDeep
+            | Self::FreshVolumeReplacementPartitionDuringHeal
+            | Self::OnDiskBitrotAdminDeep
+            | Self::MetadataShardCorruptionAdminDeep => Some(HealMode::AdminDeep),
             Self::StaleDiskReturn => None,
         }
     }
@@ -153,6 +175,24 @@ impl StorageRecoveryCase {
             .into_iter()
             .find(|case| case.as_str() == value)
             .with_context(|| format!("unknown storage-recovery case {value:?}"))
+    }
+
+    pub(crate) fn is_fresh_volume_replacement(self) -> bool {
+        matches!(
+            self,
+            Self::FreshVolumeReplacementAutomaticReplacement
+                | Self::FreshVolumeReplacementAdminDeep
+                | Self::FreshVolumeReplacementPartitionDuringHeal
+        )
+    }
+
+    pub fn is_corruption_recovery(self) -> bool {
+        matches!(
+            self,
+            Self::OnDiskBitrotAutomaticScanner
+                | Self::OnDiskBitrotAdminDeep
+                | Self::MetadataShardCorruptionAdminDeep
+        )
     }
 }
 
@@ -512,7 +552,10 @@ impl FreshVolumeReplacementProof {
         );
         self.identity.validate()?;
         ensure!(
-            self.identity.scenario == "fresh-volume-replacement",
+            matches!(
+                self.identity.scenario.as_str(),
+                "fresh-volume-replacement" | "network-partition-during-heal"
+            ),
             "fresh replacement proof is bound to the wrong scenario"
         );
         self.original.validate()?;
@@ -2959,7 +3002,7 @@ impl ForceReadThroughProof {
         ensure!(
             matches!(
                 self.identity.scenario.as_str(),
-                "fresh-volume-replacement" | "on-disk-bitrot"
+                "fresh-volume-replacement" | "on-disk-bitrot" | "network-partition-during-heal"
             ),
             "force-read proof is bound to a scenario without a repaired drive"
         );
@@ -6329,8 +6372,17 @@ mod tests {
     }
 
     #[test]
-    fn storage_recovery_case_matrix_has_five_distinct_qualified_variants() {
-        assert_eq!(StorageRecoveryCase::ALL.len(), 5);
+    fn storage_recovery_case_matrix_preserves_distinct_recovery_variants() {
+        assert_eq!(StorageRecoveryCase::ALL.len(), 7);
+        for case in StorageRecoveryCase::ALL {
+            let value = serde_json::to_value(case).expect("serialized case");
+            assert_eq!(value.as_str(), Some(case.as_str()));
+            assert_eq!(
+                serde_json::from_value::<StorageRecoveryCase>(value).unwrap(),
+                case
+            );
+            assert_eq!(StorageRecoveryCase::parse(case.as_str()).unwrap(), case);
+        }
         assert_eq!(
             StorageRecoveryCase::ALL
                 .iter()
@@ -6346,6 +6398,14 @@ mod tests {
             2
         );
         assert_eq!(StorageRecoveryCase::StaleDiskReturn.heal_mode(), None);
+        assert_eq!(
+            StorageRecoveryCase::MetadataShardCorruptionAdminDeep.heal_mode(),
+            Some(HealMode::AdminDeep)
+        );
+        assert_eq!(
+            StorageRecoveryCase::FreshVolumeReplacementPartitionDuringHeal.heal_mode(),
+            Some(HealMode::AdminDeep)
+        );
         assert_eq!(
             StorageRecoveryCase::FreshVolumeReplacementAutomaticReplacement.heal_mode(),
             Some(HealMode::AutomaticReplacement)

@@ -54,7 +54,7 @@ use crate::{
         },
         storage_recovery_helper::{
             CONTROLLED_SHARD_XOR_MASK, MutationJournalLookup, OfflineShardMutationResponse,
-            OfflineShardRecoveryResponse, OfflineXl2InspectResponse,
+            OfflineShardRecoveryResponse, OfflineXl2InspectResponse, decode_corruption_mutation,
         },
         storage_recovery_lease::{
             KubernetesStorageLeaseAdapter, StorageRecoveryCleanupProof,
@@ -97,6 +97,14 @@ pub const BITROT_CLEANUP_ARTIFACT: &str = "bitrot-cleanup.json";
 pub const BITROT_WORKFLOW_ARTIFACT: &str = "bitrot-workflow.json";
 pub const BITROT_FAILURE_ARTIFACT: &str = "bitrot-failure.json";
 pub const BITROT_ARTIFACT_SCHEMA_VERSION: u8 = 2;
+
+pub(crate) fn corruption_artifact_name(scenario: &str, name: &str) -> String {
+    if scenario == crate::fault::scenarios::METADATA_SHARD_CORRUPTION_SCENARIO {
+        name.replacen("bitrot-", "metadata-", 1)
+    } else {
+        name.to_string()
+    }
+}
 const MIN_NON_INLINE_PROBE_BYTES: u64 = 8 * 1024;
 const SCANNER_STATUS_PATH: &str = "/rustfs/admin/v3/scanner/status";
 const LEASE_RENEWAL_MARGIN_MS: u64 = 5_000;
@@ -570,14 +578,10 @@ impl BitrotSelectionEvidence {
     pub fn validate(&self) -> Result<OfflineXl2InspectResponse> {
         ensure!(
             self.schema_version == BITROT_ARTIFACT_SCHEMA_VERSION
-                && matches!(
-                    self.case,
-                    StorageRecoveryCase::OnDiskBitrotAutomaticScanner
-                        | StorageRecoveryCase::OnDiskBitrotAdminDeep
-                )
+                && self.case.is_corruption_recovery()
                 && self.context.case == self.case
                 && self.context.identity == self.identity
-                && self.identity.scenario == "on-disk-bitrot",
+                && self.identity.scenario == self.case.scenario(),
             "bitrot selection identity or case is invalid"
         );
         self.context.validate()?;
@@ -628,6 +632,13 @@ impl BitrotSelectionEvidence {
             &self.inspection_receipt.response_body,
         )
         .context("decode bitrot selection inspection")?;
+        let selected_file = response.corruption_file(self.case)?;
+        if self.case == StorageRecoveryCase::MetadataShardCorruptionAdminDeep {
+            ensure!(
+                selected_file.relative_part_path == format!("{object_directory}/xl.meta"),
+                "selected metadata path differs from the sealed object directory"
+            );
+        }
         ensure!(
             object_directory
                 == &volume_relative_object_directory(&self.probe.bucket, &self.probe.object_key)
@@ -939,30 +950,40 @@ impl BitrotMutationEvidence {
         );
         self.mutation_receipt
             .validate_for(&selection.context, &self.mutation_receipt.operation)?;
-        let StorageRecoveryHostOperation::MutateShard {
-            inspection_operation_id,
-            part_number,
-            byte_offset,
-        } = &self.mutation_receipt.operation
-        else {
-            bail!("bitrot mutation receipt has the wrong operation")
-        };
-        let response = serde_json::from_str::<OfflineShardMutationResponse>(
-            &self.mutation_receipt.response_body,
-        )
-        .context("decode bitrot mutation response")?;
+        let selected_file = inspected.corruption_file(selection.case)?;
+        let (inspection_operation_id, part_number, byte_offset) =
+            match &self.mutation_receipt.operation {
+                StorageRecoveryHostOperation::MutateShard {
+                    inspection_operation_id,
+                    part_number,
+                    byte_offset,
+                } if selection.case != StorageRecoveryCase::MetadataShardCorruptionAdminDeep => {
+                    (inspection_operation_id, *part_number, *byte_offset)
+                }
+                StorageRecoveryHostOperation::MutateMetadata {
+                    inspection_operation_id,
+                } if selection.case == StorageRecoveryCase::MetadataShardCorruptionAdminDeep => {
+                    (inspection_operation_id, 0, 0)
+                }
+                _ => bail!("corruption receipt has the wrong file operation"),
+            };
+        let response =
+            decode_corruption_mutation(selection.case, &self.mutation_receipt.response_body)
+                .context("decode bitrot mutation response")?;
         ensure!(
             inspection_operation_id == &self.selection_operation_id
-                && *part_number == inspected.selected_part.part_number
-                && *byte_offset == response.byte_offset
+                && part_number == selected_file.part_number
+                && byte_offset == response.byte_offset
                 && response.journal_operation_id == self.mutation_receipt.operation_id
-                && response.relative_part_path == inspected.selected_part.relative_part_path
-                && response.shard_device_id == inspected.selected_part.shard_device_id
-                && response.shard_inode == inspected.selected_part.shard_inode
-                && response.shard_size_bytes == inspected.selected_part.shard_size_bytes
-                && response.original_sha256 == inspected.selected_part.original_sha256
+                && response.relative_part_path == selected_file.relative_part_path
+                && response.shard_device_id == selected_file.shard_device_id
+                && response.shard_inode == selected_file.shard_inode
+                && response.shard_size_bytes == selected_file.shard_size_bytes
+                && response.original_sha256 == selected_file.original_sha256
                 && response.mutated_sha256 != response.original_sha256
                 && response.original_byte ^ response.mutated_byte == CONTROLLED_SHARD_XOR_MASK
+                && (selection.case != StorageRecoveryCase::MetadataShardCorruptionAdminDeep
+                    || response.original_byte == b'X')
                 && self.mutated_at_ms == self.mutation_receipt.completed_at_ms,
             "bitrot mutation response is not the controlled change to the selected shard"
         );
@@ -1718,8 +1739,11 @@ impl BitrotHealEvidence {
                 cancel,
             } => {
                 ensure!(
-                    selection.case == StorageRecoveryCase::OnDiskBitrotAdminDeep
-                        && cancel.is_none(),
+                    matches!(
+                        selection.case,
+                        StorageRecoveryCase::OnDiskBitrotAdminDeep
+                            | StorageRecoveryCase::MetadataShardCorruptionAdminDeep
+                    ) && cancel.is_none(),
                     "successful admin-deep recovery has the wrong case or a cancel receipt"
                 );
                 terminal_status.validate("admin heal terminal status")?;
@@ -1898,6 +1922,7 @@ impl BitrotCleanupEvidence {
             &self.post_inspection_receipt.response_body,
         )
         .context("decode post-heal XL2 inspection")?;
+        let post_file = post.corruption_file(selection.case)?;
         ensure!(
             object_directory
                 == &volume_relative_object_directory(
@@ -1908,8 +1933,12 @@ impl BitrotCleanupEvidence {
                 && object_key == &selection.probe.object_key
                 && post.layout.version_id == selection.probe.version_id
                 && post.drive_uuid == selection.context.volume.rustfs_drive_uuid
-                && post.selected_part.original_sha256 == mutation.original_sha256
-                && post.selected_part.original_sha256 != mutation.mutated_sha256,
+                && post_file.original_sha256 == mutation.original_sha256
+                && post_file.original_sha256 != mutation.mutated_sha256
+                && (selection.case != StorageRecoveryCase::MetadataShardCorruptionAdminDeep
+                    || (post_file.relative_part_path == format!("{object_directory}/xl.meta")
+                        && post.selected_part.original_sha256
+                            == selection.validate()?.selected_part.original_sha256)),
             "post-heal inspection does not prove the selected shard hash transition"
         );
         heal.validate(
@@ -2022,8 +2051,14 @@ impl BitrotEmergencyCleanupEvidence {
             .context("successful mutation cleanup lacks a shard proof")?;
         let receipt = terminal_shard_cleanup_receipt(cleanup)?;
         if let Some(mutation) = mutation {
-            let response: OfflineShardMutationResponse =
-                serde_json::from_str(&mutation.mutation_receipt.response_body)?;
+            let case = match mutation.mutation_receipt.operation {
+                StorageRecoveryHostOperation::MutateMetadata { .. } => {
+                    StorageRecoveryCase::MetadataShardCorruptionAdminDeep
+                }
+                _ => StorageRecoveryCase::OnDiskBitrotAdminDeep,
+            };
+            let response =
+                decode_corruption_mutation(case, &mutation.mutation_receipt.response_body)?;
             ensure!(
                 response.journal_operation_id == mutation.mutation_receipt.operation_id
                     && receipt.started_at_ms >= mutation.mutation_receipt.completed_at_ms,
@@ -2059,8 +2094,11 @@ impl BitrotEmergencyCleanupEvidence {
                 receipt.validate("admin heal emergency cleanup")?;
                 let expected_path = format!("/rustfs/admin/v3/heal/{}", context.identity.bucket);
                 ensure!(
-                    context.case == StorageRecoveryCase::OnDiskBitrotAdminDeep
-                        && receipt.request_path.as_deref() == Some(expected_path.as_str())
+                    matches!(
+                        context.case,
+                        StorageRecoveryCase::OnDiskBitrotAdminDeep
+                            | StorageRecoveryCase::MetadataShardCorruptionAdminDeep
+                    ) && receipt.request_path.as_deref() == Some(expected_path.as_str())
                         && matches!(
                             receipt.api_revision.as_str(),
                             "v3/heal/cancel" | "v3/heal/exact-scope-cancel"
@@ -2185,11 +2223,7 @@ impl BitrotFailureEvidence {
                 && self.run_id == run_id
                 && !self.primary_error.trim().is_empty()
                 && self.observed_at_ms >= self.cleanup.completed_at_ms
-                && matches!(
-                    self.case,
-                    StorageRecoveryCase::OnDiskBitrotAutomaticScanner
-                        | StorageRecoveryCase::OnDiskBitrotAdminDeep
-                )
+                && self.case.is_corruption_recovery()
                 && matches!(
                     self.stage.as_str(),
                     "target-proof"
@@ -2209,7 +2243,7 @@ impl BitrotFailureEvidence {
             ensure!(
                 context.identity.run_id == self.run_id
                     && context.identity.case_name == case_name
-                    && context.identity.scenario == "on-disk-bitrot"
+                    && context.identity.scenario == self.case.scenario()
                     && context.case == self.case,
                 "bitrot failure context belongs to another run or case"
             );
@@ -2293,7 +2327,9 @@ pub fn validate_on_disk_bitrot_evidence(evidence: &OnDiskBitrotEvidenceSet<'_>) 
                 == sha256_bytes(evidence.checker_report_body.as_bytes())
             && evidence.workflow.post_write_report_sha256
                 == sha256_bytes(evidence.post_write_report_body.as_bytes())
-            && selection_response.selected_part.original_sha256
+            && selection_response
+                .corruption_file(evidence.selection.case)?
+                .original_sha256
                 == mutation_response.original_sha256,
         "bitrot workflow artifact digests or identities are not transitively bound"
     );
@@ -2494,6 +2530,12 @@ impl BitrotLiveTargetConfig {
                     .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
                 && self.selected_part_number > 0,
             "bitrot object identity is invalid"
+        );
+        ensure!(
+            config.storage_recovery_case
+                != Some(StorageRecoveryCase::MetadataShardCorruptionAdminDeep)
+                || self.mutation_byte_offset == 0,
+            "metadata corruption uses the fixed XL2 header byte at offset zero"
         );
         validate_bitrot_lease_timing(
             self.lease_duration_seconds,
@@ -2917,7 +2959,13 @@ impl LiveOnDiskBitrotRuntime {
         ensure!(
             config.destructive_enabled
                 && config.storage_recovery_case == Some(storage_plan.case)
-                && target.bucket.starts_with("s3chaos-bitrot-"),
+                && target.bucket.starts_with(
+                    if storage_plan.case == StorageRecoveryCase::MetadataShardCorruptionAdminDeep {
+                        "s3chaos-metadata-"
+                    } else {
+                        "s3chaos-bitrot-"
+                    }
+                ),
             "bitrot live adapter lacks destructive authorization, an exact case, or a dedicated bucket"
         );
         let case_dir = collector.case_dir(scenario.case_name);
@@ -3089,7 +3137,11 @@ impl LiveOnDiskBitrotRuntime {
 
     fn persist_json(&self, name: &str, value: &impl Serialize) -> Result<String> {
         let body = serde_json::to_string_pretty(value)?;
-        self.collector.write_text(&self.case_name, name, &body)?;
+        self.collector.write_text(
+            &self.case_name,
+            &corruption_artifact_name(self.case.scenario(), name),
+            &body,
+        )?;
         Ok(body)
     }
 
@@ -3110,7 +3162,10 @@ impl LiveOnDiskBitrotRuntime {
         let path = self
             .collector
             .case_dir(&self.case_name)
-            .join(BITROT_HEAL_PROGRESS_ARTIFACT);
+            .join(corruption_artifact_name(
+                self.case.scenario(),
+                BITROT_HEAL_PROGRESS_ARTIFACT,
+            ));
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -3146,8 +3201,11 @@ impl LiveOnDiskBitrotRuntime {
     fn reset_heal_progress(&mut self) -> Result<()> {
         self.heal_progress.clear();
         self.heal_progress_bytes = 0;
-        self.collector
-            .write_text(&self.case_name, BITROT_HEAL_PROGRESS_ARTIFACT, "")?;
+        self.collector.write_text(
+            &self.case_name,
+            &corruption_artifact_name(self.case.scenario(), BITROT_HEAL_PROGRESS_ARTIFACT),
+            "",
+        )?;
         Ok(())
     }
 
@@ -3415,7 +3473,7 @@ impl LiveOnDiskBitrotRuntime {
             &self.config.cluster,
             &self.config.chaos_namespace,
             &self.run_id,
-            "on-disk-bitrot",
+            self.case.scenario(),
             &self.config.rustfs_volume_path,
             100,
             Duration::from_secs(300),
@@ -4222,7 +4280,7 @@ impl OnDiskBitrotRuntimePort for LiveOnDiskBitrotRuntime {
         volume.observed_at_ms = observation.observed_at_ms;
         let identity = StorageRecoveryArtifactIdentity {
             run_id: self.run_id.clone(),
-            scenario: "on-disk-bitrot".to_string(),
+            scenario: case.scenario().to_string(),
             case_name: self.case_name.clone(),
             bucket: self.target.bucket.clone(),
         };
@@ -4309,7 +4367,7 @@ impl OnDiskBitrotRuntimePort for LiveOnDiskBitrotRuntime {
         self.helper = Some(helper);
         let preflight = PreflightSummary::single_run(
             &self.config,
-            "on-disk-bitrot",
+            self.case.scenario(),
             &self.run_id,
             vec![PreflightPhase::new(
                 "target-proof",
@@ -4550,10 +4608,16 @@ impl OnDiskBitrotRuntimePort for LiveOnDiskBitrotRuntime {
                 .as_ref()
                 .context("controlled mutation requires the active exact cohort")?,
         )?;
-        let operation = StorageRecoveryHostOperation::MutateShard {
-            inspection_operation_id: inspection_operation_id.to_string(),
-            part_number,
-            byte_offset: self.target.mutation_byte_offset,
+        let operation = if self.case == StorageRecoveryCase::MetadataShardCorruptionAdminDeep {
+            StorageRecoveryHostOperation::MutateMetadata {
+                inspection_operation_id: inspection_operation_id.to_string(),
+            }
+        } else {
+            StorageRecoveryHostOperation::MutateShard {
+                inspection_operation_id: inspection_operation_id.to_string(),
+                part_number,
+                byte_offset: self.target.mutation_byte_offset,
+            }
         };
         let operation_id = Uuid::new_v4().to_string();
         self.pending_mutation = Some((operation_id.clone(), operation.clone()));
@@ -4582,13 +4646,15 @@ impl OnDiskBitrotRuntimePort for LiveOnDiskBitrotRuntime {
         self.history.mark_fault_active_at(receipt.completed_at_ms);
         let collector = self.collector.clone();
         let case_name = self.case_name.clone();
+        let artifact_name =
+            corruption_artifact_name(self.case.scenario(), BITROT_MUTATION_ARTIFACT);
         retain_mutation_before_persist(
             &mut self.mutation,
             &mut self.pending_mutation,
             evidence,
             |evidence| {
                 let body = serde_json::to_string_pretty(evidence)?;
-                collector.write_text(&case_name, BITROT_MUTATION_ARTIFACT, &body)?;
+                collector.write_text(&case_name, &artifact_name, &body)?;
                 Ok(())
             },
         )?;
@@ -4634,8 +4700,7 @@ impl OnDiskBitrotRuntimePort for LiveOnDiskBitrotRuntime {
             }
             _ => bail!("on-disk-bitrot received a non-bitrot heal mode"),
         };
-        let mutated =
-            serde_json::from_str::<OfflineShardMutationResponse>(&mutation.response_body)?;
+        let mutated = decode_corruption_mutation(self.case, &mutation.response_body)?;
         let automatic_scanner = matches!(heal, BitrotHealEvidence::AutomaticScanner { .. });
         let mut repair_observations = Vec::new();
         let mut repair_observation_bytes = 0_usize;
@@ -4665,8 +4730,9 @@ impl OnDiskBitrotRuntimePort for LiveOnDiskBitrotRuntime {
                 .await?;
             let post =
                 serde_json::from_str::<OfflineXl2InspectResponse>(&inspection.response_body)?;
-            let repaired = post.selected_part.original_sha256 == mutated.original_sha256
-                && post.selected_part.original_sha256 != mutated.mutated_sha256;
+            let post_file = post.corruption_file(self.case)?;
+            let repaired = post_file.original_sha256 == mutated.original_sha256
+                && post_file.original_sha256 != mutated.mutated_sha256;
             if automatic_scanner
                 && should_retain_scanner_round(
                     repair_observations.len(),
@@ -4721,16 +4787,17 @@ impl OnDiskBitrotRuntimePort for LiveOnDiskBitrotRuntime {
         {
             *evidence = repair_observations;
         }
-        let cleanup_operation = if post.selected_part.shard_inode == mutated.shard_inode {
-            StorageRecoveryHostOperation::RestoreShard {
-                mutation_operation_id: mutation.operation_id.clone(),
-            }
-        } else {
-            StorageRecoveryHostOperation::VerifySupersededShard {
-                mutation_operation_id: mutation.operation_id.clone(),
-                post_inspection_operation_id: post_inspection.operation_id.clone(),
-            }
-        };
+        let cleanup_operation =
+            if post.corruption_file(self.case)?.shard_inode == mutated.shard_inode {
+                StorageRecoveryHostOperation::RestoreShard {
+                    mutation_operation_id: mutation.operation_id.clone(),
+                }
+            } else {
+                StorageRecoveryHostOperation::VerifySupersededShard {
+                    mutation_operation_id: mutation.operation_id.clone(),
+                    post_inspection_operation_id: post_inspection.operation_id.clone(),
+                }
+            };
         let cleanup_context = self.renew_current().await?;
         let cleanup_receipt = self
             .helper_mut()?
@@ -4843,7 +4910,7 @@ impl LiveOnDiskBitrotRuntime {
             self.collector
                 .case_dir(&self.case_name)
                 .join(POST_RECOVERY_WRITE_HISTORY_ARTIFACT),
-            "on-disk-bitrot",
+            self.case.scenario(),
             &self.run_id,
         )?;
         let post_report = run_post_recovery_write_probe(&PostRecoveryWriteRequest {
@@ -4992,11 +5059,7 @@ pub async fn execute_on_disk_bitrot(
     case: StorageRecoveryCase,
 ) -> Result<()> {
     ensure!(
-        matches!(
-            case,
-            StorageRecoveryCase::OnDiskBitrotAutomaticScanner
-                | StorageRecoveryCase::OnDiskBitrotAdminDeep
-        ),
+        case.is_corruption_recovery(),
         "on-disk-bitrot driver received a case from another scenario"
     );
     let acquired = runtime.acquire(case).await?;
@@ -5036,6 +5099,13 @@ pub async fn execute_on_disk_bitrot(
         )
         .await?;
     mutation.validate_for(&mutation_context, &mutation.operation)?;
+    BitrotMutationEvidence {
+        schema_version: BITROT_ARTIFACT_SCHEMA_VERSION,
+        selection_operation_id: selection.inspection_receipt.operation_id.clone(),
+        mutation_receipt: Box::new(mutation.clone()),
+        mutated_at_ms: mutation.completed_at_ms,
+    }
+    .validate(&selection)?;
     let corruption_context = runtime.renew(&mutation_context).await?;
     validate_renewed_context(&mutation_context, &corruption_context)?;
     let corrupted = runtime
@@ -5078,9 +5148,8 @@ pub async fn execute_on_disk_bitrot(
             case.heal_mode().context("bitrot case lacks a heal mode")?,
         )
         .await?;
-    let mutation_response =
-        serde_json::from_str::<OfflineShardMutationResponse>(&mutation.response_body)
-            .context("decode runtime mutation receipt")?;
+    let mutation_response = decode_corruption_mutation(case, &mutation.response_body)
+        .context("decode runtime mutation receipt")?;
     heal.validate(
         &selection,
         corrupted.completed_at_ms,
@@ -5234,7 +5303,10 @@ mod tests {
         quorum::ErasureSetMember,
         scenarios::{ON_DISK_BITROT_SCENARIO, scenario_spec},
         storage_recovery::StorageVolumeIdentity,
-        storage_recovery_helper::{OfflineInspectedShard, OfflineShardRecoveryResponse},
+        storage_recovery_helper::{
+            OfflineInspectedMetadata, OfflineInspectedShard, OfflineMetadataMutationResponse,
+            OfflineShardRecoveryResponse,
+        },
         storage_recovery_runtime::{
             HostFlockProof, HostGenerationIdentity, KubernetesLeaseProof,
             KubernetesResourceVersions, StorageRecoveryExclusiveAccess, storage_scope_sha256,
@@ -5498,6 +5570,13 @@ mod tests {
         current
     }
 
+    fn context_for_case(case: StorageRecoveryCase) -> OwnedStorageContext {
+        let mut context = context();
+        context.case = case;
+        context.identity.scenario = case.scenario().to_string();
+        context
+    }
+
     fn capability(context: &OwnedStorageContext) -> BitrotCapabilityObservation {
         let body = r#"{"explicitVersionReads":true,"offlineXl2NonInline":true}"#.to_string();
         BitrotCapabilityObservation {
@@ -5592,6 +5671,7 @@ mod tests {
 
     fn inspect_response(hash: &str, inode: u64) -> OfflineXl2InspectResponse {
         OfflineXl2InspectResponse {
+            selected_metadata: None,
             mount_device_id: "259:0".to_string(),
             drive_uuid: "drive-1".to_string(),
             format_json_sha256: ORIGINAL.to_string(),
@@ -5654,7 +5734,7 @@ mod tests {
             expected_drive_uuid: "drive-1".to_string(),
         };
         let response_body =
-            serde_json::to_string(&inspect_response(ORIGINAL, 42)).expect("inspect");
+            serde_json::to_string(&inspect_response_for_case(context.case)).expect("inspect");
         let inspection = receipt(
             context,
             "11111111-1111-1111-1111-111111111111",
@@ -5750,28 +5830,82 @@ mod tests {
         BitrotCleanupEvidence,
         OnDiskBitrotWorkflowEvidence,
     ) {
-        let selected_context = renewed(&context(), 110);
+        evidence_set_for_case(StorageRecoveryCase::OnDiskBitrotAutomaticScanner)
+    }
+
+    fn inspect_response_for_case(case: StorageRecoveryCase) -> OfflineXl2InspectResponse {
+        let mut response = inspect_response(ORIGINAL, 42);
+        if case == StorageRecoveryCase::MetadataShardCorruptionAdminDeep {
+            response.xl_meta_sha256 = "8".repeat(64);
+            response.selected_metadata = Some(OfflineInspectedMetadata {
+                relative_metadata_path: "bucket/object/xl.meta".to_string(),
+                metadata_device_id: "259:0".to_string(),
+                metadata_inode: 43,
+                metadata_size_bytes: 256,
+                original_sha256: response.xl_meta_sha256.clone(),
+            });
+        }
+        response
+    }
+
+    fn evidence_set_for_case(
+        case: StorageRecoveryCase,
+    ) -> (
+        BitrotSelectionEvidence,
+        BitrotMutationEvidence,
+        BitrotCorruptionWindowProof,
+        BitrotHealEvidence,
+        BitrotCleanupEvidence,
+        OnDiskBitrotWorkflowEvidence,
+    ) {
+        let selected_context = renewed(&context_for_case(case), 110);
         let selection = selection(&selected_context);
-        let mutation_body = serde_json::to_string(&OfflineShardMutationResponse {
+        let selected_file = selection
+            .validate()
+            .expect("sealed selection")
+            .corruption_file(case)
+            .expect("selected file");
+        let original_byte = if case == StorageRecoveryCase::MetadataShardCorruptionAdminDeep {
+            b'X'
+        } else {
+            1
+        };
+        let byte_offset = if case == StorageRecoveryCase::MetadataShardCorruptionAdminDeep {
+            0
+        } else {
+            7
+        };
+        let mutation_response = OfflineShardMutationResponse {
             journal_operation_id: "22222222-2222-2222-2222-222222222222".to_string(),
-            relative_part_path: PATH.to_string(),
-            shard_device_id: "259:0".to_string(),
-            shard_inode: 42,
-            shard_size_bytes: 1024,
-            byte_offset: 7,
-            original_byte: 1,
-            mutated_byte: 254,
-            original_sha256: ORIGINAL.to_string(),
+            relative_part_path: selected_file.relative_part_path,
+            shard_device_id: selected_file.shard_device_id,
+            shard_inode: selected_file.shard_inode,
+            shard_size_bytes: selected_file.shard_size_bytes,
+            byte_offset,
+            original_byte,
+            mutated_byte: original_byte ^ CONTROLLED_SHARD_XOR_MASK,
+            original_sha256: selected_file.original_sha256.clone(),
             mutated_sha256: MUTATED.to_string(),
-        })
+        };
+        let mutation_body = if case == StorageRecoveryCase::MetadataShardCorruptionAdminDeep {
+            serde_json::to_string(&OfflineMetadataMutationResponse::from(mutation_response))
+        } else {
+            serde_json::to_string(&mutation_response)
+        }
         .expect("mutation response");
         let mutation_receipt = receipt(
             &selected_context,
             "22222222-2222-2222-2222-222222222222",
-            StorageRecoveryHostOperation::MutateShard {
-                inspection_operation_id: selection.inspection_receipt.operation_id.clone(),
-                part_number: 1,
-                byte_offset: 7,
+            if case == StorageRecoveryCase::MetadataShardCorruptionAdminDeep {
+                StorageRecoveryHostOperation::MutateMetadata {
+                    inspection_operation_id: selection.inspection_receipt.operation_id.clone(),
+                }
+            } else {
+                StorageRecoveryHostOperation::MutateShard {
+                    inspection_operation_id: selection.inspection_receipt.operation_id.clone(),
+                    part_number: 1,
+                    byte_offset,
+                }
             },
             mutation_body,
             120,
@@ -5909,7 +6043,7 @@ mod tests {
         };
         let recovery_context = renewed(&selected_context, 1_100);
         let post_body =
-            serde_json::to_string(&inspect_response(ORIGINAL, 42)).expect("post inspect");
+            serde_json::to_string(&inspect_response_for_case(case)).expect("post inspect");
         let post_inspection = receipt(
             &recovery_context,
             "33333333-3333-3333-3333-333333333333",
@@ -5935,6 +6069,9 @@ mod tests {
             unreachable!()
         };
         repair_observations.push(post_inspection.clone());
+        if case == StorageRecoveryCase::MetadataShardCorruptionAdminDeep {
+            heal = admin_heal_fixture(&selection);
+        }
         let fresh_mapping = VersionShardMappingObservation {
             schema_version: 1,
             identity: recovery_context.identity.clone(),
@@ -5953,7 +6090,7 @@ mod tests {
         let recovery_body = serde_json::to_string(&OfflineShardRecoveryResponse {
             mutation_operation_id: mutation_receipt.operation_id.clone(),
             outcome: crate::fault::storage_recovery_runtime::RestoreOutcome::AlreadyRepaired,
-            observed_sha256: Some(ORIGINAL.to_string()),
+            observed_sha256: Some(selected_file.original_sha256),
         })
         .expect("recovery response");
         let restore_receipt = receipt(
@@ -6950,20 +7087,7 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn admin_deep_evidence_binds_progress_and_the_exact_healed_drive() {
-        let mut admin_context = context();
-        admin_context.case = StorageRecoveryCase::OnDiskBitrotAdminDeep;
-        let scope = storage_scope_sha256(&admin_context);
-        admin_context.scope_sha256 = scope.clone();
-        admin_context.exclusive_access.kubernetes_lease.scope_sha256 = scope.clone();
-        admin_context.exclusive_access.kubernetes_lease.name =
-            format!("s3chaos-storage-{}", &scope[..20]);
-        admin_context.exclusive_access.host_flock.scope_sha256 = scope.clone();
-        admin_context.exclusive_access.host_flock.path =
-            format!("/var/lock/s3chaos/storage-{scope}.lock");
-        let selection = selection(&renewed(&admin_context, 110));
-
+    fn admin_heal_fixture(selection: &BitrotSelectionEvidence) -> BitrotHealEvidence {
         let start_body = r#"{"clientToken":"token-1","clientAddress":"127.0.0.1","startTime":"1970-01-01T00:00:00Z"}"#;
         let request_body = r#"{"recursive":true,"scanMode":2}"#;
         let path = format!("/rustfs/admin/v3/heal/{}", selection.probe.bucket);
@@ -7021,7 +7145,7 @@ mod tests {
             started_at_ms: 160,
             completed_at_ms: 170,
         };
-        let heal = BitrotHealEvidence::AdminDeep {
+        BitrotHealEvidence::AdminDeep {
             start,
             progress: vec![BitrotHealProgressSample {
                 schema_version: BITROT_ARTIFACT_SCHEMA_VERSION,
@@ -7034,7 +7158,16 @@ mod tests {
             }],
             terminal_status: Box::new(terminal_status),
             cancel: None,
-        };
+        }
+    }
+
+    #[test]
+    fn admin_deep_evidence_binds_progress_and_the_exact_healed_drive() {
+        let selection = selection(&renewed(
+            &context_for_case(StorageRecoveryCase::OnDiskBitrotAdminDeep),
+            110,
+        ));
+        let heal = admin_heal_fixture(&selection);
         heal.validate(&selection, 131, 180)
             .expect("exact AdminDeep heal evidence");
 
@@ -7149,9 +7282,13 @@ mod tests {
 
     impl FakeBitrotRuntime {
         fn successful() -> Self {
-            let (selection, mutation, corruption, heal, cleanup, _) = evidence_set();
+            Self::successful_for_case(StorageRecoveryCase::OnDiskBitrotAutomaticScanner)
+        }
+
+        fn successful_for_case(case: StorageRecoveryCase) -> Self {
+            let (selection, mutation, corruption, heal, cleanup, _) = evidence_set_for_case(case);
             Self {
-                acquired: context(),
+                acquired: context_for_case(case),
                 mutation: mutation.mutation_receipt.as_ref().clone(),
                 reads: [corruption.baseline, corruption.corrupted].into(),
                 selection,
@@ -7258,6 +7395,97 @@ mod tests {
         .await
         .expect("repaired execution");
         assert!(runtime.finished);
+    }
+
+    #[tokio::test]
+    async fn metadata_executor_requires_header_corruption_and_receipt_bound_repair() {
+        let case = StorageRecoveryCase::MetadataShardCorruptionAdminDeep;
+        let mut runtime = FakeBitrotRuntime::successful_for_case(case);
+        execute_on_disk_bitrot(&mut runtime, case)
+            .await
+            .expect("metadata recovery workflow");
+        assert!(runtime.finished);
+        let (_, mutation, _, _, _, _) = evidence_set_for_case(case);
+        assert!(matches!(
+            mutation.mutation_receipt.operation,
+            StorageRecoveryHostOperation::MutateMetadata { .. }
+        ));
+        let response: OfflineMetadataMutationResponse =
+            serde_json::from_str(&mutation.mutation_receipt.response_body)
+                .expect("metadata response");
+        assert_eq!(response.relative_metadata_path, "bucket/object/xl.meta");
+        assert_eq!(response.byte_offset, 0);
+    }
+
+    #[tokio::test]
+    async fn metadata_executor_rejects_part_mutation_and_clean_corruption_reads() {
+        let case = StorageRecoveryCase::MetadataShardCorruptionAdminDeep;
+        let mut runtime = FakeBitrotRuntime::successful_for_case(case);
+        runtime.mutation.operation = StorageRecoveryHostOperation::MutateShard {
+            inspection_operation_id: runtime.selection.inspection_receipt.operation_id.clone(),
+            part_number: 1,
+            byte_offset: 0,
+        };
+        assert!(execute_on_disk_bitrot(&mut runtime, case).await.is_err());
+        assert!(!runtime.finished);
+        let mut runtime = FakeBitrotRuntime::successful_for_case(case);
+        let corrupt = runtime.reads.back_mut().expect("corruption read");
+        corrupt.outcome = BitrotReadOutcome::ExpectedBytes;
+        corrupt.http_status = Some(200);
+        corrupt.observed_sha256 = Some(corrupt.expected_sha256.clone());
+        corrupt.error = None;
+        assert!(execute_on_disk_bitrot(&mut runtime, case).await.is_err());
+        assert!(!runtime.finished);
+    }
+
+    #[test]
+    fn metadata_artifacts_require_a_metadata_file_hash_transition() {
+        let case = StorageRecoveryCase::MetadataShardCorruptionAdminDeep;
+        let (selection, mutation, corruption, heal, mut cleanup, mut workflow) =
+            evidence_set_for_case(case);
+        validate_on_disk_bitrot_evidence(&OnDiskBitrotEvidenceSet {
+            workflow: &workflow,
+            selection: &selection,
+            mutation: &mutation,
+            corruption_window: &corruption,
+            heal: &heal,
+            cleanup: &cleanup,
+            checker_report_body: "{}",
+            post_write_report_body: "{}",
+        })
+        .expect("metadata evidence");
+        let mut post: OfflineXl2InspectResponse =
+            serde_json::from_str(&cleanup.post_inspection_receipt.response_body)
+                .expect("post inspection");
+        post.xl_meta_sha256 = MUTATED.to_string();
+        post.selected_metadata
+            .as_mut()
+            .expect("metadata identity")
+            .original_sha256 = MUTATED.to_string();
+        cleanup.post_inspection_receipt.response_body =
+            serde_json::to_string(&post).expect("unrepaired metadata");
+        cleanup.post_inspection_receipt.response_sha256 =
+            sha256_bytes(cleanup.post_inspection_receipt.response_body.as_bytes());
+        workflow.cleanup_sha256 = canonical_sha256(&cleanup).expect("updated cleanup digest");
+        assert!(
+            validate_on_disk_bitrot_evidence(&OnDiskBitrotEvidenceSet {
+                workflow: &workflow,
+                selection: &selection,
+                mutation: &mutation,
+                corruption_window: &corruption,
+                heal: &heal,
+                cleanup: &cleanup,
+                checker_report_body: "{}",
+                post_write_report_body: "{}",
+            })
+            .is_err(),
+            "clean part bytes cannot prove metadata repair"
+        );
+        let names =
+            crate::fault::spec::FaultRunArtifactSpec::required_names_for_scenario(case.scenario());
+        assert!(names.contains(&"metadata-mutation.json".to_string()));
+        assert!(names.contains(&"metadata-cleanup.json".to_string()));
+        assert!(names.iter().all(|name| !name.starts_with("bitrot-")));
     }
 
     #[tokio::test]

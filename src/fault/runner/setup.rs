@@ -26,7 +26,8 @@ use crate::{
         reporting::FailureSummary,
         scenarios::{
             FaultBackend, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
-            POD_FAILURE_QUORUM_EDGE_SCENARIO, QUORUM_P_DM_EIO_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
+            NETWORK_SPLIT_BRAIN_SCENARIO, POD_FAILURE_QUORUM_EDGE_SCENARIO,
+            QUORUM_P_DM_EIO_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
             QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, acknowledged_mutation_kind,
             proves_single_volume_eio_tolerance, requires_prefault_multipart_staging,
         },
@@ -42,10 +43,10 @@ use super::access::{
     wait_for_stable_rustfs_pods,
 };
 use super::targets::{
-    plan_requires_volume_bindings, require_volume_availability_topology,
-    require_volume_quorum_topology, require_write_quorum_loss_topology,
-    requires_fixed_volume_runtime_proof, volume_fault_target_count, volume_quorum_boundary,
-    write_quorum_partition_target_count,
+    plan_requires_volume_bindings, require_same_pod_volume_topology,
+    require_volume_availability_topology, require_volume_quorum_topology,
+    require_write_quorum_loss_topology, requires_fixed_volume_runtime_proof,
+    volume_fault_target_count, volume_quorum_boundary, write_quorum_partition_target_count,
 };
 use super::{FaultRun, PreparedWorkload, ProvenTarget, write_preflight_summary};
 use crate::fault::backends::runtime::{
@@ -157,7 +158,16 @@ impl FaultRun<'_> {
             "preparing owned fault-test Tenant fixture",
             None,
         )?;
-        if let Err(error) = prepare_fault_fixture(&config.cluster, spec.isolation) {
+        let volumes_per_server = if self.scenario.name
+            == crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO
+        {
+            2
+        } else {
+            1
+        };
+        if let Err(error) =
+            prepare_fault_fixture(&config.cluster, spec.isolation, volumes_per_server)
+        {
             self.record_failure("fixture-prepare", "test_or_environment", &error, None, None)?;
             return Err(error);
         }
@@ -589,6 +599,28 @@ impl FaultRun<'_> {
         )?;
         let mut topology_observed_at_ms = None;
         let mut execution_injection = plan.fault().clone();
+        if plan.scenario == crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO {
+            let (observation, volumes) = require_same_pod_volume_topology(
+                config,
+                endpoint,
+                access_key,
+                secret_key,
+                plan.fault(),
+                &target_proof.resolved_pods,
+            )
+            .await?;
+            topology_observed_at_ms = Some(observation.observed_at_ms);
+            execution_injection = plan.fault().pin_same_pod(&volumes.bindings[0].pod_name)?;
+            target_proof = target_proof
+                .with_erasure_set_topology_proven(
+                    observation.shape,
+                    observation.health,
+                    observation.membership,
+                    observation.deployment_id,
+                    observation.observed_at_ms,
+                )?
+                .with_same_pod_volumes_proven(volumes)?;
+        }
         if proves_single_volume_eio_tolerance(&plan.scenario) {
             events.record(
                 "volume-availability-topology-proof",
@@ -646,7 +678,9 @@ impl FaultRun<'_> {
         }
         if matches!(
             plan.scenario.as_str(),
-            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO | POD_FAILURE_QUORUM_EDGE_SCENARIO
+            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO
+                | POD_FAILURE_QUORUM_EDGE_SCENARIO
+                | NETWORK_SPLIT_BRAIN_SCENARIO
         ) {
             events.record(
                 "write-quorum-loss-topology-proof",

@@ -90,6 +90,9 @@ pub enum FaultRunExecutionSpec {
         topology: AdminTopologyPlan,
         operation_timeout_seconds: u64,
     },
+    CredentialRotation {
+        operation_timeout_seconds: u64,
+    },
     StorageRecovery {
         case: crate::fault::storage_recovery::StorageRecoveryCase,
         operation_timeout_seconds: u64,
@@ -339,7 +342,9 @@ impl FaultRunSpec {
                 expected_rustfs_pod_count: config.expected_rustfs_pod_count,
                 stable_pod_window_seconds: config.rustfs_pod_stable_window.as_secs(),
                 recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
-                recommit_unconfirmed_writes: acknowledged_mutation_kind(&scenario.name).is_none(),
+                recommit_unconfirmed_writes: acknowledged_mutation_kind(&scenario.name).is_none()
+                    && scenario.name
+                        != crate::fault::scenarios::CREDENTIAL_ROTATION_MID_LOAD_SCENARIO,
             },
             execution: Some(match plan {
                 ExecutionPlan::Injection(_) => FaultRunExecutionSpec::Injection,
@@ -347,6 +352,11 @@ impl FaultRunSpec {
                     topology: plan.topology.clone(),
                     operation_timeout_seconds: plan.operation_timeout.as_secs(),
                 },
+                ExecutionPlan::CredentialRotation(plan) => {
+                    FaultRunExecutionSpec::CredentialRotation {
+                        operation_timeout_seconds: plan.operation_timeout.as_secs(),
+                    }
+                }
                 ExecutionPlan::StorageRecovery(plan) => FaultRunExecutionSpec::StorageRecovery {
                     case: plan.case,
                     operation_timeout_seconds: plan.operation_timeout.as_secs(),
@@ -390,6 +400,18 @@ impl FaultRunSpec {
                     "admin run-spec operation timeout must be positive"
                 );
                 Ok(ExecutionKind::Admin)
+            }
+            Some(FaultRunExecutionSpec::CredentialRotation {
+                operation_timeout_seconds,
+            }) => {
+                ensure!(
+                    self.faults.is_empty()
+                        && *operation_timeout_seconds > 0
+                        && self.scenario.name
+                            == crate::fault::scenarios::CREDENTIAL_ROTATION_MID_LOAD_SCENARIO,
+                    "credential rotation run-spec has invalid scenario, timeout, or injections"
+                );
+                Ok(ExecutionKind::CredentialRotation)
             }
             Some(FaultRunExecutionSpec::StorageRecovery {
                 case,
@@ -450,6 +472,24 @@ impl FaultRunArtifactSpec {
     }
 
     pub fn required_names_for_scenario(scenario: &str) -> Vec<String> {
+        if scenario == crate::fault::scenarios::CREDENTIAL_ROTATION_MID_LOAD_SCENARIO {
+            return [
+                "run-spec.yaml",
+                "run-spec.json",
+                "preflight-summary.json",
+                "run-events.jsonl",
+                "run-metadata.json",
+                "workload-plan.json",
+                "history.jsonl",
+                "checker-report.json",
+                ADMIN_WORKFLOW_ARTIFACT,
+                crate::fault::credential_rotation::CREDENTIAL_ROTATION_ARTIFACT,
+                RECOVERY_HEALTH_ARTIFACT,
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        }
         let mut names = if scenario == crate::fault::scenarios::STALE_DISK_RETURN_DETECT_SCENARIO {
             [
                 "run-spec.yaml",
@@ -503,7 +543,11 @@ impl FaultRunArtifactSpec {
             .into_iter()
             .map(str::to_string)
             .collect()
-        } else if scenario == FRESH_VOLUME_REPLACEMENT_SCENARIO {
+        } else if matches!(
+            scenario,
+            FRESH_VOLUME_REPLACEMENT_SCENARIO
+                | crate::fault::scenarios::NETWORK_PARTITION_DURING_HEAL_SCENARIO
+        ) {
             [
                 "run-spec.yaml",
                 "run-spec.json",
@@ -533,7 +577,11 @@ impl FaultRunArtifactSpec {
             .into_iter()
             .map(str::to_string)
             .collect()
-        } else if scenario == crate::fault::scenarios::ON_DISK_BITROT_SCENARIO {
+        } else if matches!(
+            scenario,
+            crate::fault::scenarios::ON_DISK_BITROT_SCENARIO
+                | crate::fault::scenarios::METADATA_SHARD_CORRUPTION_SCENARIO
+        ) {
             [
                 "run-spec.yaml",
                 "run-spec.json",
@@ -554,7 +602,7 @@ impl FaultRunArtifactSpec {
                 BITROT_WORKFLOW_ARTIFACT,
             ]
             .into_iter()
-            .map(str::to_string)
+            .map(|name| crate::fault::on_disk_bitrot::corruption_artifact_name(scenario, name))
             .collect()
         } else if acknowledged_mutation_kind(scenario).is_none() {
             Self::required_names()
@@ -626,6 +674,16 @@ impl FaultRunArtifactSpec {
                 .map(str::to_string),
             );
         }
+        if scenario == crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO {
+            names.extend(
+                [
+                    crate::fault::quorum::QUORUM_FAULT_ACTIVATION_ARTIFACT,
+                    "quorum-runtime-provenance.json",
+                    "quorum-probe-fixtures.json",
+                ]
+                .map(str::to_string),
+            );
+        }
         if scenario == crate::fault::scenarios::ADMIN_DECOMMISSION_SCENARIO {
             names.extend(
                 [
@@ -635,6 +693,9 @@ impl FaultRunArtifactSpec {
                 .map(str::to_string),
             );
         }
+        if scenario == crate::fault::scenarios::NETWORK_PARTITION_DURING_HEAL_SCENARIO {
+            names.push(crate::fault::heal_partition::HEAL_PARTITION_PROOF_ARTIFACT.to_string());
+        }
         if scenario_spec(scenario).is_ok_and(|spec| {
             spec.backend == crate::fault::scenarios::FaultBackend::KubernetesLifecycle
         }) {
@@ -642,6 +703,19 @@ impl FaultRunArtifactSpec {
         }
         if scenario == crate::fault::scenarios::WARP_UNDER_CHAOS_SCENARIO {
             names.push(crate::fault::warp_metrics::WARP_POWERLOSS_METRICS_ARTIFACT.to_string());
+        }
+        if scenario == crate::fault::scenarios::NETWORK_SPLIT_BRAIN_SCENARIO {
+            names.extend(
+                [
+                    crate::fault::runner::pod_faults::NETWORK_SPLIT_BRAIN_ARTIFACT,
+                    crate::fault::runner::pod_faults::SPLIT_BRAIN_S3_HISTORY_ARTIFACT,
+                    crate::fault::runner::pod_faults::SPLIT_BRAIN_RECOVERY_HISTORY_ARTIFACT,
+                ]
+                .map(str::to_string),
+            );
+        }
+        if scenario == crate::fault::scenarios::CLOCK_SKEW_SCENARIO {
+            names.push(crate::fault::runner::pod_faults::CLOCK_SKEW_ARTIFACT.to_string());
         }
         names
     }
@@ -740,6 +814,7 @@ fn workload_mode_name(mode: FaultWorkloadMode) -> &'static str {
         FaultWorkloadMode::S3Mixed => "s3-mixed",
         FaultWorkloadMode::S3MixedWithWarp => "s3-mixed-with-warp",
         FaultWorkloadMode::AckTriggeredQuietMutation => "ack-triggered-quiet-mutation",
+        FaultWorkloadMode::CredentialRotation => "credential-rotation",
     }
 }
 

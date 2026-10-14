@@ -62,12 +62,17 @@ docker build --platform linux/amd64 -f fault/images/quorum-probe.Dockerfile \
 
 The builder and RustFS base must have compatible Linux runtime libraries. Build
 for the cluster architecture; publish and deploy the resulting immutable digest
-through `RUSTFS_FAULT_TEST_SERVER_IMAGE`. The helper path is
+through `RUSTFS_FAULT_TEST_SERVER_IMAGE`. The quorum helper path is
 `/usr/local/bin/s3chaos-quorum-probe`; it accepts a closed JSON protocol on stdin.
 It needs the same volume permissions as RustFS and no extra Linux capabilities.
 Pre-staging verifies its executable availability and protocol before mutation.
 Use the existing `quorum-reliability.yaml` suite for the four IOChaos boundaries;
 run its static validation before any separately authorized live run.
+
+The same Dockerfile installs `/usr/local/bin/s3chaos-storage-helper` for the
+receipt-bound fresh-volume, heal-partition and metadata-corruption workflows.
+Supply the derived image digest through `RUSTFS_FAULT_TEST_STORAGE_HELPER_IMAGE`
+when those workflows require a privileged storage helper Pod.
 
 ## Continuous block EIO reference
 

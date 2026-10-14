@@ -408,36 +408,77 @@ pub(super) fn prepare_quorum_fault_activation(
     active_snapshots: &[FaultStatusSnapshot],
     controller_validation_error: Option<String>,
 ) -> (QuorumFaultActivationEvidence, QuorumFaultActivationPlan) {
+    let same_pod = scenario == crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO;
     let started_at_ms = now_ms();
     let mut failure_reasons = controller_validation_error.into_iter().collect::<Vec<_>>();
     let snapshot = active_snapshots.first();
     let resource = snapshot.and_then(|snapshot| snapshot.chaos_status.as_ref());
-    let iochaos_resource_name = snapshot
-        .and_then(|snapshot| snapshot.resource_name.clone())
-        .unwrap_or_default();
-    let iochaos_snapshot_sha256 = resource
-        .and_then(|resource| serde_json::to_vec(resource).ok())
-        .map(|encoded| sha256_hex(&encoded))
-        .unwrap_or_default();
-    let proof = volume_quorum_proof(target_proof);
-    let (expected_targets, volume_path, bindings) = match proof {
-        Ok(proof) => (
-            proof.target_count,
-            proof
-                .candidates
-                .first()
-                .map(|binding| binding.mount_path.clone())
-                .unwrap_or_default(),
-            proof
-                .candidates
+    let iochaos_resource_name = if same_pod {
+        active_snapshots
+            .iter()
+            .filter_map(|snapshot| snapshot.resource_name.as_deref())
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        snapshot
+            .and_then(|snapshot| snapshot.resource_name.clone())
+            .unwrap_or_default()
+    };
+    let iochaos_snapshot_sha256 = if same_pod {
+        serde_json::to_vec(
+            &active_snapshots
                 .iter()
-                .cloned()
-                .map(|binding| (binding.pod_name.clone(), binding))
-                .collect::<BTreeMap<_, _>>(),
-        ),
-        Err(error) => {
-            failure_reasons.push(error.to_string());
-            (0, String::new(), BTreeMap::new())
+                .filter_map(|snapshot| snapshot.chaos_status.as_ref())
+                .collect::<Vec<_>>(),
+        )
+        .map(|encoded| sha256_hex(&encoded))
+        .unwrap_or_default()
+    } else {
+        resource
+            .and_then(|resource| serde_json::to_vec(resource).ok())
+            .map(|encoded| sha256_hex(&encoded))
+            .unwrap_or_default()
+    };
+    let proof = volume_quorum_proof(target_proof);
+    let (expected_targets, volume_path, bindings) = if same_pod {
+        match volume_probe_bindings(target_proof) {
+            Ok(bindings) => (
+                2,
+                bindings
+                    .first()
+                    .map(|binding| binding.mount_path.clone())
+                    .unwrap_or_default(),
+                bindings
+                    .iter()
+                    .cloned()
+                    .map(|binding| (binding.mount_path.clone(), binding))
+                    .collect::<BTreeMap<_, _>>(),
+            ),
+            Err(error) => {
+                failure_reasons.push(error.to_string());
+                (2, String::new(), BTreeMap::new())
+            }
+        }
+    } else {
+        match proof {
+            Ok(proof) => (
+                proof.target_count,
+                proof
+                    .candidates
+                    .first()
+                    .map(|binding| binding.mount_path.clone())
+                    .unwrap_or_default(),
+                proof
+                    .candidates
+                    .iter()
+                    .cloned()
+                    .map(|binding| (binding.pod_name.clone(), binding))
+                    .collect::<BTreeMap<_, _>>(),
+            ),
+            Err(error) => {
+                failure_reasons.push(error.to_string());
+                (0, String::new(), BTreeMap::new())
+            }
         }
     };
     let records = match resource.and_then(|resource| injected_controller_records(resource).ok()) {
@@ -449,7 +490,7 @@ pub(super) fn prepare_quorum_fault_activation(
             Vec::new()
         }
     };
-    let controller_records = records.len();
+    let mut controller_records = records.len();
     let unique_records = records
         .iter()
         .cloned()
@@ -460,12 +501,56 @@ pub(super) fn prepare_quorum_fault_activation(
     }
     let mut attempts = Vec::new();
     let mut selected_pods = std::collections::BTreeSet::new();
-    for record_id in unique_records {
-        let binding = iochaos_record_pod_id(&record_id)
-            .ok()
-            .and_then(|pod_id| pod_id.rsplit_once('/').map(|(_, pod)| pod.to_string()))
-            .and_then(|pod| bindings.get(&pod).cloned());
-        match binding {
+    if same_pod {
+        controller_records = 0;
+        for snapshot in active_snapshots {
+            let attempt = (|| -> Result<(QuorumVolumeBinding, String)> {
+                let resource = snapshot
+                    .chaos_status
+                    .as_ref()
+                    .context("same-Pod IOChaos snapshot missing")?;
+                let path = resource
+                    .pointer("/spec/volumePath")
+                    .and_then(serde_json::Value::as_str)
+                    .context("same-Pod IOChaos volume path missing")?;
+                let binding = bindings
+                    .get(path)
+                    .context("same-Pod IOChaos mount lacks its drive binding")?
+                    .clone();
+                ensure!(
+                    selected_pods.insert(path.to_string()),
+                    "same-Pod activation selected one mount twice"
+                );
+                let records = injected_controller_records(resource)?;
+                controller_records += records.len();
+                let [record] = records.as_slice() else {
+                    return Err(anyhow!(
+                        "same-Pod IOChaos must contain exactly one injected record"
+                    ));
+                };
+                ensure!(
+                    record == &format!("{}/{}/rustfs", target_proof.namespace, binding.pod_name),
+                    "same-Pod IOChaos controller record changed its target Pod"
+                );
+                Ok((
+                    binding,
+                    crate::fault::backends::chaos_mesh::same_pod_volume_record_id(
+                        resource, record,
+                    )?,
+                ))
+            })();
+            match attempt {
+                Ok(attempt) => attempts.push(attempt),
+                Err(error) => failure_reasons.push(error.to_string()),
+            }
+        }
+    } else {
+        for record_id in unique_records {
+            let binding = iochaos_record_pod_id(&record_id)
+                .ok()
+                .and_then(|pod_id| pod_id.rsplit_once('/').map(|(_, pod)| pod.to_string()))
+                .and_then(|pod| bindings.get(&pod).cloned());
+            match binding {
             Some(binding)
                 if record_id
                     == format!("{}/{}/rustfs", target_proof.namespace, binding.pod_name)
@@ -476,6 +561,7 @@ pub(super) fn prepare_quorum_fault_activation(
             _ => failure_reasons.push(format!(
                 "IOChaos controller record {record_id:?} does not resolve to a proven quorum volume"
             )),
+        }
         }
     }
     if attempts.len() != usize::try_from(expected_targets).unwrap_or(usize::MAX) {
@@ -556,7 +642,9 @@ pub(super) async fn qualify_prepared_quorum_fault_activation(
             binding.clone(),
             record_id,
             timeout,
-            fixtures.get(&binding.pod_name).cloned(),
+            fixtures
+                .get(&probe_fixture_key(&binding.pod_name, &binding.mount_path))
+                .cloned(),
         )
     });
     let mut targets = join_all(futures).await;
@@ -706,6 +794,22 @@ pub(super) struct QuorumProbeFixtures {
     pending: BTreeMap<String, (String, String)>,
     pub(super) fixtures: BTreeMap<String, crate::fault::quorum::probe::ProbeFixture>,
 }
+
+pub(super) fn probe_fixture_key(pod: &str, mount: &str) -> String {
+    format!("{pod}:{mount}")
+}
+
+fn volume_probe_bindings(proof: &TargetProof) -> Result<&[QuorumVolumeBinding]> {
+    if let Some(volumes) = proof
+        .faults
+        .iter()
+        .find_map(|fault| fault.erasure_set.as_ref())
+        .and_then(|erasure| erasure.same_pod_volumes.as_ref())
+    {
+        return Ok(&volumes.bindings);
+    }
+    Ok(&volume_quorum_proof(proof)?.candidates)
+}
 impl QuorumProbeFixtures {
     pub(super) async fn stage(
         cluster: &ClusterTestConfig,
@@ -735,15 +839,16 @@ impl QuorumProbeFixtures {
             pending: BTreeMap::new(),
             fixtures: BTreeMap::new(),
         };
-        let bindings = &volume_quorum_proof(proof)?.candidates;
+        let bindings = volume_probe_bindings(proof)?;
         // Stage before the final fresh topology observation and before injection.
         // The guard is declared before AppliedFault so unwind restores I/O first.
         for binding in bindings {
+            let key = probe_fixture_key(&binding.pod_name, &binding.mount_path);
             let path = format!("{}.operations", canary_path(binding, run_id));
             let nonce = probe_nonce(run_id, &binding.pod_uid, &binding.container_id);
             guard
                 .pending
-                .insert(binding.pod_name.clone(), (path.clone(), nonce.clone()));
+                .insert(key.clone(), (path.clone(), nonce.clone()));
             guard.persist()?;
             let request = ProbeRequest::Stage { path, nonce };
             let ProbeResponse::Staged { fixture } = probe_command(
@@ -759,8 +864,8 @@ impl QuorumProbeFixtures {
                 ));
             };
             fixture.validate()?;
-            guard.fixtures.insert(binding.pod_name.clone(), fixture);
-            guard.pending.remove(&binding.pod_name);
+            guard.fixtures.insert(key.clone(), fixture);
+            guard.pending.remove(&key);
             guard.persist()?;
         }
         Ok(guard)
@@ -776,7 +881,7 @@ impl QuorumProbeFixtures {
         Ok(())
     }
     pub(super) fn require_matches(&self, run_id: &str, proof: &TargetProof) -> Result<()> {
-        let candidates = &volume_quorum_proof(proof)?.candidates;
+        let candidates = volume_probe_bindings(proof)?;
         ensure!(
             candidates.len() == self.fixtures.len(),
             "quorum probe candidate count changed"
@@ -784,7 +889,7 @@ impl QuorumProbeFixtures {
         for binding in candidates {
             let fixture = self
                 .fixtures
-                .get(&binding.pod_name)
+                .get(&probe_fixture_key(&binding.pod_name, &binding.mount_path))
                 .context("quorum probe candidate changed")?;
             ensure!(
                 fixture.path == format!("{}.operations", canary_path(binding, run_id))
@@ -801,25 +906,31 @@ impl QuorumProbeFixtures {
     }
     pub(super) async fn cleanup(&mut self) -> Result<()> {
         let mut failures = Vec::new();
-        for (pod, fixture) in self.fixtures.clone() {
+        for (key, fixture) in self.fixtures.clone() {
+            let (pod, _) = key
+                .split_once(':')
+                .context("volume probe fixture key lacks its Pod")?;
             let result = probe_command(
                 &self.cluster,
-                &pod,
+                pod,
                 &crate::fault::quorum::probe::ProbeRequest::Cleanup { fixture },
                 Duration::from_secs(10),
             )
             .await;
             match result {
                 Ok(crate::fault::quorum::probe::ProbeResponse::Cleaned { .. }) => {
-                    self.fixtures.remove(&pod);
+                    self.fixtures.remove(&key);
                 }
                 other => failures.push(format!("{pod}: {other:?}")),
             }
         }
-        for (pod, (path, nonce)) in self.pending.clone() {
+        for (key, (path, nonce)) in self.pending.clone() {
+            let (pod, _) = key
+                .split_once(':')
+                .context("pending volume probe fixture key lacks its Pod")?;
             let result = probe_command(
                 &self.cluster,
-                &pod,
+                pod,
                 &crate::fault::quorum::probe::ProbeRequest::CleanupPending {
                     path: path.clone(),
                     nonce: nonce.clone(),
@@ -832,7 +943,7 @@ impl QuorumProbeFixtures {
                     path: actual,
                     nonce: owner,
                 }) if actual == path && owner == nonce => {
-                    self.pending.remove(&pod);
+                    self.pending.remove(&key);
                 }
                 other => failures.push(format!("pending {pod}: {other:?}")),
             }
@@ -989,7 +1100,7 @@ async fn capture_runtime_provenance(
         &value,
         run_id,
         &cluster.context,
-        &volume_quorum_proof(proof)?.candidates,
+        volume_probe_bindings(proof)?,
     )
 }
 

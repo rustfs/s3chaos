@@ -225,7 +225,7 @@ metadata:
     )
 }
 
-pub fn tenant_manifest(config: &ClusterTestConfig) -> Result<String> {
+pub fn tenant_manifest(config: &ClusterTestConfig, volumes_per_server: u32) -> Result<String> {
     let mut template = TenantTemplate::real_cluster(
         &config.test_namespace,
         &config.tenant_name,
@@ -234,6 +234,8 @@ pub fn tenant_manifest(config: &ClusterTestConfig) -> Result<String> {
         credential_secret_name(config),
     );
     template.rustfs_env.clone_from(&config.rustfs_env);
+    template.volumes_per_server =
+        i32::try_from(volumes_per_server).context("Tenant volume count exceeds schema")?;
     template.metadata_annotations.insert(
         RUNTIME_DEFAULT_IMAGE_ACK_ANNOTATION.to_string(),
         config.rustfs_image.clone(),
@@ -277,7 +279,7 @@ pub fn admin_tenant_manifest(
     Ok(serde_yaml_ng::to_string(&manifest)?)
 }
 
-pub fn apply_tenant_resources(config: &ClusterTestConfig) -> Result<()> {
+pub fn apply_tenant_resources(config: &ClusterTestConfig, volumes_per_server: u32) -> Result<()> {
     let kubectl = Kubectl::new(config);
     if !ensure_namespace_owned_or_absent(config)? {
         kubectl
@@ -294,7 +296,7 @@ pub fn apply_tenant_resources(config: &ClusterTestConfig) -> Result<()> {
         .apply_yaml_command(credential_secret_manifest(config))
         .run_checked()?;
     kubectl
-        .apply_yaml_command(tenant_manifest(config)?)
+        .apply_yaml_command(tenant_manifest(config, volumes_per_server)?)
         .run_checked()?;
     Ok(())
 }
@@ -497,7 +499,7 @@ mod tests {
     #[test]
     fn fault_tenant_manifest_uses_real_cluster_defaults() {
         let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
-        let manifest = tenant_manifest(&config.cluster).expect("fault tenant manifest");
+        let manifest = tenant_manifest(&config.cluster, 1).expect("fault tenant manifest");
 
         assert!(manifest.contains("namespace: rustfs-fault-test"));
         assert!(manifest.contains("storageClassName: fast-csi"));
@@ -523,7 +525,7 @@ mod tests {
         config.cluster.tenant_spread_across_hosts = false;
         config.cluster.tenant_unsafe_bypass_disk_check = true;
 
-        let manifest = tenant_manifest(&config.cluster).expect("fault tenant manifest");
+        let manifest = tenant_manifest(&config.cluster, 1).expect("fault tenant manifest");
 
         // Single-node knobs come from config without editing source: small PVC,
         // no host anti-affinity, and the disk-check bypass env present.
@@ -540,7 +542,7 @@ mod tests {
             "true".to_string(),
         )];
 
-        let manifest = tenant_manifest(&config.cluster).expect("fault tenant manifest");
+        let manifest = tenant_manifest(&config.cluster, 1).expect("fault tenant manifest");
         let value: serde_json::Value = serde_yaml_ng::from_str(&manifest).expect("valid yaml");
 
         assert_eq!(
@@ -589,6 +591,23 @@ mod tests {
         assert_eq!(
             initial["metadata"]["annotations"]["rustfs.com/fault-test-run"],
             "run-1"
+        );
+    }
+
+    #[test]
+    fn same_pod_fault_fixture_requests_two_volumes_per_server() {
+        let config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        let manifest: serde_json::Value = serde_yaml_ng::from_str(
+            &tenant_manifest(&config.cluster, 2).expect("two-volume fixture"),
+        )
+        .expect("Tenant YAML");
+        assert_eq!(
+            manifest.pointer("/spec/pools/0/servers"),
+            Some(&serde_json::json!(4))
+        );
+        assert_eq!(
+            manifest.pointer("/spec/pools/0/persistence/volumesPerServer"),
+            Some(&serde_json::json!(2))
         );
     }
 

@@ -158,6 +158,7 @@ pub enum FailureClassification {
     UnexpectedListedObject,
     DataCorruption,
     AmbiguousWriteMaterialized,
+    QuorumViolation,
     RecoveryHealthDegraded,
     PostRecoveryWriteFailed,
     AvailabilityRegression,
@@ -186,7 +187,7 @@ pub enum FailureClassification {
 }
 
 impl FailureClassification {
-    pub(crate) const ALL: [Self; 37] = [
+    pub(crate) const ALL: [Self; 38] = [
         Self::RecoveryTailReadLatency,
         Self::CommittedObjectUnavailable,
         Self::CommittedVersionMissing,
@@ -202,6 +203,7 @@ impl FailureClassification {
         Self::UnexpectedListedObject,
         Self::DataCorruption,
         Self::AmbiguousWriteMaterialized,
+        Self::QuorumViolation,
         Self::RecoveryHealthDegraded,
         Self::PostRecoveryWriteFailed,
         Self::AvailabilityRegression,
@@ -249,6 +251,7 @@ impl FailureClassification {
             Self::UnexpectedListedObject => "unexpected_listed_object",
             Self::DataCorruption => "data_corruption",
             Self::AmbiguousWriteMaterialized => "ambiguous_write_materialized",
+            Self::QuorumViolation => "quorum_violation",
             Self::RecoveryHealthDegraded => "recovery_health_degraded",
             Self::PostRecoveryWriteFailed => "post_recovery_write_failed",
             Self::AvailabilityRegression => "availability_regression",
@@ -312,6 +315,7 @@ impl FailureClassification {
             | Self::UnexpectedListedObject
             | Self::DataCorruption
             | Self::AmbiguousWriteMaterialized
+            | Self::QuorumViolation
             | Self::RecoveryHealthDegraded
             | Self::PostRecoveryWriteFailed
             | Self::AvailabilityRegression
@@ -352,7 +356,8 @@ impl FailureClassification {
             | Self::DeletedObjectResurrected
             | Self::ListedKeyUnreadable
             | Self::UnexpectedListedObject
-            | Self::DataCorruption => FailureSeverity::FailCorrectness,
+            | Self::DataCorruption
+            | Self::QuorumViolation => FailureSeverity::FailCorrectness,
             Self::HarnessError
             | Self::TestHarness
             | Self::TestOrEnvironment
@@ -695,6 +700,7 @@ impl FailurePhase {
             "s3-access-under-fault"
             | "warp-workload"
             | "mixed-workload"
+            | "split-brain-s3-probe"
             | "post-warp-s3-access"
             | "post-warp-port-forward-failed"
             | "fault-evidence"
@@ -711,6 +717,7 @@ impl FailurePhase {
             | "recovery-evidence"
             | "fault-recovery-recheck"
             | "post-recovery-write"
+            | "split-brain-probe-recovery"
             | "recommit-unconfirmed" => Self::Recovery,
             "availability-endpoint" | "availability-read-probe" | "availability" => Self::Workload,
             "checker-pre-recommit"
@@ -729,6 +736,16 @@ fn primary_evidence_refs_for(stage: &str, phase: FailurePhase) -> Vec<String> {
     let mut refs = Vec::new();
 
     match phase {
+        FailurePhase::Recovery if stage == "split-brain-probe-recovery" => {
+            push_unique(&mut refs, "network-split-brain.json");
+            push_unique(&mut refs, "network-split-brain-recovery-history.jsonl");
+            push_unique(&mut refs, "fault-evidence.json");
+        }
+        FailurePhase::Workload if stage == "split-brain-s3-probe" => {
+            push_unique(&mut refs, "network-split-brain.json");
+            push_unique(&mut refs, "network-split-brain-s3-history.jsonl");
+            push_unique(&mut refs, "target-proof.json");
+        }
         FailurePhase::FaultInjection if stage == "quorum-fault-activation" => {
             push_unique(&mut refs, "quorum-fault-activation.json");
             push_unique(&mut refs, "target-proof.json");
@@ -849,6 +866,13 @@ impl FailureClassificationDetails {
                 data_loss: None,
                 corruption: Some(false),
                 recovered_within_window: Some(false),
+            },
+            FailureClassification::QuorumViolation => Self {
+                data_correctness: DataCorrectnessStatus::Failed,
+                availability: AvailabilityStatus::Unknown,
+                data_loss: None,
+                corruption: None,
+                recovered_within_window: None,
             },
             FailureClassification::DataCorruption => Self {
                 data_correctness: DataCorrectnessStatus::Failed,

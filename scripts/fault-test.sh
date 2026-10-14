@@ -399,7 +399,7 @@ validate_qualification_env_contract() {
     storage)
       [[ "$storage_case" != "-" ]] || die "$qualification_case lacks its storage-recovery case"
       case "$scenario" in
-        fresh-volume-replacement)
+        fresh-volume-replacement|network-partition-during-heal)
           require_nonempty_env RUSTFS_FAULT_TEST_STATIC_LOCAL_PVS_JSON
           require_nonempty_env RUSTFS_FAULT_TEST_STORAGE_HELPER_IMAGE
           require_nonempty_env RUSTFS_FAULT_TEST_OPERATOR_DEPLOYMENT
@@ -413,7 +413,7 @@ validate_qualification_env_contract() {
             <<<"$RUSTFS_FAULT_TEST_STATIC_LOCAL_PVS_JSON" >/dev/null \
             || die "RUSTFS_FAULT_TEST_STATIC_LOCAL_PVS_JSON must contain exactly $expected_local_pvs Local PV entries"
           ;;
-        on-disk-bitrot)
+        on-disk-bitrot|metadata-shard-corruption)
           require_nonempty_env RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG
           target_config="$RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG"
           require_absolute_non_root_path RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG "$target_config"
@@ -681,7 +681,7 @@ require_storage_class() {
   provisioner="$(kubectl_cluster get storageclass "$storage_class" -o json | jq -r '.provisioner // ""')"
   [[ -n "$provisioner" ]] || die "StorageClass $storage_class has no provisioner"
 
-  if [[ "$qualification_case" == fresh-volume-replacement-* ]]; then
+  if [[ "$qualification_case" == fresh-volume-replacement-* || "$scenario" == "network-partition-during-heal" ]]; then
     [[ "$provisioner" == "kubernetes.io/no-provisioner" ]] || die "$qualification_case requires a no-provisioner StorageClass"
   elif scenario_requires_static_storage "$scenario"; then
     [[ "$provisioner" == "kubernetes.io/no-provisioner" ]] || die "$scenario requires a no-provisioner StorageClass"
@@ -722,9 +722,15 @@ preflight() {
   if [[ "$mode" == "qualification" ]]; then
     validate_qualification_env_contract \
       "$qualification_case" "$scenario" "$QUALIFICATION_KIND" "$QUALIFICATION_STORAGE_CASE"
-  elif [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" ]]; then
-    require_nonempty_env RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE
-    qualification_case="$RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE"
+  elif [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" || "$scenario" == "network-partition-during-heal" || "$scenario" == "metadata-shard-corruption" ]]; then
+    if [[ "$scenario" == "network-partition-during-heal" ]]; then
+      qualification_case="${RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE:-network-partition-during-heal-admin-deep}"
+    elif [[ "$scenario" == "metadata-shard-corruption" ]]; then
+      qualification_case="${RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE:-metadata-shard-corruption-admin-deep}"
+    else
+      require_nonempty_env RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE
+      qualification_case="$RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE"
+    fi
     local contract case_scenario case_kind storage_case
     contract="$(qualification_case_contract "$qualification_case")" \
       || die "unknown storage-recovery case: $qualification_case"
@@ -762,7 +768,7 @@ preflight() {
   for tool in $(scenario_required_tools "$scenario"); do
     require_command "$tool"
   done
-  if [[ "$scenario" == "on-disk-bitrot" ]]; then
+  if [[ "$scenario" == "on-disk-bitrot" || "$scenario" == "metadata-shard-corruption" ]]; then
     target_config="$RUSTFS_FAULT_TEST_STORAGE_RECOVERY_TARGET_CONFIG"
     target_namespace="$(jq -er '.volume.namespace | strings | select(length > 0)' "$target_config")" \
       || die "bitrot target config lacks volume.namespace"
@@ -771,12 +777,12 @@ preflight() {
     [[ "$target_namespace" == "$FAULT_NAMESPACE" ]] \
       || die "bitrot target config belongs to another namespace: $target_namespace"
     kubectl_ns "$target_namespace" get pod "$target_helper_pod" >/dev/null \
-      || die "on-disk-bitrot requires its configured storage helper Pod"
+      || die "$scenario requires its configured storage helper Pod"
     kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1 \
-      || die "on-disk-bitrot requires a pre-created owned fault namespace with privileged Pod Security"
+      || die "$scenario requires a pre-created owned fault namespace with privileged Pod Security"
     [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] \
-      || die "on-disk-bitrot requires pod-security.kubernetes.io/enforce=privileged on $FAULT_NAMESPACE"
-  elif [[ "$scenario" == "fresh-volume-replacement" ]]; then
+      || die "$scenario requires pod-security.kubernetes.io/enforce=privileged on $FAULT_NAMESPACE"
+  elif [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "network-partition-during-heal" ]]; then
     kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1 \
       || die "$scenario requires a pre-created owned privileged namespace"
     [[ "$(kubectl_cluster get namespace "$FAULT_NAMESPACE" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" == "privileged" ]] \
@@ -812,9 +818,27 @@ preflight_cleanup() {
   require_namespace_ownership
 }
 
+timechaos_is_served() {
+  local discovery
+  discovery="$(kubectl_cluster get --raw /apis/chaos-mesh.org/v1alpha1)" || return $?
+  jq -r '
+    if .kind == "APIResourceList" and .groupVersion == "chaos-mesh.org/v1alpha1"
+      and (.resources | type) == "array"
+      and all(.resources[]; (.name | type) == "string" and (.name | length) > 0)
+    then any(.resources[]; .name == "timechaos")
+    else error("invalid Chaos Mesh API discovery") end
+  ' <<<"$discovery"
+}
+
 cleanup_managed_chaos() {
+  local timechaos_served
+  timechaos_served="$(timechaos_is_served)" || return $?
   kubectl_ns "$CHAOS_NAMESPACE" delete iochaos,podchaos,networkchaos,stresschaos \
     -l "$MANAGER_SELECTOR" --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
+  if [[ "$timechaos_served" == "true" ]]; then
+    kubectl_ns "$CHAOS_NAMESPACE" delete timechaos \
+      -l "$MANAGER_SELECTOR" --ignore-not-found=true --wait=false >/dev/null
+  fi
 }
 
 capture_process_group() {
@@ -972,7 +996,7 @@ handle_signal() {
     fi
     finalize_failed_run "${ACTIVE_SCOPE:-run}" "${ACTIVE_NAME:-unknown}" "$ACTIVE_ARTIFACTS" 130 interrupted
   else
-    cleanup_managed_chaos
+    cleanup_managed_chaos || echo "error: managed Chaos cleanup failed during interruption" >&2
   fi
   if [[ -n "$ACTIVE_QUALIFICATION_ROOT" ]]; then
     write_qualification_result "$ACTIVE_QUALIFICATION_ROOT" interrupted 130 \
@@ -999,13 +1023,20 @@ handle_exit() {
 }
 
 capture_cluster_snapshot() {
-  local artifacts="$1" stage="$2"
+  local artifacts="$1" stage="$2" timechaos_served
   kubectl_cluster get nodes -o wide >"$artifacts/nodes-$stage.txt" 2>&1 || true
   kubectl_ns "$FAULT_NAMESPACE" get tenants -o wide >"$artifacts/tenants-$stage.txt" 2>&1 || true
   kubectl_ns "$FAULT_NAMESPACE" get pods -o wide >"$artifacts/pods-$stage.txt" 2>&1 || true
   kubectl_ns "$FAULT_NAMESPACE" get pvc -o wide >"$artifacts/pvcs-$stage.txt" 2>&1 || true
   kubectl_cluster get pv -o wide >"$artifacts/pvs-$stage.txt" 2>&1 || true
   kubectl_ns "$CHAOS_NAMESPACE" get iochaos,podchaos,networkchaos,stresschaos -o yaml >"$artifacts/chaos-$stage.yaml" 2>&1 || true
+  if timechaos_served="$(timechaos_is_served 2>"$artifacts/timechaos-discovery-$stage.txt")"; then
+    if [[ "$timechaos_served" == "true" ]]; then
+      kubectl_ns "$CHAOS_NAMESPACE" get timechaos -o yaml >"$artifacts/timechaos-$stage.yaml" 2>&1 || true
+    fi
+  else
+    echo "error: TimeChaos API discovery failed while capturing $stage evidence" >&2
+  fi
   kubectl_ns "$FAULT_NAMESPACE" get events --sort-by=.lastTimestamp >"$artifacts/events-$stage.txt" 2>&1 || true
 }
 
@@ -1281,7 +1312,7 @@ finalize_failed_run() {
   esac
   write_failure_evidence_manifest "$scope" "$name" "$artifacts" "$rc" "$snapshot_stage" \
     || warn_artifact_write_failed "failure-evidence.json" "$artifacts/failure-evidence.json"
-  cleanup_managed_chaos
+  cleanup_managed_chaos || echo "error: managed Chaos cleanup failed after evidence capture" >&2
 }
 
 warn_artifact_write_failed() {
@@ -1299,7 +1330,11 @@ run_scenario() {
   case "$qualification_kind" in
     ordinary)
       storage_case=""
-      if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" ]]; then
+      if [[ "$scenario" == "network-partition-during-heal" ]]; then
+        storage_case="${RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE:-network-partition-during-heal-admin-deep}"
+      elif [[ "$scenario" == "metadata-shard-corruption" ]]; then
+        storage_case="${RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE:-metadata-shard-corruption-admin-deep}"
+      elif [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" ]]; then
         storage_case="${RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE:-}"
         [[ -n "$storage_case" ]] || die "storage recovery requires an exact case"
       fi
@@ -1458,7 +1493,7 @@ run_one() {
   initialize_summary "$run_root"
   run_root="$(cd "$run_root" && pwd -P)"
   build_fault_binary "$run_root" "scenario=$scenario"
-  if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" ]]; then
+  if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" || "$scenario" == "network-partition-during-heal" || "$scenario" == "metadata-shard-corruption" ]]; then
     require_supported_scenario "$scenario"
   elif [[ "$mode" == "dm" ]]; then
     require_dm_scenario "$scenario"
@@ -1725,7 +1760,7 @@ preflight_suite() {
   fi
   scenario="$(jq -r '.attempts[0].scenario // empty' "$plan_path")"
   [[ -n "$scenario" ]] || die "fault suite plan contains no attempts: $suite"
-  if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" ]]; then
+  if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" || "$scenario" == "network-partition-during-heal" || "$scenario" == "metadata-shard-corruption" ]]; then
     RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE="$(jq -er '.attempts[0].execution.case' "$plan_path")" preflight "$scenario"
   else
     preflight "$scenario"
@@ -1759,7 +1794,7 @@ require_non_static_suite_plan() {
   local plan_path="$1"
   jq -e '.requiresStaticStorage == false or
     ((.attempts | length) == 1 and
-     (.attempts[0].scenario == "fresh-volume-replacement" or .attempts[0].scenario == "on-disk-bitrot") and
+     (.attempts[0].scenario == "fresh-volume-replacement" or .attempts[0].scenario == "on-disk-bitrot" or .attempts[0].scenario == "network-partition-during-heal" or .attempts[0].scenario == "metadata-shard-corruption") and
      .attempts[0].execution.type == "storage-recovery")' "$plan_path" >/dev/null \
     || die "fault-suite-run does not execute device-mapper suites; run exactly one scenario in the foreground with make fault-dm-run SCENARIO=<name>"
 }
@@ -1961,6 +1996,7 @@ restore_paused_operators() {
 # Fixture removal and the residual-Chaos check. Failures are returned rather
 # than ending the script so cleanup can still report the operator restore.
 cleanup_fixture() {
+  local timechaos_served remaining_timechaos
   if kubectl_cluster get namespace "$FAULT_NAMESPACE" >/dev/null 2>&1; then
     require_namespace_ownership
     if ! kubectl_cluster delete namespace "$FAULT_NAMESPACE" --wait=true --timeout="$NAMESPACE_DELETE_TIMEOUT"; then
@@ -1972,19 +2008,27 @@ cleanup_fixture() {
     echo "error: managed Chaos resources remain after cleanup" >&2
     return 1
   fi
+  timechaos_served="$(timechaos_is_served)" || return $?
+  if [[ "$timechaos_served" == "true" ]]; then
+    remaining_timechaos="$(kubectl_ns "$CHAOS_NAMESPACE" get timechaos -l "$MANAGER_SELECTOR" -o name)" || return $?
+    if [[ -n "$remaining_timechaos" ]]; then
+      echo "error: managed TimeChaos resources remain after cleanup" >&2
+      return 1
+    fi
+  fi
 }
 
 cleanup() {
-  local fixture_status=0 restore_status=0
-  cleanup_managed_chaos
+  local chaos_status=0 fixture_status=0 restore_status=0
+  cleanup_managed_chaos || chaos_status=$?
   # The operator is restored first so a Tenant finalizer that needs it can
   # complete during the namespace deletion. Both parts always run: the
   # fixture steps run in a subshell so an ownership die cannot skip the
   # summary, and each part's status is kept.
   restore_paused_operators || restore_status=$?
   ( cleanup_fixture ) || fixture_status=$?
-  if [[ "$fixture_status" -ne 0 || "$restore_status" -ne 0 ]]; then
-    die "cleanup incomplete: fixture cleanup exit $fixture_status, operator restore exit $restore_status; see the errors above"
+  if [[ "$chaos_status" -ne 0 || "$fixture_status" -ne 0 || "$restore_status" -ne 0 ]]; then
+    die "cleanup incomplete: Chaos cleanup exit $chaos_status, fixture cleanup exit $fixture_status, operator restore exit $restore_status; see the errors above"
   fi
   echo "managed fault-test resources cleaned; external StorageClasses, PVs, and host devices were not changed"
 }

@@ -326,7 +326,8 @@ impl FaultTestConfig {
                 "RUSTFS_FAULT_TEST_STORAGE_RECOVERY_CASE",
             )
             .map(|value| StorageRecoveryCase::parse(&value))
-            .transpose()?,
+            .transpose()?
+            .or_else(|| StorageRecoveryCase::default_for_scenario(&scenario)),
             storage_local_pvs_json: env_optional(
                 &get_env,
                 "RUSTFS_FAULT_TEST_STATIC_LOCAL_PVS_JSON",
@@ -873,6 +874,29 @@ mod tests {
         assert_eq!(
             config.storage_recovery_target_config.as_deref(),
             Some(std::path::Path::new("/secure/bitrot-target.json"))
+        );
+    }
+
+    #[test]
+    fn heal_partition_selects_its_unique_case_without_authorizing_destruction() {
+        let config = FaultTestConfig::from_env_with(
+            |name| match name {
+                "RUSTFS_FAULT_TEST_STORAGE_CLASS" => Some("local-static".to_string()),
+                "RUSTFS_FAULT_TEST_SERVER_IMAGE" => Some("rustfs/rustfs:test".to_string()),
+                "RUSTFS_FAULT_TEST_SCENARIO" => Some("network-partition-during-heal".to_string()),
+                _ => None,
+            },
+            "real-cluster".to_string(),
+        )
+        .expect("fault config");
+        assert_eq!(
+            config.storage_recovery_case,
+            Some(crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementPartitionDuringHeal)
+        );
+        assert!(!config.destructive_enabled);
+        assert!(!config.qualify_planned_storage);
+        assert!(
+            crate::fault::scenarios::FaultScenario::from_config_for_execution(&config).is_err()
         );
     }
 

@@ -110,6 +110,7 @@ fn require_fault_backend(
             Ok(())
         }
         FaultBackend::ChaosMeshNetworkChaos => chaos_mesh::require_networkchaos_crd(cluster),
+        FaultBackend::ChaosMeshTimeChaos => chaos_mesh::require_timechaos_crd(cluster),
         FaultBackend::ChaosMeshStressChaos => chaos_mesh::require_stresschaos_crd(cluster),
         FaultBackend::DeviceMapper => Ok(()),
         FaultBackend::PlannedReliabilityWorkflow => {
@@ -149,6 +150,7 @@ fn cleanup_fault_backend(
         | FaultBackend::MinioWarpWithChaos
         | FaultBackend::ChaosMeshPodChaos
         | FaultBackend::ChaosMeshNetworkChaos
+        | FaultBackend::ChaosMeshTimeChaos
         | FaultBackend::ChaosMeshStressChaos => {
             // Sweep every managed chaos kind, not just this plan's backend: a
             // chaos CR leaked by a prior run or a prior suite attempt of a
@@ -177,6 +179,89 @@ fn cleanup_fault_backend(
 struct ChaosFaultHandle {
     guard: Box<ChaosGuard>,
     active_required: bool,
+}
+
+struct SamePodIoFaultHandle {
+    guards: Vec<ChaosGuard>,
+}
+
+impl FaultLifecyclePort for SamePodIoFaultHandle {
+    fn wait_active(&self, timeout: Duration) -> Result<()> {
+        let started = Instant::now();
+        for guard in &self.guards {
+            guard.wait_active(timeout.saturating_sub(started.elapsed()))?;
+        }
+        Ok(())
+    }
+
+    fn ensure_active(&self, stage: &str) -> Result<()> {
+        for guard in &self.guards {
+            guard.ensure_active(stage)?;
+        }
+        Ok(())
+    }
+
+    fn delete(&mut self, timeout: Duration) -> Result<()> {
+        let started = Instant::now();
+        let mut failures = Vec::new();
+        for guard in &mut self.guards {
+            if let Err(error) = guard.delete(
+                timeout
+                    .saturating_sub(started.elapsed())
+                    .max(Duration::from_secs(1)),
+            ) {
+                failures.push(format!("{}: {error:#}", guard.name()));
+            }
+        }
+        ensure!(
+            failures.is_empty(),
+            "same-Pod IOChaos cleanup failed: {}",
+            failures.join("; ")
+        );
+        Ok(())
+    }
+
+    fn snapshot(&self, _stage: &str) -> Result<FaultStatusSnapshot> {
+        bail!("same-Pod volume fault requires both runtime snapshots")
+    }
+
+    fn snapshots(&self, stage: &str) -> Result<Vec<FaultStatusSnapshot>> {
+        self.guards
+            .iter()
+            .map(|guard| chaos_fault_snapshot(guard, stage))
+            .collect()
+    }
+
+    fn failure_artifacts(&self) -> Option<&dyn FaultFailureArtifactSource> {
+        Some(self)
+    }
+}
+
+impl FaultFailureArtifactSource for SamePodIoFaultHandle {
+    fn collect_failure_artifacts(
+        &self,
+        collector: &ArtifactCollector,
+        case_name: &str,
+        suffix: &str,
+    ) -> Result<()> {
+        let mut failures = Vec::new();
+        for (index, guard) in self.guards.iter().enumerate() {
+            if let Err(error) = collect_chaos_failure_artifacts(
+                guard,
+                collector,
+                case_name,
+                &format!("{suffix}-volume-{index}"),
+            ) {
+                failures.push(format!("{}: {error:#}", guard.name()));
+            }
+        }
+        ensure!(
+            failures.is_empty(),
+            "same-Pod fault evidence capture failed: {}",
+            failures.join("; ")
+        );
+        Ok(())
+    }
 }
 
 struct PodKillFaultHandle {
@@ -260,6 +345,7 @@ fn apply_fault_backend(request: &FaultApplyRequest<'_>) -> Result<AppliedFault> 
         FaultBackend::ChaosMeshIoChaos
         | FaultBackend::ChaosMeshPodChaos
         | FaultBackend::ChaosMeshNetworkChaos
+        | FaultBackend::ChaosMeshTimeChaos
         | FaultBackend::ChaosMeshStressChaos
         | FaultBackend::MinioWarpWithChaos => apply_chaos_mesh_fault_backend(request),
         FaultBackend::PlannedReliabilityWorkflow => {
@@ -289,6 +375,43 @@ struct FaultApplyRequest<'a> {
 }
 
 fn apply_chaos_mesh_fault_backend(request: &FaultApplyRequest<'_>) -> Result<AppliedFault> {
+    if request.scenario.name == crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO {
+        let paths = request.injection.same_pod_volume_paths()?;
+        let pod = request
+            .injection
+            .pinned_pod()
+            .context("same-Pod injection lacks its proven exact Pod")?;
+        let mut specs = Vec::new();
+        for (index, path) in paths.iter().enumerate() {
+            specs.push(
+                chaos_mesh::IoChaosSpec::eio_on_rustfs_volume(
+                    &request.config.cluster,
+                    &request.config.chaos_namespace,
+                    request.run_id,
+                    &request.scenario.name,
+                    *path,
+                    100,
+                    request.injection.duration(),
+                )?
+                .with_exact_pods(vec![pod.to_string()])?
+                .with_name_suffix(&format!("-volume-{index}")),
+            );
+        }
+        request.collector.write_text(
+            request.scenario.case_name,
+            request.manifest_name,
+            &specs
+                .iter()
+                .map(chaos_mesh::IoChaosSpec::manifest)
+                .collect::<Vec<_>>()
+                .join("\n---\n"),
+        )?;
+        let mut guards = Vec::new();
+        for spec in specs {
+            guards.push(chaos_mesh::apply_iochaos(&request.config.cluster, &spec)?);
+        }
+        return Ok(Box::new(SamePodIoFaultHandle { guards }));
+    }
     let applied = chaos_mesh::apply_fault(&chaos_mesh::FaultApplyRequest {
         config: request.config,
         collector: request.collector,

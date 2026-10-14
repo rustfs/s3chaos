@@ -399,9 +399,18 @@ fn validate_failed_attempt_disruption_evidence(
             &run_spec,
         );
     }
-    if scenario == scenarios::ON_DISK_BITROT_SCENARIO {
+    if matches!(
+        scenario,
+        scenarios::ON_DISK_BITROT_SCENARIO | scenarios::METADATA_SHARD_CORRUPTION_SCENARIO
+    ) {
         let full_run_spec = read_json::<FaultRunSpec>(&run_spec_path)?;
-        let failure_path = bound_case_artifact(&case_dir, BITROT_FAILURE_ARTIFACT)?;
+        let failure_path = bound_case_artifact(
+            &case_dir,
+            &crate::fault::on_disk_bitrot::corruption_artifact_name(
+                scenario,
+                BITROT_FAILURE_ARTIFACT,
+            ),
+        )?;
         let failure = read_json::<BitrotFailureEvidence>(&failure_path)?;
         ensure!(
             (attempt_started_at_ms..=evaluated_at_ms).contains(&failure.observed_at_ms)
@@ -531,6 +540,41 @@ fn validate_failed_attempt_disruption_evidence(
             },
             expected_mutation,
         )?;
+    }
+    if scenario == scenarios::NETWORK_SPLIT_BRAIN_SCENARIO {
+        let summary =
+            read_json::<FailureSummary>(&bound_case_artifact(&case_dir, "failure-summary.json")?)?;
+        if summary.classification == "quorum_violation" {
+            use crate::fault::runner::pod_faults::{
+                NETWORK_SPLIT_BRAIN_ARTIFACT, PodFaultEvidence,
+                SPLIT_BRAIN_RECOVERY_HISTORY_ARTIFACT, SPLIT_BRAIN_S3_HISTORY_ARTIFACT,
+            };
+            summary.validate_classification_projection()?;
+            let spec = read_json::<FaultRunSpec>(&run_spec_path)?;
+            let proof =
+                read_json::<TargetProof>(&bound_case_artifact(&case_dir, "target-proof.json")?)?;
+            let pod_evidence = read_json::<PodFaultEvidence>(&bound_case_artifact(
+                &case_dir,
+                NETWORK_SPLIT_BRAIN_ARTIFACT,
+            )?)?;
+            let history =
+                read_jsonl::<OperationRecord>(&bound_case_artifact(&case_dir, "history.jsonl")?)?;
+            let side_history = read_jsonl::<OperationRecord>(&bound_case_artifact(
+                &case_dir,
+                SPLIT_BRAIN_S3_HISTORY_ARTIFACT,
+            )?)?;
+            pod_evidence.validate_quorum_violation(&proof, &spec, &history, &side_history)?;
+            let recovery_history = read_jsonl::<OperationRecord>(&bound_case_artifact(
+                &case_dir,
+                SPLIT_BRAIN_RECOVERY_HISTORY_ARTIFACT,
+            )?)?;
+            pod_evidence.validate_recovered_probes(
+                &recovery_history,
+                &spec.metadata.bucket,
+                spec.workload.seed,
+            )?;
+            validate_pod_fault_runtime_evidence(&pod_evidence, &evidence)?;
+        }
     }
     ensure!(
         has_event(&events, "run", RunEventStatus::Started)
@@ -2305,20 +2349,30 @@ fn validate_fault_artifacts_with_identity(
     identity: ArtifactIdentityPolicy<'_>,
 ) -> Result<ArtifactValidationReport> {
     let scenario_spec = scenarios::scenario_spec(&options.scenario)?;
+    if options.scenario == scenarios::CREDENTIAL_ROTATION_MID_LOAD_SCENARIO {
+        return validate_credential_rotation_artifacts(options, identity, scenario_spec.case_name);
+    }
     if matches!(
         options.scenario.as_str(),
         scenarios::ADMIN_DECOMMISSION_SCENARIO | scenarios::ADMIN_REBALANCE_SCENARIO
     ) {
         return validate_admin_execution_artifacts(options, identity, scenario_spec.case_name);
     }
-    if options.scenario == scenarios::FRESH_VOLUME_REPLACEMENT_SCENARIO {
+    if matches!(
+        options.scenario.as_str(),
+        scenarios::FRESH_VOLUME_REPLACEMENT_SCENARIO
+            | scenarios::NETWORK_PARTITION_DURING_HEAL_SCENARIO
+    ) {
         return validate_storage_recovery_execution_artifacts(
             options,
             identity,
             scenario_spec.case_name,
         );
     }
-    if options.scenario == scenarios::ON_DISK_BITROT_SCENARIO {
+    if matches!(
+        options.scenario.as_str(),
+        scenarios::ON_DISK_BITROT_SCENARIO | scenarios::METADATA_SHARD_CORRUPTION_SCENARIO
+    ) {
         return validate_on_disk_bitrot_artifacts(options, identity, scenario_spec.case_name);
     }
     if options.scenario == scenarios::STALE_DISK_RETURN_DETECT_SCENARIO {
@@ -2542,6 +2596,39 @@ fn validate_fault_artifacts_with_identity(
             QuorumEdgeRuntimeKind::NetworkPartition,
         )?;
     }
+    if matches!(
+        options.scenario.as_str(),
+        scenarios::CLOCK_SKEW_SCENARIO | scenarios::NETWORK_SPLIT_BRAIN_SCENARIO
+    ) {
+        use crate::fault::runner::pod_faults::{
+            CLOCK_SKEW_ARTIFACT, NETWORK_SPLIT_BRAIN_ARTIFACT, PodFaultEvidence,
+            SPLIT_BRAIN_RECOVERY_HISTORY_ARTIFACT, SPLIT_BRAIN_S3_HISTORY_ARTIFACT,
+        };
+        let name = if options.scenario == scenarios::CLOCK_SKEW_SCENARIO {
+            CLOCK_SKEW_ARTIFACT
+        } else {
+            NETWORK_SPLIT_BRAIN_ARTIFACT
+        };
+        let pod_evidence = read_json::<PodFaultEvidence>(required(&artifacts, name)?)?;
+        let side_history = if options.scenario == scenarios::NETWORK_SPLIT_BRAIN_SCENARIO {
+            read_jsonl::<OperationRecord>(required(&artifacts, SPLIT_BRAIN_S3_HISTORY_ARTIFACT)?)?
+        } else {
+            Vec::new()
+        };
+        pod_evidence.validate(&target_proof, &json_spec, &history, &side_history)?;
+        if options.scenario == scenarios::NETWORK_SPLIT_BRAIN_SCENARIO {
+            let recovery_history = read_jsonl::<OperationRecord>(required(
+                &artifacts,
+                SPLIT_BRAIN_RECOVERY_HISTORY_ARTIFACT,
+            )?)?;
+            pod_evidence.validate_recovered_probes(
+                &recovery_history,
+                &json_spec.metadata.bucket,
+                json_spec.workload.seed,
+            )?;
+        }
+        validate_pod_fault_runtime_evidence(&pod_evidence, &evidence)?;
+    }
     if options.scenario == scenarios::POD_FAILURE_QUORUM_EDGE_SCENARIO {
         validate_write_quorum_runtime_evidence(
             &evidence,
@@ -2624,7 +2711,9 @@ fn validate_fault_artifacts_with_identity(
     }
     if matches!(
         options.scenario.as_str(),
-        scenarios::QUORUM_P_IO_FAULT_SCENARIO | scenarios::QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+        scenarios::QUORUM_P_IO_FAULT_SCENARIO
+            | scenarios::QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO
+            | scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO
     ) {
         validate_quorum_fault_activation_evidence(
             &artifacts,
@@ -2632,7 +2721,9 @@ fn validate_fault_artifacts_with_identity(
             &target_proof,
             &json_spec,
         )?;
-        validate_volume_quorum_health_evidence(&evidence, &target_proof, &history)?;
+        if options.scenario != scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO {
+            validate_volume_quorum_health_evidence(&evidence, &target_proof, &history)?;
+        }
     }
     if options.scenario == scenarios::QUORUM_P_DM_EIO_SCENARIO {
         validate_quorum_dm_artifacts(&artifacts, &evidence, &target_proof, &json_spec)?;
@@ -2930,9 +3021,14 @@ fn validate_on_disk_bitrot_artifacts(
     identity: ArtifactIdentityPolicy<'_>,
     case_name: &str,
 ) -> Result<ArtifactValidationReport> {
-    if let Some(failure_path) =
-        optional_artifact(&options.artifact_root, case_name, BITROT_FAILURE_ARTIFACT)?
-    {
+    if let Some(failure_path) = optional_artifact(
+        &options.artifact_root,
+        case_name,
+        &crate::fault::on_disk_bitrot::corruption_artifact_name(
+            &options.scenario,
+            BITROT_FAILURE_ARTIFACT,
+        ),
+    )? {
         return validate_failed_on_disk_bitrot_artifacts(
             options,
             identity,
@@ -2996,27 +3092,25 @@ fn validate_on_disk_bitrot_artifacts(
         &json_spec.metadata.bucket,
     )?;
 
-    let selection =
-        read_json::<BitrotSelectionEvidence>(required(&artifacts, BITROT_SELECTION_ARTIFACT)?)?;
-    let mutation =
-        read_json::<BitrotMutationEvidence>(required(&artifacts, BITROT_MUTATION_ARTIFACT)?)?;
-    let corruption_window = read_json::<BitrotCorruptionWindowProof>(required(
-        &artifacts,
-        BITROT_CORRUPTION_WINDOW_ARTIFACT,
-    )?)?;
-    let heal = read_json::<BitrotHealEvidence>(required(&artifacts, BITROT_HEAL_ARTIFACT)?)?;
-    let heal_progress = read_jsonl::<BitrotHealProgressSample>(required(
-        &artifacts,
-        BITROT_HEAL_PROGRESS_ARTIFACT,
-    )?)?;
+    let artifact = |name: &str| {
+        required(
+            &artifacts,
+            &crate::fault::on_disk_bitrot::corruption_artifact_name(&options.scenario, name),
+        )
+    };
+    let selection = read_json::<BitrotSelectionEvidence>(artifact(BITROT_SELECTION_ARTIFACT)?)?;
+    let mutation = read_json::<BitrotMutationEvidence>(artifact(BITROT_MUTATION_ARTIFACT)?)?;
+    let corruption_window =
+        read_json::<BitrotCorruptionWindowProof>(artifact(BITROT_CORRUPTION_WINDOW_ARTIFACT)?)?;
+    let heal = read_json::<BitrotHealEvidence>(artifact(BITROT_HEAL_ARTIFACT)?)?;
+    let heal_progress =
+        read_jsonl::<BitrotHealProgressSample>(artifact(BITROT_HEAL_PROGRESS_ARTIFACT)?)?;
     ensure!(
         heal_progress == heal.progress(),
         "bitrot heal progress transcript differs from the terminal heal artifact"
     );
-    let cleanup =
-        read_json::<BitrotCleanupEvidence>(required(&artifacts, BITROT_CLEANUP_ARTIFACT)?)?;
-    let workflow =
-        read_json::<OnDiskBitrotWorkflowEvidence>(required(&artifacts, BITROT_WORKFLOW_ARTIFACT)?)?;
+    let cleanup = read_json::<BitrotCleanupEvidence>(artifact(BITROT_CLEANUP_ARTIFACT)?)?;
+    let workflow = read_json::<OnDiskBitrotWorkflowEvidence>(artifact(BITROT_WORKFLOW_ARTIFACT)?)?;
     let checker_path = required(&artifacts, "checker-report.json")?;
     let checker_body =
         fs::read_to_string(checker_path).context("read bitrot final checker report")?;
@@ -3087,11 +3181,17 @@ fn validate_failed_on_disk_bitrot_artifacts(
             .parent()
             .context("bitrot failure artifact has no case directory")?,
     )?;
-    let artifact = |name: &str| bound_case_artifact(&case_dir, name);
+    let artifact = |name: &str| {
+        bound_case_artifact(
+            &case_dir,
+            &crate::fault::on_disk_bitrot::corruption_artifact_name(&options.scenario, name),
+        )
+    };
     let optional = |name: &str| -> Result<Option<PathBuf>> {
-        let path = case_dir.join(name);
+        let name = crate::fault::on_disk_bitrot::corruption_artifact_name(&options.scenario, name);
+        let path = case_dir.join(&name);
         if path.is_file() {
-            Ok(Some(bound_case_artifact(&case_dir, name)?))
+            Ok(Some(bound_case_artifact(&case_dir, &name)?))
         } else {
             Ok(None)
         }
@@ -3360,6 +3460,161 @@ fn validate_bitrot_failure_event(
         "failed bitrot run event differs from bitrot-failure.json"
     );
     Ok(())
+}
+
+fn validate_credential_rotation_artifacts(
+    options: &ArtifactValidationOptions,
+    identity: ArtifactIdentityPolicy<'_>,
+    case_name: &str,
+) -> Result<ArtifactValidationReport> {
+    use crate::fault::credential_rotation::{
+        CREDENTIAL_ROTATION_ARTIFACT, CredentialRotationEvidence,
+        validate_credential_rotation_evidence,
+    };
+    let artifacts =
+        locate_required_artifacts(&options.artifact_root, case_name, &options.scenario)?;
+    let metadata = read_json::<RunMetadataArtifact>(required(&artifacts, "run-metadata.json")?)?;
+    let json_spec = read_json::<FaultRunSpec>(required(&artifacts, "run-spec.json")?)?;
+    let yaml_spec = read_yaml::<FaultRunSpec>(required(&artifacts, "run-spec.yaml")?)?;
+    ensure!(
+        json_spec == yaml_spec,
+        "credential rotation JSON/YAML run specs differ"
+    );
+    validate_run_spec(&json_spec, options)?;
+    ensure!(
+        json_spec.execution_kind()? == ExecutionKind::CredentialRotation
+            && metadata.scenario == options.scenario
+            && metadata.run_id == json_spec.metadata.run_id
+            && metadata.workload_objects == options.expected_workload_objects
+            && metadata.workload_concurrency == options.expected_workload_concurrency
+            && json_spec.metadata.name == case_name
+            && metadata.context == json_spec.cluster.context
+            && metadata.namespace == json_spec.cluster.namespace
+            && metadata.tenant == json_spec.cluster.tenant,
+        "credential rotation metadata does not match its run spec or selected workload"
+    );
+    if let Some(run_id) = identity.planned_run_id() {
+        ensure!(
+            metadata.run_id == run_id,
+            "credential rotation does not match the planned attempt"
+        );
+    }
+    let workload = read_json::<WorkloadPlan>(required(&artifacts, "workload-plan.json")?)?;
+    let workload_identity =
+        read_json::<ArtifactIdentity>(required(&artifacts, "workload-plan.json")?)?;
+    validate_optional_artifact_identity(
+        "workload-plan.json",
+        &workload_identity,
+        &metadata,
+        identity,
+    )?;
+    ensure!(
+        workload == json_spec.workload.plan,
+        "credential rotation workload plan differs from the run spec"
+    );
+    let preflight = read_json::<PreflightSummary>(required(&artifacts, "preflight-summary.json")?)?;
+    ensure!(
+        preflight.schema_version == 1
+            && preflight.status == PreflightStatus::Passed
+            && preflight.run_id.as_deref() == Some(metadata.run_id.as_str())
+            && preflight.scenario_set == [options.scenario.clone()]
+            && preflight.context == metadata.context
+            && preflight.namespace == metadata.namespace
+            && preflight.tenant == metadata.tenant
+            && preflight
+                .phases
+                .iter()
+                .any(|phase| phase.name == "credential-rotation-fixture"
+                    && phase.status == PreflightStatus::Passed
+                    && !phase.checks.is_empty()
+                    && phase
+                        .checks
+                        .iter()
+                        .all(|check| check.status == PreflightStatus::Passed)),
+        "credential rotation preflight lacks the exact owned fixture proof"
+    );
+    let evidence = read_json::<CredentialRotationEvidence>(required(
+        &artifacts,
+        CREDENTIAL_ROTATION_ARTIFACT,
+    )?)?;
+    ensure!(
+        evidence.run_id == metadata.run_id
+            && evidence.scenario == options.scenario
+            && evidence.bucket == json_spec.metadata.bucket
+            && evidence.context == metadata.context
+            && evidence.namespace == metadata.namespace
+            && evidence.tenant == metadata.tenant
+            && evidence.pods_before.len() == options.expected_rustfs_pod_count
+            && evidence.old_prefill_operation_ids.len() == workload.object_count / 2
+            && evidence.old_workload_operation_ids.len()
+                == workload.object_count - workload.object_count / 2,
+        "credential rotation identity, Pod coverage, or finite workload count is invalid"
+    );
+    let history = read_jsonl::<OperationRecord>(required(&artifacts, "history.jsonl")?)?;
+    let checker = read_json::<CheckerReport>(required(&artifacts, "checker-report.json")?)?;
+    validate_credential_rotation_evidence(&evidence, &history, &checker)?;
+    let workflow =
+        read_json::<AdminWorkflowEvidence>(required(&artifacts, ADMIN_WORKFLOW_ARTIFACT)?)?;
+    workflow.validate()?;
+    ensure!(
+        workflow.completed
+            && workflow.cleanup_succeeded
+            && workflow.scenario == options.scenario
+            && workflow.run_id == metadata.run_id,
+        "credential rotation lifecycle did not complete"
+    );
+    let events = read_jsonl::<RunEvent>(required(&artifacts, "run-events.jsonl")?)?;
+    ensure!(
+        events
+            .iter()
+            .all(|event| event.scenario == options.scenario && event.run_id == metadata.run_id)
+            && has_event(&events, "credential-rotation", RunEventStatus::Succeeded)
+            && has_event(&events, "checker-final", RunEventStatus::Succeeded)
+            && has_event(&events, "run", RunEventStatus::Succeeded),
+        "credential rotation run events do not prove successful completion"
+    );
+    let (recovery, baseline) =
+        validate_recovery_health_report(&artifacts, &metadata, identity, &events)?;
+    let rotation = evidence
+        .rotation
+        .as_ref()
+        .context("rotation receipt is absent")?;
+    ensure!(
+        recovery.baseline.deployment_id == evidence.deployment_id
+            && baseline.at_ms <= rotation.started_at_ms
+            && recovery.started_at_ms >= rotation.ended_at_ms
+            && recovery
+                .readiness
+                .iter()
+                .map(|probe| probe.pod_name.as_str())
+                .collect::<BTreeSet<_>>()
+                == evidence
+                    .pods_before
+                    .iter()
+                    .map(|pod| pod.name.as_str())
+                    .collect::<BTreeSet<_>>()
+            && recovery.readiness.len() == evidence.pods_before.len(),
+        "credential rotation recovery health does not cover its original RustFS deployment"
+    );
+    Ok(ArtifactValidationReport {
+        scenario: options.scenario.clone(),
+        case_name: case_name.to_string(),
+        terminal_stage: "checker-final".to_string(),
+        run_succeeded: true,
+        seed: workload.seed,
+        client_disruptions: evidence
+            .old_workload_operation_ids
+            .iter()
+            .filter(|id| {
+                history
+                    .iter()
+                    .any(|record| &record.id == *id && record.outcome != OperationOutcome::Ok)
+            })
+            .count(),
+        recommitted: 0,
+        committed: checker.committed_puts,
+        required_artifacts: json_spec.artifacts.required,
+    })
 }
 
 fn validate_admin_execution_artifacts(
@@ -3751,6 +4006,13 @@ fn validate_storage_recovery_execution_artifacts(
         &proof_history,
         &original_target_proof,
     )?;
+    if case == crate::fault::storage_recovery::StorageRecoveryCase::FreshVolumeReplacementPartitionDuringHeal {
+        let partition = read_json::<crate::fault::heal_partition::HealPartitionEvidence>(required(
+            &artifacts, crate::fault::heal_partition::HEAL_PARTITION_PROOF_ARTIFACT,
+        )?)?;
+        let transcript = read_json::<Vec<HealWireReceipt>>(required(&artifacts, FRESH_VOLUME_HEAL_TRANSCRIPT_ARTIFACT)?)?;
+        partition.validate_chain(&replacement, &summary, &progress, &history, &transcript, &read_proof)?;
+    }
     ensure!(
         read_proof.chaos_namespace() == json_spec.cluster.chaos_namespace
             && replacement.replacement.namespace == json_spec.cluster.namespace
@@ -4037,6 +4299,9 @@ fn validate_run_spec(spec: &FaultRunSpec, options: &ArtifactValidationOptions) -
             ExecutionKind::Injection => {
                 bail!("planned run-spec cannot use the injection execution route")
             }
+            ExecutionKind::CredentialRotation => {
+                bail!("credential rotation must use its executable catalog entry")
+            }
         }
     }
     validate_run_spec_catalog_contract(spec, options)?;
@@ -4229,6 +4494,20 @@ fn validate_run_spec_catalog_contract(
                 None,
             )
         }
+        ExecutionKind::CredentialRotation => {
+            let Some(crate::fault::spec::FaultRunExecutionSpec::CredentialRotation {
+                operation_timeout_seconds,
+            }) = &spec.execution
+            else {
+                unreachable!("execution_kind validated the credential rotation shape")
+            };
+            (
+                *operation_timeout_seconds,
+                1,
+                FaultInjectionParameters::Default,
+                None,
+            )
+        }
         ExecutionKind::StorageRecovery => {
             let (case, operation_timeout_seconds) = match &spec.execution {
                 Some(crate::fault::spec::FaultRunExecutionSpec::StorageRecovery {
@@ -4286,6 +4565,7 @@ fn validate_run_spec_catalog_contract(
         FaultWorkloadMode::S3Mixed => "s3-mixed",
         FaultWorkloadMode::S3MixedWithWarp => "s3-mixed-with-warp",
         FaultWorkloadMode::AckTriggeredQuietMutation => "ack-triggered-quiet-mutation",
+        FaultWorkloadMode::CredentialRotation => "credential-rotation",
     };
     ensure!(
         spec.workload.mode == expected_mode,
@@ -4726,6 +5006,27 @@ fn validate_target_proof(
                         fault.name
                     )
                 })?;
+        } else if options.scenario == scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO {
+            let volumes = erasure_set
+                .same_pod_volumes
+                .as_ref()
+                .context("same-Pod target proof lacks its two-volume bindings")?;
+            volumes.validate(shape, membership)?;
+            proof.validate_volume_bindings(&volumes.bindings, true)?;
+            let injection = fixed_volume_injection_from_run_spec(spec_fault, 1)?;
+            let paths = injection
+                .same_pod_volume_paths()?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            ensure!(
+                volumes
+                    .bindings
+                    .iter()
+                    .map(|binding| binding.mount_path.as_str())
+                    .collect::<BTreeSet<_>>()
+                    == paths,
+                "same-Pod volume paths differ from run-spec parameters"
+            );
         } else if scenarios::proves_single_volume_eio_tolerance(&options.scenario) {
             let unavailable_volumes = match spec_fault.selection.kind.as_str() {
                 // For legacy volume selections, `percent` is the I/O sampling
@@ -5311,6 +5612,9 @@ fn validate_fixed_volume_runtime_evidence(
     proof: &TargetProof,
     spec: &FaultRunSpec,
 ) -> Result<()> {
+    if spec.scenario.name == scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO {
+        return validate_same_pod_volume_runtime_evidence(evidence, proof, spec);
+    }
     let fault = fixed_volume_fault(spec)
         .context("fixed volume runtime proof requires one fixed-target volume fault")?;
     let volume_quorum = if fault.selection.kind == "runtime-quorum" {
@@ -5546,6 +5850,163 @@ fn validate_fixed_volume_runtime_evidence(
     Ok(())
 }
 
+fn validate_same_pod_volume_runtime_evidence(
+    evidence: &FaultEvidenceArtifact,
+    proof: &TargetProof,
+    spec: &FaultRunSpec,
+) -> Result<()> {
+    let erasure = proof
+        .faults
+        .iter()
+        .find_map(|fault| fault.erasure_set.as_ref())
+        .context("same-Pod target proof lacks its erasure set")?;
+    let volumes = erasure
+        .same_pod_volumes
+        .as_ref()
+        .context("same-Pod two-volume bindings missing")?;
+    volumes.validate(
+        erasure.shape.as_ref().context("same-Pod shape missing")?,
+        erasure
+            .membership
+            .as_ref()
+            .context("same-Pod membership missing")?,
+    )?;
+    proof.validate_volume_bindings(&volumes.bindings, true)?;
+    require_fresh_runtime_observation(
+        erasure.observed_at_ms,
+        evidence
+            .fault_apply_started_at_ms
+            .context("same-Pod fault apply timestamp missing")?,
+    )?;
+    let fault = fixed_volume_fault(spec).context("same-Pod canonical fault missing")?;
+    let injection = fixed_volume_injection_from_run_spec(fault, 1)?;
+    let runtime = crate::fault::backends::chaos_mesh::volume_fault_runtime_contract(
+        &injection,
+        &spec.scenario.name,
+    )?;
+    ensure!(
+        fault.io_sampling_percent == Some(runtime.io_sampling_percent)
+            && volumes
+                .bindings
+                .iter()
+                .map(|binding| binding.mount_path.as_str())
+                .collect::<BTreeSet<_>>()
+                == injection
+                    .same_pod_volume_paths()?
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+        "same-Pod volume paths or sampling differ from run-spec.json"
+    );
+    let before = unique_pod_identities(
+        "same-Pod pods_before",
+        evidence
+            .pods_before
+            .iter()
+            .map(|pod| (pod.name.as_str(), pod.uid.as_str())),
+    )?;
+    let proved = unique_pod_identities(
+        "same-Pod resolved_pods",
+        proof
+            .resolved_pods
+            .iter()
+            .map(|pod| (pod.name.as_str(), pod.uid.as_str())),
+    )?;
+    ensure!(
+        !before.is_empty() && before == proved,
+        "same-Pod pods_before differs from target-proof.json"
+    );
+    let first = &volumes.bindings[0];
+    let expected_containers =
+        BTreeMap::from([(first.pod_name.clone(), first.container_id.clone())]);
+    let expected_pods = BTreeSet::from([(first.pod_name.clone(), first.pod_uid.clone())]);
+    ensure!(
+        evidence.pods_at_fault_activation.len() == 1
+            && evidence.pods_at_workload_snapshot.len() == 1
+            && unique_pod_identities(
+                "same-Pod active targets",
+                evidence
+                    .pods_at_fault_activation
+                    .iter()
+                    .map(|pod| (pod.name.as_str(), pod.uid.as_str()))
+            )? == expected_pods
+            && unique_pod_identities(
+                "same-Pod workload targets",
+                evidence
+                    .pods_at_workload_snapshot
+                    .iter()
+                    .map(|pod| (pod.name.as_str(), pod.uid.as_str()))
+            )? == expected_pods
+            && evidence.fixed_volume_containers_at_fault_activation == expected_containers
+            && evidence.fixed_volume_containers_at_workload_snapshot == expected_containers,
+        "same-Pod EIO changed its target Pod/container generation"
+    );
+    let mut active_records = None;
+    for (stage, snapshots, persisted) in [
+        (
+            "active",
+            &evidence.active_snapshots,
+            &evidence.fixed_volume_targets_at_fault_activation,
+        ),
+        (
+            "after-workload",
+            &evidence.workload_snapshots,
+            &evidence.fixed_volume_targets_at_workload_snapshot,
+        ),
+    ] {
+        let resources = snapshots
+            .iter()
+            .map(|snapshot| {
+                ensure!(
+                    snapshot.get("stage").and_then(Value::as_str) == Some(stage)
+                        && snapshot.get("resource_kind").and_then(Value::as_str) == Some("iochaos"),
+                    "same-Pod {stage} snapshot metadata is invalid"
+                );
+                let resource = snapshot
+                    .get("chaos_status")
+                    .context("same-Pod snapshot lacks its IOChaos")?;
+                ensure!(
+                    snapshot.get("resource_name").and_then(Value::as_str)
+                        == resource.pointer("/metadata/name").and_then(Value::as_str),
+                    "same-Pod snapshot resource name differs"
+                );
+                Ok(resource)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let records = crate::fault::backends::chaos_mesh::validate_same_pod_volume_resources(
+            &resources,
+            volumes,
+            &VolumeTargetEvidenceContract {
+                chaos_namespace: &spec.cluster.chaos_namespace,
+                target_namespace: &spec.cluster.namespace,
+                tenant: &spec.cluster.tenant,
+                run_id: &spec.metadata.run_id,
+                scenario: &spec.scenario.name,
+                volume_path: injection.rustfs_volume_path()?,
+                path: None,
+                exact_pod_names: None,
+                expected_targets: 1,
+                candidate_pod_ids: &BTreeSet::new(),
+                runtime: &runtime,
+            },
+        )?
+        .into_values()
+        .collect::<BTreeSet<_>>();
+        ensure!(
+            persisted.len() == 2 && persisted.iter().cloned().collect::<BTreeSet<_>>() == records,
+            "same-Pod {stage} persisted targets differ from both IOChaos records"
+        );
+        if let Some(active) = &active_records {
+            ensure!(
+                active == &records,
+                "same-Pod IOChaos identities changed during the workload"
+            );
+        } else {
+            active_records = Some(records);
+        }
+    }
+    Ok(())
+}
+
 fn validate_skipped_quorum_recovery(evidence: &FaultEvidenceArtifact) -> Result<()> {
     ensure!(
         !evidence.injected && !evidence.active_during_workload && evidence.recovered,
@@ -5590,17 +6051,25 @@ fn validate_quorum_fault_activation_evidence(
     )?)?;
     activation.validate()?;
     let provenance: Value = read_json(required(artifacts, "quorum-runtime-provenance.json")?)?;
-    let quorum = proof
+    let erasure = proof
         .faults
         .iter()
         .find_map(|fault| fault.erasure_set.as_ref())
-        .and_then(|erasure| erasure.volume_quorum.as_ref())
         .context("quorum target proof missing")?;
+    let bindings = if let Some(volumes) = &erasure.same_pod_volumes {
+        &volumes.bindings[..]
+    } else {
+        &erasure
+            .volume_quorum
+            .as_ref()
+            .context("volume quorum target proof missing")?
+            .candidates[..]
+    };
     crate::fault::quorum::activation::validate_runtime_provenance(
         &provenance,
         &spec.metadata.run_id,
         &spec.cluster.context,
-        &quorum.candidates,
+        bindings,
     )?;
     ensure!(
         provenance["observedAtMs"]
@@ -5661,6 +6130,7 @@ fn validate_quorum_activation_binding(
     proof: &TargetProof,
     spec: &FaultRunSpec,
 ) -> Result<()> {
+    let same_pod = spec.scenario.name == scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO;
     ensure!(
         activation.scenario == spec.scenario.name
             && activation.run_id == spec.metadata.run_id
@@ -5690,14 +6160,26 @@ fn validate_quorum_activation_binding(
         .iter()
         .find_map(|fault| fault.erasure_set.as_ref())
         .context("runtime quorum target proof has no erasure-set evidence")?;
-    let volume_quorum = erasure_set
-        .volume_quorum
-        .as_ref()
-        .context("runtime quorum target proof has no volume bindings")?;
+    let (target_count, candidate_bindings) = if same_pod {
+        (
+            2,
+            &erasure_set
+                .same_pod_volumes
+                .as_ref()
+                .context("same-Pod volume target proof missing")?
+                .bindings[..],
+        )
+    } else {
+        let quorum = erasure_set
+            .volume_quorum
+            .as_ref()
+            .context("runtime quorum target proof has no volume bindings")?;
+        (quorum.target_count, &quorum.candidates[..])
+    };
     ensure!(
-        activation.expected_targets == volume_quorum.target_count
+        activation.expected_targets == target_count
             && (!activation.qualified
-                || activation.targets.len() == usize::try_from(volume_quorum.target_count)?),
+                || activation.targets.len() == usize::try_from(target_count)?),
         "quorum activation evidence does not cover the proven target count"
     );
     let selected_names = evidence
@@ -5705,13 +6187,27 @@ fn validate_quorum_activation_binding(
         .iter()
         .map(|pod| pod.name.as_str())
         .collect::<BTreeSet<_>>();
-    let bindings = volume_quorum
-        .candidates
+    let bindings = candidate_bindings
         .iter()
-        .map(|binding| (binding.pod_name.as_str(), binding))
+        .map(|binding| {
+            (
+                if same_pod {
+                    binding.mount_path.as_str()
+                } else {
+                    binding.pod_name.as_str()
+                },
+                binding,
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     ensure!(
-        (!activation.qualified || selected_names.len() == activation.targets.len())
+        (!activation.qualified
+            || selected_names.len()
+                == if same_pod {
+                    1
+                } else {
+                    activation.targets.len()
+                })
             && activation
                 .targets
                 .iter()
@@ -5719,12 +6215,18 @@ fn validate_quorum_activation_binding(
         "quorum activation canary targets do not match fault-evidence.json"
     );
     for target in &activation.targets {
-        let binding = bindings.get(target.pod_name.as_str()).with_context(|| {
-            format!(
-                "quorum activation target Pod {:?} has no proven volume binding",
-                target.pod_name
-            )
-        })?;
+        let binding = bindings
+            .get(if same_pod {
+                target.mount_path.as_str()
+            } else {
+                target.pod_name.as_str()
+            })
+            .with_context(|| {
+                format!(
+                    "quorum activation target Pod {:?} has no proven volume binding",
+                    target.pod_name
+                )
+            })?;
         ensure!(
             target.pod_uid == binding.pod_uid
                 && target.container_id == binding.container_id
@@ -5732,8 +6234,15 @@ fn validate_quorum_activation_binding(
                 && target.persistent_volume == binding.persistent_volume
                 && target.mount_path == binding.mount_path
                 && target.drive_uuid == binding.drive_uuid
-                && iochaos_record_pod_id(&target.controller_record_id)?
-                    == format!("{}/{}", proof.namespace, binding.pod_name),
+                && iochaos_record_pod_id(if same_pod {
+                    target
+                        .controller_record_id
+                        .rsplit_once(':')
+                        .context("same-Pod record lacks its IOChaos identity")?
+                        .1
+                } else {
+                    &target.controller_record_id
+                })? == format!("{}/{}", proof.namespace, binding.pod_name),
             "quorum activation target {:?} differs from target-proof.json",
             target.pod_name
         );
@@ -5759,9 +6268,22 @@ fn validate_quorum_activation_binding(
         .iter()
         .find(|snapshot| snapshot.get("resource_kind").and_then(Value::as_str) == Some("iochaos"))
         .context("fault-evidence.json has no active IOChaos snapshot")?;
+    let snapshot_names = if same_pod {
+        evidence
+            .active_snapshots
+            .iter()
+            .filter_map(|snapshot| snapshot.get("resource_name").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        snapshot
+            .get("resource_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
     ensure!(
-        snapshot.get("resource_name").and_then(Value::as_str)
-            == Some(activation.iochaos_resource_name.as_str()),
+        snapshot_names == activation.iochaos_resource_name,
         "quorum activation evidence IOChaos name does not match fault-evidence.json"
     );
     let snapshot_resource = snapshot
@@ -5772,36 +6294,65 @@ fn validate_quorum_activation_binding(
         fault.target.path.as_deref() == Some(activation.volume_path.as_str()),
         "quorum activation volume path differs from run-spec.json"
     );
-    let injection = fixed_volume_injection_from_run_spec(fault, volume_quorum.target_count)?;
+    let injection =
+        fixed_volume_injection_from_run_spec(fault, if same_pod { 1 } else { target_count })?;
     let runtime = crate::fault::backends::chaos_mesh::volume_fault_runtime_contract(
         &injection,
         &spec.scenario.name,
     )?;
-    let candidates = volume_quorum
-        .candidates
+    let candidates = candidate_bindings
         .iter()
         .map(|binding| format!("{}/{}", proof.namespace, binding.pod_name))
         .collect();
-    let controller_targets = validate_fixed_volume_snapshot(
-        snapshot_resource,
-        &VolumeTargetEvidenceContract {
-            chaos_namespace: &spec.cluster.chaos_namespace,
-            target_namespace: &spec.cluster.namespace,
-            tenant: &spec.cluster.tenant,
-            run_id: &spec.metadata.run_id,
-            scenario: &spec.scenario.name,
-            volume_path: &activation.volume_path,
-            path: None,
-            exact_pod_names: None,
-            expected_targets: volume_quorum.target_count,
-            candidate_pod_ids: &candidates,
-            runtime: &runtime,
-        },
-    );
+    let snapshot_resources = evidence
+        .active_snapshots
+        .iter()
+        .filter_map(|snapshot| snapshot.get("chaos_status"))
+        .collect::<Vec<_>>();
+    let controller_targets = if same_pod {
+        crate::fault::backends::chaos_mesh::validate_same_pod_volume_resources(
+            &snapshot_resources,
+            erasure_set
+                .same_pod_volumes
+                .as_ref()
+                .context("same-Pod bindings missing")?,
+            &VolumeTargetEvidenceContract {
+                chaos_namespace: &spec.cluster.chaos_namespace,
+                target_namespace: &spec.cluster.namespace,
+                tenant: &spec.cluster.tenant,
+                run_id: &spec.metadata.run_id,
+                scenario: &spec.scenario.name,
+                volume_path: &activation.volume_path,
+                path: None,
+                exact_pod_names: None,
+                expected_targets: 1,
+                candidate_pod_ids: &candidates,
+                runtime: &runtime,
+            },
+        )
+        .map(|records| records.into_values().collect::<BTreeSet<_>>())
+    } else {
+        validate_fixed_volume_snapshot(
+            snapshot_resource,
+            &VolumeTargetEvidenceContract {
+                chaos_namespace: &spec.cluster.chaos_namespace,
+                target_namespace: &spec.cluster.namespace,
+                tenant: &spec.cluster.tenant,
+                run_id: &spec.metadata.run_id,
+                scenario: &spec.scenario.name,
+                volume_path: &activation.volume_path,
+                path: None,
+                exact_pod_names: None,
+                expected_targets: target_count,
+                candidate_pod_ids: &candidates,
+                runtime: &runtime,
+            },
+        )
+    };
     let proven = controller_targets
         .as_ref()
         .is_ok_and(|targets| *targets == activation.selected_record_ids())
-        && activation.targets.len() == usize::try_from(volume_quorum.target_count)?
+        && activation.targets.len() == usize::try_from(target_count)?
         && activation.targets.iter().all(|target| {
             target.outcome == crate::fault::quorum::activation::QuorumCanaryOutcome::IoErrorObserved
                 && target
@@ -5813,9 +6364,13 @@ fn validate_quorum_activation_binding(
         activation.qualified == proven,
         "quorum activation verdict differs from controller and independent probe evidence: controller={controller_targets:?}, canaries={:?}, expected={}",
         activation.selected_record_ids(),
-        volume_quorum.target_count
+        target_count
     );
-    let snapshot_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(snapshot_resource)?));
+    let snapshot_sha256 = hex::encode(Sha256::digest(if same_pod {
+        serde_json::to_vec(&snapshot_resources)?
+    } else {
+        serde_json::to_vec(snapshot_resource)?
+    }));
     ensure!(
         activation.iochaos_snapshot_sha256 == snapshot_sha256,
         "quorum activation evidence IOChaos snapshot digest does not match fault-evidence.json"
@@ -7318,6 +7873,105 @@ fn validate_pod_lifecycle_artifact(
             }
         }
     }
+    Ok(())
+}
+
+fn validate_pod_fault_runtime_evidence(
+    pod_evidence: &crate::fault::runner::pod_faults::PodFaultEvidence,
+    evidence: &FaultEvidenceArtifact,
+) -> Result<()> {
+    let phases = &pod_evidence.observations;
+    ensure!(
+        phases.len() == 4,
+        "Pod fault runtime evidence lacks its four observation phases"
+    );
+    if pod_evidence.scenario == scenarios::CLOCK_SKEW_SCENARIO {
+        ensure!(
+            pod_evidence
+                .clock_workload_endpoint
+                .as_ref()
+                .context("clock fault has no pinned mixed workload endpoint")?
+                .established_at_ms
+                <= evidence
+                    .fault_apply_started_at_ms
+                    .context("clock fault lacks apply timestamp")?,
+            "clock workload endpoint was established after fault injection started"
+        );
+    } else {
+        ensure!(
+            pod_evidence
+                .probe_recovery
+                .as_ref()
+                .context("split-brain lacks recovered probe state")?
+                .started_at_ms
+                >= evidence
+                    .recovery_ended_at_ms
+                    .context("split-brain lacks completed recovery timestamp")?,
+            "split-brain probes were inspected before healthy recovery completed"
+        );
+    }
+    let controller = phases[1]
+        .controller_before
+        .as_ref()
+        .context("Pod fault controller is missing")?;
+    ensure!(
+        evidence.active_snapshots.len() == 1 && evidence.workload_snapshots.len() == 1,
+        "Pod faults require one active and one post-workload runtime snapshot"
+    );
+    for snapshot in evidence
+        .active_snapshots
+        .iter()
+        .chain(&evidence.workload_snapshots)
+    {
+        let resource = snapshot
+            .get("chaos_status")
+            .context("Pod fault runtime snapshot has no controller resource")?;
+        pod_evidence.validate_controller(resource)?;
+        ensure!(
+            resource.pointer("/metadata/uid") == controller.pointer("/metadata/uid")
+                && resource.pointer("/metadata/name") == controller.pointer("/metadata/name")
+                && resource.pointer("/metadata/name").and_then(Value::as_str)
+                    == snapshot.get("resource_name").and_then(Value::as_str)
+                && snapshot.get("resource_kind").and_then(Value::as_str)
+                    == Some(if pod_evidence.scenario == scenarios::CLOCK_SKEW_SCENARIO {
+                        "timechaos"
+                    } else {
+                        "networkchaos"
+                    }),
+            "Pod observations and fault-evidence.json identify different controller resources"
+        );
+    }
+    ensure!(
+        phases[0].completed_at_ms
+            <= evidence
+                .fault_apply_started_at_ms
+                .context("Pod fault lacks apply timestamp")?
+            && phases[1].started_at_ms
+                >= evidence
+                    .fault_active_at_ms
+                    .context("Pod fault lacks active timestamp")?
+            && phases[1].completed_at_ms
+                <= evidence
+                    .workload_started_at_ms
+                    .context("Pod fault lacks workload start timestamp")?
+            && phases[2].started_at_ms
+                >= evidence
+                    .workload_ended_at_ms
+                    .context("Pod fault lacks workload end timestamp")?
+            && phases[2].completed_at_ms
+                <= evidence
+                    .fault_delete_started_at_ms
+                    .context("Pod fault lacks deletion timestamp")?
+            && phases[3].started_at_ms
+                >= evidence
+                    .recovery_started_at_ms
+                    .context("Pod fault lacks recovery start timestamp")?
+            && phases[3].completed_at_ms
+                <= evidence
+                    .recovery_ended_at_ms
+                    .context("Pod fault lacks recovery end timestamp")?,
+        "Pod observations are outside the persisted baseline/fault/workload/recovery phases"
+    );
     Ok(())
 }
 
@@ -13601,6 +14255,181 @@ mod tests {
         validate_run_spec(&run_spec, &options).expect("canonical percent run spec");
         validate_target_proof(&proof, &run_spec, &options)
             .expect("CSI PV without hostname affinity remains valid for percent mode");
+    }
+
+    #[test]
+    fn same_pod_runtime_artifacts_reject_missing_volume_and_generation_drift() {
+        let mut config = FaultTestConfig::for_test("real-cluster", "fast-csi");
+        config.scenario = crate::fault::scenarios::IO_EIO_SAME_POD_TWO_VOLUMES_SCENARIO.to_string();
+        apply_catalog_defaults(&mut config).expect("defaults");
+        let scenario = FaultScenario::from_config(&config).expect("scenario");
+        let catalog = scenario_spec(&scenario.name).expect("catalog");
+        let plan = FaultPlan::from_scenario_with_options(
+            &scenario,
+            catalog,
+            FaultPlanOptions::from_config(&config),
+        )
+        .expect("plan");
+        let run_spec = FaultRunSpec::resolved(
+            &config,
+            &scenario,
+            catalog,
+            &plan,
+            &WorkloadPlan::seeded(42, scenario.object_count, config.workload.concurrency),
+            "run-1",
+            "bucket-1",
+        );
+        let (shape, membership, volumes) = crate::fault::quorum::same_pod_volume_proof_fixture();
+        let pods = (0..4)
+            .map(|index| {
+                TargetResolvedPodProof::new(format!("rustfs-{index}"), format!("pod-uid-{index}"))
+                    .with_node(format!("node-{index}"))
+                    .with_node_labels(BTreeMap::from([(
+                        "kubernetes.io/hostname".to_string(),
+                        format!("node-{index}"),
+                    )]))
+                    .with_ready(true)
+                    .with_rustfs_container_id(format!("containerd://container-{index}"))
+                    .with_volume_mounts(
+                        (0..2)
+                            .map(|volume| TargetVolumeMountProof {
+                                container_name: "rustfs".to_string(),
+                                mount_path: format!("/data/rustfs{volume}"),
+                                volume_name: format!("data-{volume}-rustfs-{index}"),
+                                persistent_volume_claim: Some(format!(
+                                    "data-{volume}-rustfs-{index}"
+                                )),
+                            })
+                            .collect(),
+                    )
+                    .with_persistent_volume_claims(
+                        (0..2)
+                            .map(|volume| TargetPersistentVolumeClaimProof {
+                                name: format!("data-{volume}-rustfs-{index}"),
+                                uid: format!("pvc-uid-{index}-{volume}"),
+                                volume_name: Some(format!("pv-{index}-{volume}")),
+                                storage_class: Some("fast-csi".to_string()),
+                                persistent_volume: Some(TargetPersistentVolumeProof {
+                                    name: format!("pv-{index}-{volume}"),
+                                    uid: format!("pv-uid-{index}-{volume}"),
+                                    source: Some("csi".to_string()),
+                                    required_node_affinity: None,
+                                    node: None,
+                                    device_or_path: Some(format!("csi://{index}-{volume}")),
+                                }),
+                            })
+                            .collect(),
+                    )
+            })
+            .collect::<Vec<_>>();
+        let proof = TargetProof::from_plan(&config, &scenario, catalog, &plan, "run-1")
+            .with_resolved_pod_proofs(pods)
+            .with_erasure_set_topology_proven(
+                shape,
+                ErasureSetHealth::from_runtime(8, 8, 0, 0).expect("healthy drives"),
+                membership,
+                "deployment-1",
+                100,
+            )
+            .expect("runtime topology")
+            .with_same_pod_volumes_proven(volumes.clone())
+            .expect("same-Pod bindings");
+        let options = ArtifactValidationOptions {
+            scenario: scenario.name.clone(),
+            artifact_root: std::path::PathBuf::from("unused"),
+            expected_workload_objects: scenario.object_count,
+            expected_workload_concurrency: config.workload.concurrency,
+            expected_workload_versioning: config.workload_versioning,
+            expected_rustfs_pod_count: config.expected_rustfs_pod_count,
+            expected_stable_window_seconds: config.rustfs_pod_stable_window.as_secs(),
+            expected_recovery_stability_reread_seconds: config.recovery_stability_reread.as_secs(),
+            expected_rustfs_volume_path: config.rustfs_volume_path.clone(),
+        };
+        validate_run_spec(&run_spec, &options).expect("canonical run spec");
+        validate_target_proof(&proof, &run_spec, &options).expect("two-volume target proof");
+        let resources = volumes.bindings.iter().enumerate().map(|(index, binding)| json!({
+            "apiVersion":"chaos-mesh.org/v1alpha1", "kind":"IOChaos",
+            "metadata":{"name":format!("same-pod-{index}"), "uid":format!("iochaos-uid-{index}"), "namespace":run_spec.cluster.chaos_namespace,
+                "labels":{"rustfs-fault-test/run-id":"run-1", "rustfs-fault-test/scenario":scenario.name, "app.kubernetes.io/managed-by":"s3chaos"}},
+            "spec":{"action":"fault", "errno":5, "mode":"fixed", "value":"1", "selector":{"pods":{run_spec.cluster.namespace.clone():[binding.pod_name]}},
+                "containerNames":["rustfs"], "volumePath":binding.mount_path, "path":format!("{}/**/*", binding.mount_path),
+                "methods":["READ","WRITE","FSYNC","RENAME","UNLINK"], "percent":100, "duration":format!("{}s", scenario.duration.as_secs())},
+            "status":{"conditions":[{"type":"Selected","status":"True"},{"type":"AllInjected","status":"True"},{"type":"AllRecovered","status":"False"}],
+                "experiment":{"desiredPhase":"Run", "containerRecords":[{"id":format!("{}/{}/rustfs", run_spec.cluster.namespace, binding.pod_name), "selectorKey":".", "phase":"Injected", "injectedCount":1}]}}
+        })).collect::<Vec<_>>();
+        let snapshots = |stage| {
+            resources.iter().map(|resource| json!({"stage":stage, "resource_kind":"iochaos", "resource_name":resource["metadata"]["name"], "chaos_status":resource})).collect::<Vec<_>>()
+        };
+        let records = (0..2)
+            .map(|index| {
+                format!(
+                    "same-pod-{index}/iochaos-uid-{index}:{}/rustfs-3/rustfs",
+                    run_spec.cluster.namespace
+                )
+            })
+            .collect::<Vec<_>>();
+        let evidence: FaultEvidenceArtifact = serde_json::from_value(json!({
+            "injected":true, "active_during_workload":true, "recovered":true, "require_client_disruption":false, "client_disruptions":0,
+            "pods_before":(0..4).map(|index| json!({"name":format!("rustfs-{index}"), "uid":format!("pod-uid-{index}")})).collect::<Vec<_>>(),
+            "pods_at_fault_activation":[{"name":"rustfs-3","uid":"pod-uid-3"}], "pods_at_workload_snapshot":[{"name":"rustfs-3","uid":"pod-uid-3"}], "pods_after":[],
+            "fixed_volume_targets_at_fault_activation":records, "fixed_volume_targets_at_workload_snapshot":records,
+            "fixed_volume_containers_at_fault_activation":{"rustfs-3":"containerd://container-3"}, "fixed_volume_containers_at_workload_snapshot":{"rustfs-3":"containerd://container-3"},
+            "active_snapshots":snapshots("active"), "workload_snapshots":snapshots("after-workload"), "fault_apply_started_at_ms":200
+        })).expect("evidence");
+        validate_fixed_volume_runtime_evidence(&evidence, &proof, &run_spec)
+            .expect("both mounts throughout workload");
+        for field in [
+            "missing",
+            "resource_uid",
+            "pod_uid",
+            "container",
+            "before",
+            "record",
+            "path",
+        ] {
+            let mut changed = evidence.clone();
+            match field {
+                "missing" => {
+                    changed.workload_snapshots.pop();
+                }
+                "resource_uid" => {
+                    changed.workload_snapshots[1]["chaos_status"]["metadata"]["uid"] =
+                        json!("replacement-resource")
+                }
+                "pod_uid" => {
+                    changed.pods_at_workload_snapshot[0].uid = "replacement-pod".to_string()
+                }
+                "container" => {
+                    changed.fixed_volume_containers_at_workload_snapshot.insert(
+                        "rustfs-3".to_string(),
+                        "containerd://replacement".to_string(),
+                    );
+                }
+                "before" => {
+                    changed.pods_before.pop();
+                }
+                "record" => {
+                    changed.fixed_volume_targets_at_workload_snapshot.pop();
+                }
+                "path" => {
+                    changed.workload_snapshots[1]["chaos_status"]["spec"]["volumePath"] =
+                        json!("/data/unproved")
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_fixed_volume_runtime_evidence(&changed, &proof, &run_spec).is_err(),
+                "changed {field}"
+            );
+        }
+        let mut wrong_second_mount = proof.clone();
+        wrong_second_mount.resolved_pods[3].volume_mounts[1].persistent_volume_claim =
+            Some("unrelated".to_string());
+        assert!(validate_target_proof(&wrong_second_mount, &run_spec, &options).is_err());
+        assert!(
+            validate_fixed_volume_runtime_evidence(&evidence, &wrong_second_mount, &run_spec)
+                .is_err()
+        );
     }
 
     #[test]
