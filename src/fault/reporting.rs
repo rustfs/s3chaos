@@ -40,6 +40,8 @@ pub(crate) struct FaultStatusSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) lifecycle_status: Option<LifecycleStatusSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pod_kill_status: Option<crate::fault::backends::pod_kill::PodKillEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) quorum_dm_status: Option<crate::fault::backends::quorum_dm::QuorumDmStatusSnapshot>,
 }
 

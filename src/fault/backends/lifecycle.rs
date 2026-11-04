@@ -1185,7 +1185,11 @@ fn restart_pod_blocking(
 /// Block until the runner reports the first fault-phase S3 request
 /// (`gate` holds its harness timestamp), so the first delete lands while the
 /// client is issuing requests.
-fn wait_for_load(gate: &AtomicU64, cancel: &AtomicBool, timeout: Duration) -> Result<u64> {
+pub(super) fn wait_for_load(
+    gate: &AtomicU64,
+    cancel: &AtomicBool,
+    timeout: Duration,
+) -> Result<u64> {
     let deadline = Instant::now() + timeout;
     loop {
         if cancel.load(Ordering::SeqCst) {
@@ -1209,7 +1213,7 @@ fn wait_for_load(gate: &AtomicU64, cancel: &AtomicBool, timeout: Duration) -> Re
 
 /// A lifecycle step running beside the workload: the restart worker of the
 /// single-Pod and rolling restarts, or the cold-restart outage sampler.
-struct BackgroundTask {
+pub(super) struct BackgroundTask {
     handle: Option<JoinHandle<Result<()>>>,
     cancel: Arc<AtomicBool>,
     outcome: Option<Result<()>>,
@@ -1230,7 +1234,7 @@ fn join_outcome(handle: JoinHandle<Result<()>>) -> Result<()> {
 }
 
 impl BackgroundTask {
-    fn spawn(task: impl FnOnce(&AtomicBool) -> Result<()> + Send + 'static) -> Self {
+    pub(super) fn spawn(task: impl FnOnce(&AtomicBool) -> Result<()> + Send + 'static) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
         let task_cancel = Arc::clone(&cancel);
         Self {
@@ -1250,7 +1254,7 @@ impl BackgroundTask {
         self.outcome.as_ref()
     }
 
-    fn require_healthy(&mut self) -> Result<()> {
+    pub(super) fn require_healthy(&mut self) -> Result<()> {
         if let Some(Err(error)) = self.poll() {
             bail!("lifecycle background task failed: {error:#}");
         }
@@ -1289,7 +1293,7 @@ impl BackgroundTask {
 
     /// Stop a task that runs until cancelled (the outage sampler) and return
     /// its outcome.
-    fn stop(mut self) -> Result<()> {
+    pub(super) fn stop(mut self) -> Result<()> {
         self.cancel.store(true, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
             self.outcome = Some(join_outcome(handle));
@@ -1738,6 +1742,7 @@ impl LifecycleFaultHandle {
             chaos_status: None,
             dm_status: None,
             quorum_dm_status: None,
+            pod_kill_status: None,
             lifecycle_status: Some(LifecycleStatusSnapshot {
                 operation: self.operation,
                 statefulset_name: statefulset.identity.name,

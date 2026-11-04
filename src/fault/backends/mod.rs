@@ -20,3 +20,5 @@ pub(in crate::fault) mod lifecycle;
 pub(in crate::fault) mod runtime;
 
 pub(in crate::fault) mod quorum_dm;
+
+pub(in crate::fault) mod pod_kill;

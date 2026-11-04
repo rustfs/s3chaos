@@ -533,6 +533,14 @@ impl FaultRun<'_> {
         self.run_warp_workload(endpoint, port_forward, fault)
             .await?;
         history.set_durability_cohort(DurabilityCohort::FaultActive);
+        // One-shot Pod kills can be triggered by the availability read probe;
+        // include those actual requests in their recorded workload window.
+        let pod_kill_workload_started_at_ms = matches!(
+            plan.scenario.as_str(),
+            crate::fault::scenarios::POD_KILL_ONE_SCENARIO
+                | crate::fault::scenarios::POD_CRASH_VERSIONED_HOT_SCENARIO
+        )
+        .then(now_ms);
         // A backend that must disrupt under load is released by the first
         // fault-phase S3 request; the trigger stops when this scope ends.
         let _load_trigger = fault.load_gate().map(|gate| {
@@ -694,7 +702,7 @@ impl FaultRun<'_> {
                 "concurrency": workload_plan.concurrency,
             })),
         )?;
-        let workload_started_at_ms = now_ms();
+        let workload_started_at_ms = pod_kill_workload_started_at_ms.unwrap_or_else(now_ms);
         let workload = match run_mixed_workload(&MixedWorkloadRequest {
             s3,
             history,
@@ -774,6 +782,39 @@ impl FaultRun<'_> {
                 return Err(error);
             }
         };
+        if matches!(
+            plan.scenario.as_str(),
+            crate::fault::scenarios::POD_KILL_ONE_SCENARIO
+                | crate::fault::scenarios::POD_CRASH_VERSIONED_HOT_SCENARIO
+        ) {
+            let overlap = (|| -> Result<()> {
+                ensure!(
+                    workload_snapshots.len() == 1,
+                    "Pod kill requires one exact target snapshot"
+                );
+                crate::fault::backends::pod_kill::validate_snapshot(
+                    &serde_json::to_value(&workload_snapshots[0])?,
+                    &history.records(),
+                    &self.scenario.name,
+                    &self.context.run_id,
+                    &self.config.cluster.test_namespace,
+                    &self.config.chaos_namespace,
+                    &target.pods_before,
+                )?
+                .require_workload_window(workload_started_at_ms, workload_ended_at_ms)?;
+                Ok(())
+            })();
+            if let Err(error) = overlap {
+                self.record_failure(
+                    "fault-snapshot-after-workload",
+                    "environment_or_fault_backend",
+                    &error,
+                    None,
+                    Some((fault, "pod-kill-overlap-unproven")),
+                )?;
+                return Err(error);
+            }
+        }
         let WorkloadTargetEvidence {
             pods_at_workload_snapshot,
             workload_fixed_volume_targets,
@@ -1348,7 +1389,7 @@ impl FaultRun<'_> {
             "waiting for applied faults to become active",
             None,
         )?;
-        if let Err(error) = fault.wait_active(cluster.timeout) {
+        if let Err(error) = fault.wait_active(self.deadline.bounded_timeout(cluster.timeout)?) {
             self.record_failure(
                 "wait-active",
                 "environment_or_fault_backend",
@@ -1701,7 +1742,15 @@ impl FaultRun<'_> {
         if let Err(error) = fault.ensure_active("after fault workload") {
             self.record_failure(
                 "fault-still-active",
-                "test_or_environment",
+                if matches!(
+                    plan.scenario.as_str(),
+                    crate::fault::scenarios::POD_KILL_ONE_SCENARIO
+                        | crate::fault::scenarios::POD_CRASH_VERSIONED_HOT_SCENARIO
+                ) {
+                    "environment_or_fault_backend"
+                } else {
+                    "test_or_environment"
+                },
                 &error,
                 None,
                 Some((fault, "workload-outlived-fault")),
@@ -1725,6 +1774,31 @@ fn injected_source_pod_names(snapshots: &[FaultStatusSnapshot]) -> Result<BTreeS
         let Some(status) = &snapshot.chaos_status else {
             continue;
         };
+        if snapshot.resource_kind.as_deref() == Some("podchaos")
+            && status
+                .pointer("/spec/action")
+                .and_then(serde_json::Value::as_str)
+                == Some("pod-kill")
+            && snapshot.pod_kill_status.is_none()
+        {
+            // Before the load gate opens, use the exact armed selector to
+            // keep the S3 forward on a surviving Pod.
+            let namespaces = status
+                .pointer("/spec/selector/pods")
+                .and_then(serde_json::Value::as_object)
+                .context("armed Pod kill lacks its exact selector")?;
+            let names = namespaces
+                .values()
+                .flat_map(|value| value.as_array().into_iter().flatten())
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>();
+            ensure!(
+                names.len() == 1,
+                "armed Pod kill must select exactly one Pod"
+            );
+            targets.insert(names[0].to_string());
+            continue;
+        }
         let records = status
             .pointer("/status/experiment/containerRecords")
             .and_then(serde_json::Value::as_array)
@@ -1918,6 +1992,43 @@ mod availability_endpoint_tests {
     use std::collections::BTreeSet;
 
     #[test]
+    fn armed_pod_kill_routes_requests_to_an_untargeted_survivor() {
+        let config = crate::framework::config::E2eConfig::defaults();
+        let mut spec = crate::fault::backends::chaos_mesh::PodChaosSpec::kill_one_rustfs_pod(
+            &config.cluster,
+            "chaos-mesh",
+            "run",
+            "pod-kill-one",
+        );
+        spec.pod_name = Some("rustfs-1".into());
+        let snapshot = FaultStatusSnapshot {
+            stage: "armed".into(),
+            resource_kind: Some("podchaos".into()),
+            resource_name: Some(spec.name.clone()),
+            chaos_status: Some(serde_yaml_ng::from_str(&spec.manifest()).expect("manifest")),
+            pod_kill_status: None,
+            dm_status: None,
+            quorum_dm_status: None,
+            lifecycle_status: None,
+        };
+        let targets = injected_source_pod_names(&[snapshot]).expect("armed target");
+        let pods = [
+            PodIdentity {
+                name: "rustfs-0".into(),
+                uid: "zero".into(),
+            },
+            PodIdentity {
+                name: "rustfs-1".into(),
+                uid: "one".into(),
+            },
+        ];
+        assert_eq!(
+            surviving_pod_name(&pods, &targets).expect("survivor"),
+            "rustfs-0"
+        );
+    }
+
+    #[test]
     fn a_forward_lost_during_the_survivor_wait_is_harness_not_product() {
         use super::PortForwardLost;
         use anyhow::Context;
@@ -2026,6 +2137,7 @@ mod availability_endpoint_tests {
             })),
             dm_status: None,
             quorum_dm_status: None,
+            pod_kill_status: None,
             lifecycle_status: None,
         }
     }
@@ -2042,6 +2154,7 @@ mod availability_endpoint_tests {
             chaos_status: None,
             dm_status: None,
             quorum_dm_status: None,
+            pod_kill_status: None,
             lifecycle_status: Some(LifecycleStatusSnapshot {
                 operation: LifecycleOperation::Rolling,
                 statefulset_name: "tenant-primary".to_string(),
@@ -2096,6 +2209,7 @@ mod availability_endpoint_tests {
             chaos_status: None,
             dm_status: None,
             quorum_dm_status: None,
+            pod_kill_status: None,
             lifecycle_status: None,
         };
         assert!(injected_source_pod_names(&[dm_only]).is_err());

@@ -561,6 +561,7 @@ impl FaultLifecyclePort for Group {
             resource_name: Some("quorum-p-dm-eio".into()),
             chaos_status: None,
             dm_status: None,
+            pod_kill_status: None,
             lifecycle_status: None,
             quorum_dm_status: Some(self.evidence(stage)?),
         })

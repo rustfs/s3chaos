@@ -208,12 +208,20 @@ resolve_fault_context() {
   [[ "$FAULT_CONTEXT" != kind-* ]] || die "fault tests require a real Kubernetes or K3s cluster, got $FAULT_CONTEXT"
 }
 
+run_kubectl() {
+  if [[ -n "${health_request_timeout_seconds:-}" ]]; then
+    timeout --signal=TERM --kill-after=1s "${health_request_timeout_seconds}s" kubectl "$@"
+  else
+    kubectl "$@"
+  fi
+}
+
 kubectl_ns() {
-  kubectl --context "$FAULT_CONTEXT" -n "$1" "${@:2}"
+  run_kubectl --context "$FAULT_CONTEXT" -n "$1" "${@:2}"
 }
 
 kubectl_cluster() {
-  kubectl --context "$FAULT_CONTEXT" "$@"
+  run_kubectl --context "$FAULT_CONTEXT" "$@"
 }
 
 fault_catalog_json() {
@@ -351,6 +359,7 @@ validate_runtime_env_contract() {
   require_absolute_non_root_path RUSTFS_FAULT_TEST_RUSTFS_VOLUME_PATH "$RUSTFS_VOLUME_PATH"
   require_positive_integer RUSTFS_FAULT_TEST_RUSTFS_POD_STABLE_WINDOW_SECONDS "$RUSTFS_POD_STABLE_WINDOW_SECONDS"
   require_positive_integer RUSTFS_FAULT_TEST_HEALTH_GUARD_FAILURE_THRESHOLD "$HEALTH_GUARD_FAILURE_THRESHOLD"
+  require_optional_positive_integer RUSTFS_FAULT_TEST_HEALTH_REQUEST_TIMEOUT_SECONDS
   require_positive_integer RUSTFS_FAULT_TEST_PROCESS_TERMINATION_GRACE_SECONDS "$PROCESS_TERMINATION_GRACE_SECONDS"
   if [[ -n "$BUILD_JOBS" ]]; then
     require_positive_integer RUSTFS_FAULT_TEST_BUILD_JOBS "$BUILD_JOBS"
@@ -718,6 +727,7 @@ preflight() {
   require_command ps
   require_command awk
   require_command setsid
+  require_command timeout
   validate_runtime_env_contract "$scenario"
   if [[ "$mode" == "qualification" ]]; then
     validate_qualification_env_contract \
@@ -1050,6 +1060,10 @@ capture_fault_logs() {
 }
 
 health_status_json() {
+  local health_request_timeout_seconds="${RUSTFS_FAULT_TEST_HEALTH_REQUEST_TIMEOUT_SECONDS:-30}"
+  require_unsigned_integer RUSTFS_FAULT_TEST_HEALTH_REQUEST_TIMEOUT_SECONDS "$health_request_timeout_seconds"
+  (( 10#$health_request_timeout_seconds > 0 )) || die "health request timeout must be positive"
+  require_command timeout
   local baseline_ready_nodes="$1" baseline_tenants="$2" require_chaos="$3"
   local current_ready_nodes=0 disk_pressure_nodes="" disk_pressure_count=0
   local nodes_safe=false disk_pressure_safe=true tenants_safe=true chaos_safe=true chaos_required=false

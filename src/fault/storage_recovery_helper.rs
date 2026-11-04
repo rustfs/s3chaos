@@ -24,7 +24,6 @@ use std::{
     ffi::CString,
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
-    mem::size_of,
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::{fs::MetadataExt, prelude::FileExt},
@@ -2956,20 +2955,8 @@ fn open_beneath(root: &File, relative: &str, flags: i32, mode: u32) -> Result<Fi
         mode: u64::from(mode),
         resolve: STORAGE_RESOLVE_FLAGS,
     };
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            root.as_raw_fd(),
-            path.as_ptr(),
-            &how,
-            size_of::<OpenHow>(),
-        )
-    } as i32;
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("open contained storage path {relative:?}"));
-    }
-    Ok(unsafe { File::from_raw_fd(fd) })
+    contained_open(root, &path, &how)
+        .with_context(|| format!("open contained storage path {relative:?}"))
 }
 
 fn ensure_absent_beneath(root: &File, relative: &str) -> Result<()> {
@@ -2987,25 +2974,40 @@ fn ensure_absent_beneath(root: &File, relative: &str) -> Result<()> {
         mode: 0,
         resolve: STORAGE_RESOLVE_FLAGS,
     };
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            root.as_raw_fd(),
-            path.as_ptr(),
-            &how,
-            size_of::<OpenHow>(),
-        )
-    } as i32;
-    if fd >= 0 {
-        drop(unsafe { File::from_raw_fd(fd) });
-        bail!("run-owned stale orphan remains present after cleanup")
-    }
-    let error = std::io::Error::last_os_error();
+    let error = match contained_open(root, &path, &how) {
+        Ok(_) => bail!("run-owned stale orphan remains present after cleanup"),
+        Err(error) => error,
+    };
     ensure!(
         error.raw_os_error() == Some(libc::ENOENT),
         "cannot prove stale orphan absence: {error}"
     );
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn contained_open(root: &File, path: &CString, how: &OpenHow) -> std::io::Result<File> {
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            path.as_ptr(),
+            how,
+            std::mem::size_of::<OpenHow>(),
+        )
+    } as i32;
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn contained_open(_root: &File, _path: &CString, _how: &OpenHow) -> std::io::Result<File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "storage helper requires Linux openat2 containment",
+    ))
 }
 
 fn acquire_flock(file: &File) -> Result<()> {
@@ -3148,6 +3150,8 @@ fn required<'a>(value: &'a Option<String>, label: &str) -> Result<&'a str> {
 
 fn device_id(metadata: &std::fs::Metadata) -> String {
     let device = metadata.dev();
+    #[cfg(target_os = "macos")]
+    let device = device as libc::dev_t;
     let major = libc::major(device);
     let minor = libc::minor(device);
     format!("{major}:{minor}")
@@ -3162,7 +3166,7 @@ fn now_ms() -> Result<u64> {
         .context("system timestamp exceeds u64 milliseconds")
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use crate::fault::storage_recovery_runtime::*;
@@ -4521,5 +4525,20 @@ mod tests {
             error.to_string().contains("repair acknowledgement"),
             "{error:#}"
         );
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod platform_tests {
+    #[test]
+    fn storage_paths_require_linux_containment() {
+        let root = tempfile::tempdir().expect("root");
+        let directory = std::fs::File::open(root.path()).expect("directory");
+        let error =
+            super::open_beneath(&directory, "new-file", libc::O_CREAT | libc::O_RDWR, 0o600)
+                .expect_err("unsupported host cannot mutate storage");
+        assert!(format!("{error:#}").contains("requires Linux openat2"));
+        assert!(!root.path().join("new-file").exists());
+        assert!(super::ensure_absent_beneath(&directory, "missing").is_err());
     }
 }

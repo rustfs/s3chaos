@@ -55,6 +55,9 @@ make fault-check      # check + fault script/YAML validation
 make protocol-check   # check + bash -n on protocol scripts
 ```
 
+The CLI builds on Linux and macOS. Host storage recovery helpers require Linux
+`openat2`; unsupported hosts reject those filesystem operations.
+
 ## Fault-Injection Testing
 
 The normal correctness workflow uses one foreground command for all ordinary
@@ -78,6 +81,20 @@ make fault-cleanup                                   # release cluster fixtures
 Both live targets build once and run cluster preflight once. The Chaos wrapper
 uses one pre-run plan pass. `make fault-preflight SCENARIO=...` is available for
 standalone diagnostics, but it is not a required execution step.
+Foreground Rust `kubectl` calls use the configured cluster timeout. Health
+watcher calls have a separate per-command limit of 30 seconds, configurable
+through `RUSTFS_FAULT_TEST_HEALTH_REQUEST_TIMEOUT_SECONDS` (positive integer).
+The live shell entry point requires GNU `timeout` (Homebrew `coreutils` on macOS).
+
+`pod-kill-one` and `pod-crash-versioned-hot` arm an exact Pod target and apply
+PodChaos after fault-phase S3 requests begin. Their evidence must contain a
+successful controller injection record, disappearance of the original Pod UID,
+and continuous request coverage from apply start through the first disappearance
+observation. A short workload or a gap in requests can leave overlap unproven;
+the run then fails as an environment/backend failure. Increase workload size or
+concurrency to sustain requests during injection. Artifact validation requires
+this evidence for both scenarios, including when reading older run directories.
+
 Use `make fault-chaos-plan` only when reviewing the resolved plan without
 starting the suite. Override the canonical suite with
 `CHAOS_SUITE=/path/to/suite.yaml`; `fault-chaos-run` rejects static storage and
