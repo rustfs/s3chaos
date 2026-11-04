@@ -26,7 +26,8 @@ use crate::{
         history::DurabilityCohort,
         quorum::require_fresh_runtime_observation,
         scenarios::{
-            NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO, POD_FAILURE_QUORUM_EDGE_SCENARIO,
+            FaultScenarioSpec, NETWORK_PARTITION_WRITE_QUORUM_LOSS_SCENARIO,
+            POD_CRASH_VERSIONED_HOT_SCENARIO, POD_FAILURE_QUORUM_EDGE_SCENARIO,
             QUORUM_P_DM_EIO_SCENARIO, QUORUM_P_IO_FAULT_SCENARIO,
             QUORUM_P_PLUS_ONE_IO_FAULT_SCENARIO, requires_prefault_multipart_staging,
             requires_quorum_edge_read_survival,
@@ -1435,9 +1436,10 @@ impl FaultRun<'_> {
     /// The workload endpoint is a `kubectl port-forward` pinned to one Pod for
     /// its lifetime. Such a verdict is only meaningful for a client attached
     /// to a surviving node — a forward to a failed Pod refuses every
-    /// connection — so once the fault is active the forward is re-established
-    /// to a Pod the controller did not target. A ClusterIP endpoint balances
-    /// per connection and needs no pinning.
+    /// connection — so before starting load the forward is re-established to
+    /// an untargeted Pod. Deferred Pod kills also need this routing to keep
+    /// hot-key mutations running after injection. A ClusterIP endpoint
+    /// balances per connection and needs no pinning.
     async fn pin_availability_endpoint(
         &self,
         target: &ProvenTarget,
@@ -1445,9 +1447,7 @@ impl FaultRun<'_> {
         endpoint: &str,
         port_forward: &mut Option<PortForwardGuard>,
     ) -> Result<Option<String>> {
-        if !self.context.spec.impact_policy.requires_availability()
-            && !requires_quorum_edge_read_survival(&self.plan.scenario)
-        {
+        if !requires_survivor_endpoint(self.context.spec) {
             return Ok(None);
         }
         // A ClusterIP endpoint needs no target set; resolving one from the
@@ -1761,6 +1761,12 @@ impl FaultRun<'_> {
     }
 }
 
+fn requires_survivor_endpoint(spec: &FaultScenarioSpec) -> bool {
+    spec.impact_policy.requires_availability()
+        || requires_quorum_edge_read_survival(spec.scenario)
+        || spec.scenario == POD_CRASH_VERSIONED_HOT_SCENARIO
+}
+
 /// Pod names the Chaos Mesh controller injected as fault sources (selector
 /// key "."), read from the active-stage status snapshots. NetworkChaos
 /// ".Target" peers are not fault targets and stay eligible as survivors.
@@ -1984,12 +1990,35 @@ mod load_trigger_tests {
 
 #[cfg(test)]
 mod availability_endpoint_tests {
-    use super::{AvailabilityEndpointFailure, injected_source_pod_names, surviving_pod_name};
+    use super::{
+        AvailabilityEndpointFailure, injected_source_pod_names, requires_survivor_endpoint,
+        surviving_pod_name,
+    };
     use crate::fault::reporting::{
         FailurePhase, FailureSeverity, FailureSummary, FaultStatusSnapshot, PodIdentity,
         ResponsibilityDomain,
     };
     use std::collections::BTreeSet;
+
+    #[test]
+    fn versioned_hot_routes_to_a_survivor_with_optional_client_disruption() {
+        use crate::fault::scenarios::{FaultImpactPolicy, scenario_spec};
+
+        let spec = scenario_spec("pod-crash-versioned-hot").expect("scenario");
+        assert_eq!(
+            spec.impact_policy,
+            FaultImpactPolicy::ClientDisruptionOptional
+        );
+        assert!(requires_survivor_endpoint(spec));
+        for name in ["pod-kill-one", "pod-failure-quorum-edge"] {
+            assert!(requires_survivor_endpoint(
+                scenario_spec(name).expect("scenario")
+            ));
+        }
+        assert!(!requires_survivor_endpoint(
+            scenario_spec("dm-flakey-versioned-hot").expect("scenario")
+        ));
+    }
 
     #[test]
     fn armed_pod_kill_routes_requests_to_an_untargeted_survivor() {

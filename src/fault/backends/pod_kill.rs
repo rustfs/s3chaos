@@ -219,6 +219,7 @@ pub(super) fn arm(
         });
         let deadline = Instant::now() + timeout;
         let mut deletion_observed_at_ms = None;
+        let mut last_observation = "no observation completed".to_string();
         loop {
             ensure!(
                 !cancel.load(Ordering::SeqCst),
@@ -226,30 +227,51 @@ pub(super) fn arm(
             );
             ensure!(
                 Instant::now() < deadline,
-                "Pod kill target did not disappear within {timeout:?}"
+                "Pod kill activation was not confirmed within {timeout:?}; last observation: {last_observation}"
             );
-            let mut probe_config = worker_config.clone();
-            probe_config.timeout = probe_config
-                .timeout
-                .min(deadline.saturating_duration_since(Instant::now()));
-            let current = rustfs_pod_identities(&probe_config)?;
-            if !current.iter().any(|observed| observed.uid == pod.uid) {
-                let observed_at = *deletion_observed_at_ms.get_or_insert_with(now_ms);
+            let observation: Result<_> = (|| {
+                let mut probe_config = worker_config.clone();
+                probe_config.timeout = probe_config
+                    .timeout
+                    .min(deadline.saturating_duration_since(Instant::now()));
+                let current = rustfs_pod_identities(&probe_config)
+                    .context("observe Pod kill target deletion")?;
+                ensure!(
+                    !current.iter().any(|observed| observed.uid == pod.uid),
+                    "original Pod UID is still present"
+                );
+                deletion_observed_at_ms.get_or_insert_with(now_ms);
                 let state = worker_activation.lock().expect("Pod kill activation mutex");
+                ensure!(
+                    !cancel.load(Ordering::SeqCst),
+                    "Pod kill cancelled during activation"
+                );
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                ensure!(!remaining.is_zero(), "activation deadline elapsed");
                 let status = state
                     .as_ref()
                     .context("Pod kill resource is missing")?
                     .guard
-                    .json_with_timeout(deadline.saturating_duration_since(Instant::now()))?;
+                    .json_with_timeout(worker_config.timeout.min(remaining))
+                    .context("observe PodChaos injection status")?;
                 drop(state);
-                if !injection_recorded(
-                    &serde_json::from_str(&status)?,
-                    &worker_spec.target_namespace,
-                    &pod.name,
-                ) {
-                    std::thread::sleep(Duration::from_millis(20));
-                    continue;
-                }
+                ensure!(
+                    injection_recorded(
+                        &serde_json::from_str(&status)
+                            .context("parse PodChaos injection status")?,
+                        &worker_spec.target_namespace,
+                        &pod.name,
+                    ),
+                    "controller has not recorded the Pod kill"
+                );
+                Ok(current)
+            })();
+            if let Ok(current) = observation {
+                ensure!(
+                    !cancel.load(Ordering::SeqCst),
+                    "Pod kill cancelled during activation"
+                );
+                ensure!(Instant::now() < deadline, "activation deadline elapsed");
                 let evidence = PodKillEvidence {
                     schema_version: 1,
                     scenario: worker_spec.scenario.clone(),
@@ -259,7 +281,7 @@ pub(super) fn arm(
                     resource_name: worker_spec.name.clone(),
                     request_gate_at_ms,
                     apply_started_at_ms,
-                    deletion_observed_at_ms: observed_at,
+                    deletion_observed_at_ms: deletion_observed_at_ms.expect("observed deletion"),
                     pods_after_deletion: current,
                 };
                 worker_activation
@@ -269,6 +291,8 @@ pub(super) fn arm(
                     .context("Pod kill resource is missing")?
                     .evidence = Some(evidence);
                 return Ok(());
+            } else if let Err(error) = observation {
+                last_observation = format!("{error:#}");
             }
             std::thread::sleep(
                 Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
@@ -500,14 +524,46 @@ mod tests {
 
     #[test]
     fn backend_waits_for_load_and_cancels_without_late_injection() {
+        run_backend_regression("success");
+    }
+
+    #[test]
+    fn backend_retries_transient_pod_and_controller_queries() {
+        for mode in ["pod-retry", "status-retry"] {
+            run_backend_regression(mode);
+        }
+    }
+
+    #[test]
+    fn backend_bounds_failed_observations_and_retains_the_last_error() {
+        for mode in ["pod-timeout", "status-timeout"] {
+            run_backend_regression(mode);
+        }
+    }
+
+    #[test]
+    fn backend_cancels_observation_retries_and_cleans_up() {
+        for mode in ["pod-cancel", "status-cancel"] {
+            run_backend_regression(mode);
+        }
+    }
+
+    fn run_backend_regression(mode: &str) {
         use crate::framework::{command::CommandSpec, config::E2eConfig};
         use std::os::unix::fs::PermissionsExt;
         const CHILD: &str = "S3CHAOS_POD_TEST_DIR";
         if let Some(directory) = std::env::var_os(CHILD) {
+            if std::env::var("S3CHAOS_POD_TEST_MODE").expect("mode") != mode {
+                return;
+            }
             let directory = std::path::PathBuf::from(directory);
             let mut config = E2eConfig::defaults().cluster;
             config.test_namespace = "test".into();
-            config.timeout = Duration::from_secs(3);
+            config.timeout = if mode.ends_with("timeout") {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_secs(3)
+            };
             let mut spec =
                 PodChaosSpec::kill_one_rustfs_pod(&config, "chaos-mesh", "run", "pod-kill-one");
             spec.name = "kill".into();
@@ -527,17 +583,82 @@ mod tests {
             let mut active = arm(&config, spec, vec![evidence().pod]).expect("arm");
             std::thread::sleep(Duration::from_millis(50));
             assert!(!directory.join("calls").exists());
+            let started = Instant::now();
             active
                 .load_gate()
                 .expect("gate")
                 .store(now_ms(), Ordering::SeqCst);
             let deadline = Instant::now() + Duration::from_secs(4);
+            let probe = mode.split('-').next().expect("probe kind");
+            let attempts = || {
+                std::fs::read_to_string(directory.join(format!("{probe}-attempts")))
+                    .ok()
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0)
+            };
+            if mode.ends_with("cancel") {
+                while attempts() < 2 {
+                    active
+                        .wait_active(config.timeout)
+                        .expect("retry remains healthy");
+                    assert!(Instant::now() < deadline, "backend did not retry");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let cancelled_at = Instant::now();
+                drop(active);
+                assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+                assert!(directory.join("deleted").exists());
+                let calls = std::fs::read_to_string(directory.join("calls")).expect("calls");
+                assert_eq!(
+                    calls
+                        .lines()
+                        .filter(|line| line.contains(" apply "))
+                        .count(),
+                    1
+                );
+                std::thread::sleep(Duration::from_millis(100));
+                assert_eq!(
+                    calls,
+                    std::fs::read_to_string(directory.join("calls")).expect("calls")
+                );
+                return;
+            }
+            if mode.ends_with("timeout") {
+                let error = loop {
+                    if let Err(error) = active.wait_active(config.timeout) {
+                        break error.to_string();
+                    }
+                    assert!(Instant::now() < deadline, "activation exceeded its budget");
+                    std::thread::sleep(Duration::from_millis(20));
+                };
+                assert!(started.elapsed() >= config.timeout);
+                assert!(attempts() >= 2, "failed query was not retried");
+                assert!(
+                    error.contains("activation was not confirmed within"),
+                    "{error}"
+                );
+                assert!(error.contains("last observation: observe Pod"), "{error}");
+                // The final probe may exhaust the remaining command budget
+                // before the fake API can return its error.
+                if error.contains("command timed out after") {
+                    assert!(error.contains(": kubectl "), "{error}");
+                } else {
+                    assert!(error.contains(&format!("{probe} unavailable")), "{error}");
+                }
+                assert!(active.ensure_active("load").is_err());
+                drop(active);
+                assert!(directory.join("deleted").exists());
+                return;
+            }
             while active.ensure_active("load").is_err() {
                 assert!(Instant::now() < deadline, "backend never activated");
                 std::thread::sleep(Duration::from_millis(20));
             }
             let result = active.snapshot("after-workload").expect("snapshot");
             assert!(result.pod_kill_status.is_some());
+            if mode.ends_with("retry") {
+                assert!(attempts() >= 3, "transient query failures were not retried");
+            }
             let manifest: serde_json::Value = serde_yaml_ng::from_str(
                 &std::fs::read_to_string(directory.join("applied")).expect("manifest"),
             )
@@ -563,13 +684,28 @@ mod tests {
 set -eu
 cd "$S3CHAOS_POD_TEST_DIR"
 printf '%s\n' "$*" >> calls
+probe() {
+  count=0
+  if [ -f "$1-attempts" ]; then count=$(cat "$1-attempts"); fi
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$1-attempts.tmp"
+  mv "$1-attempts.tmp" "$1-attempts"
+  case "$S3CHAOS_POD_TEST_MODE:$1" in
+    pod-retry:pod|status-retry:status)
+      if [ "$count" -gt 2 ]; then return; fi ;;
+    pod-timeout:pod|status-timeout:status|pod-cancel:pod|status-cancel:status) ;;
+    *) return ;;
+  esac
+  printf '%s unavailable\n' "$1" >&2
+  exit 1
+}
 case " $* " in
   *" get pod "*)
     uid=old
-    if [ -f applied ]; then uid=new; fi
+    if [ -f applied ]; then probe pod; uid=new; fi
     printf '{"items":[{"metadata":{"name":"rustfs-1","uid":"%s"}}]}\n' "$uid" ;;
   *" apply "*) cat > applied ;;
-  *" get podchaos "*) cat resource.json ;;
+  *" get podchaos "*) probe status; cat resource.json ;;
   *" delete podchaos "*) touch deleted ;;
   *" wait "*) exit 0 ;;
   *) exit 11 ;;
@@ -579,12 +715,30 @@ esac
         .expect("fake kubectl");
         std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o755))
             .expect("executable");
-        CommandSpec::new("env").args([
-            format!("PATH={}:{}", temporary.path().display(), std::env::var("PATH").expect("PATH")),
-            format!("{CHILD}={}", temporary.path().display()),
-            std::env::current_exe().expect("test binary").to_string_lossy().into_owned(),
-            "--exact".into(), "fault::backends::pod_kill::tests::backend_waits_for_load_and_cancels_without_late_injection".into(), "--nocapture".into(),
-        ]).timeout(Duration::from_secs(10)).run_checked().expect("isolated backend test");
+        let test_name = std::thread::current()
+            .name()
+            .expect("test name")
+            .to_string();
+        CommandSpec::new("env")
+            .args([
+                format!(
+                    "PATH={}:{}",
+                    temporary.path().display(),
+                    std::env::var("PATH").expect("PATH")
+                ),
+                format!("{CHILD}={}", temporary.path().display()),
+                format!("S3CHAOS_POD_TEST_MODE={mode}"),
+                std::env::current_exe()
+                    .expect("test binary")
+                    .to_string_lossy()
+                    .into_owned(),
+                "--exact".into(),
+                test_name,
+                "--nocapture".into(),
+            ])
+            .timeout(Duration::from_secs(10))
+            .run_checked()
+            .expect("isolated backend test");
     }
 
     #[test]
