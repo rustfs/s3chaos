@@ -522,39 +522,6 @@ pub(crate) fn wait_for_rustfs_pod_replacement(
     }
 }
 
-pub(crate) fn wait_for_rustfs_pod_deletion(
-    config: &ClusterTestConfig,
-    before: &[PodIdentity],
-    timeout: Duration,
-) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    let mut last_snapshot = Vec::new();
-    let mut last_error = "not checked yet".to_string();
-
-    loop {
-        if Instant::now() >= deadline {
-            bail!(
-                "timed out waiting for PodChaos to delete a RustFS pod after {timeout:?}\nbefore: {before:?}\nlast: {last_snapshot:?}\nlast error: {last_error}",
-            );
-        }
-
-        match rustfs_pod_identities(config) {
-            Ok(current) => {
-                if pod_deletion_observed(before, &current) {
-                    return Ok(());
-                }
-                last_snapshot = current;
-                last_error = "none".to_string();
-            }
-            Err(error) => {
-                last_error = error.to_string();
-            }
-        }
-
-        sleep(Duration::from_millis(250));
-    }
-}
-
 pub(crate) fn pod_deletion_observed(before: &[PodIdentity], current: &[PodIdentity]) -> bool {
     let current_uids = current
         .iter()

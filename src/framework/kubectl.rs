@@ -18,6 +18,7 @@ use crate::framework::{command::CommandSpec, config::ClusterTestConfig};
 pub struct Kubectl {
     context: String,
     namespace: Option<String>,
+    timeout: std::time::Duration,
 }
 
 impl Kubectl {
@@ -25,6 +26,7 @@ impl Kubectl {
         Self {
             context: config.context.clone(),
             namespace: None,
+            timeout: config.timeout,
         }
     }
 
@@ -53,7 +55,9 @@ impl Kubectl {
             kubectl_args.push(namespace.clone());
         }
         kubectl_args.extend(args.into_iter().map(Into::into));
-        CommandSpec::new("kubectl").args(kubectl_args)
+        CommandSpec::new("kubectl")
+            .args(kubectl_args)
+            .timeout(self.timeout)
     }
 
     pub fn apply_yaml_command(&self, yaml: impl Into<String>) -> CommandSpec {
@@ -69,6 +73,16 @@ impl Kubectl {
 mod tests {
     use super::Kubectl;
     use crate::framework::config::E2eConfig;
+
+    #[test]
+    fn foreground_commands_inherit_the_cluster_timeout() {
+        let mut config = E2eConfig::defaults();
+        config.timeout = std::time::Duration::from_millis(75);
+        assert_eq!(
+            Kubectl::new(&config).command(["get", "pods"]).timeout,
+            Some(config.timeout)
+        );
+    }
 
     #[test]
     fn kubectl_commands_pin_the_expected_context() {

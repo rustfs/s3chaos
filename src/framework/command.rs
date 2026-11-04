@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
@@ -26,6 +26,7 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub stdin: Option<String>,
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +43,7 @@ impl CommandSpec {
             args: Vec::new(),
             cwd: None,
             stdin: None,
+            timeout: None,
         }
     }
 
@@ -69,6 +71,11 @@ impl CommandSpec {
         self
     }
 
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
     pub fn display(&self) -> String {
         let args = self.args.join(" ");
         if args.is_empty() {
@@ -79,6 +86,21 @@ impl CommandSpec {
     }
 
     pub fn run(&self) -> Result<CommandOutput> {
+        if let Some(timeout) = self.timeout {
+            // Synchronous adapters also run inside Tokio tasks. A separate
+            // thread keeps the bounded I/O runtime independent of that executor.
+            return std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?
+                            .block_on(self.run_bounded(timeout))
+                    })
+                    .join()
+                    .map_err(|_| anyhow!("bounded command worker panicked: {}", self.display()))?
+            });
+        }
         let mut command = Command::new(&self.program);
         command.args(&self.args);
         if let Some(cwd) = &self.cwd {
@@ -121,6 +143,13 @@ impl CommandSpec {
     /// future is dropped, so a peer that accepts the connection but never
     /// answers cannot pin the calling task forever.
     pub async fn run_bounded(&self, timeout: Duration) -> Result<CommandOutput> {
+        let timeout = self.timeout.map_or(timeout, |limit| limit.min(timeout));
+        ensure!(
+            !timeout.is_zero(),
+            "command deadline elapsed before start: {}",
+            self.display()
+        );
+        let deadline = tokio::time::Instant::now() + timeout;
         let mut command = tokio::process::Command::new(&self.program);
         command.args(&self.args).kill_on_drop(true);
         if let Some(cwd) = &self.cwd {
@@ -137,27 +166,53 @@ impl CommandSpec {
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to start command: {}", self.display()))?;
-        if let Some(stdin) = &self.stdin {
-            let mut pipe = child.stdin.take().context("failed to open command stdin")?;
-            pipe.write_all(stdin.as_bytes()).await.with_context(|| {
-                format!("failed to write stdin for command: {}", self.display())
-            })?;
-            drop(pipe);
-        }
-        let output = tokio::time::timeout(timeout, child.wait_with_output())
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "command timed out after {}s: {}",
-                    timeout.as_secs_f64(),
-                    self.display()
-                )
-            })?
-            .with_context(|| format!("failed to wait for command: {}", self.display()))?;
+        let input = child.stdin.take();
+        let mut stdout = child.stdout.take().context("command stdout is missing")?;
+        let mut stderr = child.stderr.take().context("command stderr is missing")?;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let exchange = async {
+            let write = async {
+                if let Some(mut input) = input {
+                    input
+                        .write_all(self.stdin.as_deref().unwrap_or_default().as_bytes())
+                        .await?;
+                    input.shutdown().await?;
+                }
+                std::io::Result::Ok(())
+            };
+            let (status, _, _, _) = tokio::try_join!(
+                child.wait(),
+                write,
+                stdout.read_to_end(&mut out),
+                stderr.read_to_end(&mut err)
+            )?;
+            std::io::Result::Ok(status)
+        };
+        let result = tokio::time::timeout_at(deadline, exchange).await;
+        let status = match result {
+            Ok(Ok(status)) => status,
+            failure => {
+                // Reap before a synchronous caller shuts down its I/O runtime.
+                if child.try_wait()?.is_none() {
+                    child.kill().await.context("terminate failed command")?;
+                }
+                return match failure {
+                    Ok(Err(error)) => Err(error)
+                        .with_context(|| format!("command I/O failed: {}", self.display())),
+                    Err(_) => Err(anyhow!(
+                        "command timed out after {}s: {}",
+                        timeout.as_secs_f64(),
+                        self.display()
+                    )),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+            }
+        };
         Ok(CommandOutput {
-            code: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            code: status.code(),
+            stdout: String::from_utf8_lossy(&out).into_owned(),
+            stderr: String::from_utf8_lossy(&err).into_owned(),
         })
     }
 
@@ -295,6 +350,43 @@ mod tests {
         assert_eq!(output.stderr, "err");
     }
 
+    #[tokio::test]
+    async fn synchronous_timeout_is_enforced_inside_an_async_executor() {
+        let started = std::time::Instant::now();
+        let error = CommandSpec::new("sleep")
+            .arg("30")
+            .timeout(std::time::Duration::from_millis(100))
+            .run_checked()
+            .expect_err("timeout");
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn bounded_timeout_includes_a_blocked_stdin_writer() {
+        let started = std::time::Instant::now();
+        let error = CommandSpec::new("sleep")
+            .arg("30")
+            .stdin("x".repeat(2 * 1024 * 1024))
+            .run_bounded(std::time::Duration::from_millis(100))
+            .await
+            .expect_err("timeout");
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn bounded_exchange_drains_output_while_sending_input() {
+        let payload = "x".repeat(2 * 1024 * 1024);
+        let output = CommandSpec::new("cat")
+            .stdin(payload.clone())
+            .run_bounded(std::time::Duration::from_secs(10))
+            .await
+            .expect("duplex exchange");
+        assert_eq!(output.stdout, payload);
+        assert_eq!(output.code, Some(0));
+    }
+
     #[test]
     fn command_display_does_not_include_stdin_payload() {
         let command = CommandSpec::new("kubectl")
@@ -302,5 +394,17 @@ mod tests {
             .stdin("secret: value");
 
         assert_eq!(command.display(), "kubectl apply -f -");
+    }
+
+    #[tokio::test]
+    async fn expired_deadline_does_not_start_the_command() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let marker = temporary.path().join("started");
+        CommandSpec::new("touch")
+            .arg(marker.to_string_lossy())
+            .run_bounded(std::time::Duration::ZERO)
+            .await
+            .expect_err("expired budget");
+        assert!(!marker.exists());
     }
 }

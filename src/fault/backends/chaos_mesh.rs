@@ -1018,7 +1018,7 @@ pub(crate) enum AppliedFault {
         active_required: bool,
     },
     PodKill {
-        guard: ChaosGuard,
+        spec: PodChaosSpec,
         before_pods: Vec<PodIdentity>,
     },
     PodKillStorm {
@@ -1065,7 +1065,7 @@ pub(crate) fn apply_fault(request: &FaultApplyRequest<'_>) -> Result<AppliedFaul
     } else {
         None
     };
-    let spec = build_fault_spec(
+    let mut spec = build_fault_spec(
         config,
         scenario,
         request.injection,
@@ -1078,6 +1078,15 @@ pub(crate) fn apply_fault(request: &FaultApplyRequest<'_>) -> Result<AppliedFaul
     } else {
         None
     };
+    if let (FaultSpec::PodKill(chaos), Some(pods)) = (&mut spec, &before_pods) {
+        chaos.pod_name = Some(
+            pods.iter()
+                .max_by(|a, b| a.name.cmp(&b.name))
+                .context("pod kill requires a target Pod")?
+                .name
+                .clone(),
+        );
+    }
     request
         .collector
         .write_text(scenario.case_name, request.manifest_name, &spec.manifest())?;
@@ -1096,7 +1105,7 @@ pub(crate) fn apply_fault(request: &FaultApplyRequest<'_>) -> Result<AppliedFaul
                 unreachable!("PodKill captures pod identities before apply");
             };
             Ok(AppliedFault::PodKill {
-                guard: apply_podchaos(cluster, &chaos)?,
+                spec: chaos,
                 before_pods,
             })
         }
@@ -1535,6 +1544,7 @@ pub struct PodChaosSpec {
     /// `value: n`, which is how quorum-edge scenarios take more than one
     /// server offline at the same instant.
     pub targets: Option<u32>,
+    pub(crate) pod_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2031,6 +2041,7 @@ impl PodChaosSpec {
             tenant_name: config.tenant_name.clone(),
             action: PodChaosAction::PodKill,
             targets: None,
+            pod_name: None,
         }
     }
 
@@ -2057,6 +2068,7 @@ impl PodChaosSpec {
             tenant_name: config.tenant_name.clone(),
             action: PodChaosAction::PodFailure { duration },
             targets: None,
+            pod_name: None,
         })
     }
 
@@ -2080,6 +2092,17 @@ impl PodChaosSpec {
 
     pub fn manifest(&self) -> String {
         let action = self.action_manifest();
+        let exact_pod = self
+            .pod_name
+            .as_ref()
+            .map(|pod| {
+                format!(
+                    "    pods:\n      {}:\n        - {}\n",
+                    self.target_namespace,
+                    serde_json::to_string(pod).expect("Pod name string")
+                )
+            })
+            .unwrap_or_default();
         let (mode, value) = match self.targets {
             Some(targets) => ("fixed", format!("  value: \"{targets}\"\n")),
             None => ("one", String::new()),
@@ -2102,7 +2125,7 @@ spec:
       - {target_namespace}
     labelSelectors:
       rustfs.tenant: {tenant_name}
-"#,
+{exact_pod}"#,
             name = self.name,
             namespace = self.namespace,
             run_id_label = RUN_ID_LABEL,

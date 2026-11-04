@@ -838,8 +838,10 @@ impl<'a> MsgpackCursor<'a> {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use tests::fixture as test_fixture;
 #[cfg(test)]
-pub(crate) use tests::{fixture as test_fixture, inline_fixture as test_inline_fixture};
+pub(crate) use tests::inline_fixture as test_inline_fixture;
 
 #[cfg(test)]
 mod tests {

@@ -192,6 +192,7 @@ mod tests {
                 chaos_status: None,
                 dm_status: None,
                 quorum_dm_status: None,
+                pod_kill_status: None,
                 lifecycle_status: None,
             })
         }

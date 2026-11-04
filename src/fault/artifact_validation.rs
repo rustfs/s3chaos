@@ -472,6 +472,15 @@ fn validate_failed_attempt_disruption_evidence(
             "fault-evidence.json does not prove fault activity during the workload"
         );
         validate_fault_window_evidence(&evidence)?;
+        if matches!(
+            scenario,
+            scenarios::POD_KILL_ONE_SCENARIO | scenarios::POD_CRASH_VERSIONED_HOT_SCENARIO
+        ) {
+            let spec = read_json::<FaultRunSpec>(&run_spec_path)?;
+            let history =
+                read_jsonl::<OperationRecord>(&bound_case_artifact(&case_dir, "history.jsonl")?)?;
+            validate_pod_kill_overlap(&evidence, &history, &spec)?;
+        }
     }
     let lifecycle_started_at_ms = evidence
         .fault_prepare_started_at_ms
@@ -2102,6 +2111,13 @@ fn validate_partial_failed_injection_artifacts(
                 "completed fault-evidence.json does not prove injection, workload overlap, and recovery"
             );
             validate_fault_window_evidence(evidence)?;
+            validate_pod_kill_overlap(
+                evidence,
+                history
+                    .as_deref()
+                    .context("completed recovery lacks history")?,
+                &run_spec,
+            )?;
         }
         ensure!(
             evidence.require_client_disruption == metadata.require_client_disruption,
@@ -2733,6 +2749,7 @@ fn validate_fault_artifacts_with_identity(
         validate_ack_fault_window_evidence(&evidence)?;
     } else {
         validate_fault_window_evidence(&evidence)?;
+        validate_pod_kill_overlap(&evidence, &history, &json_spec)?;
     }
     if matches!(
         options.scenario.as_str(),
@@ -7971,6 +7988,56 @@ fn validate_pod_fault_runtime_evidence(
                     .recovery_ended_at_ms
                     .context("Pod fault lacks recovery end timestamp")?,
         "Pod observations are outside the persisted baseline/fault/workload/recovery phases"
+    );
+    Ok(())
+}
+
+fn validate_pod_kill_overlap(
+    evidence: &FaultEvidenceArtifact,
+    history: &[OperationRecord],
+    spec: &FaultRunSpec,
+) -> Result<()> {
+    if !matches!(
+        spec.scenario.name.as_str(),
+        scenarios::POD_KILL_ONE_SCENARIO | scenarios::POD_CRASH_VERSIONED_HOT_SCENARIO
+    ) {
+        return Ok(());
+    }
+    ensure!(
+        evidence.workload_snapshots.len() == 1,
+        "Pod kill requires one workload snapshot"
+    );
+    let before = evidence
+        .pods_before
+        .iter()
+        .map(|pod| crate::fault::reporting::PodIdentity {
+            name: pod.name.clone(),
+            uid: pod.uid.clone(),
+        })
+        .collect::<Vec<_>>();
+    let proof = crate::fault::backends::pod_kill::validate_snapshot(
+        &evidence.workload_snapshots[0],
+        history,
+        &spec.scenario.name,
+        &spec.metadata.run_id,
+        &spec.cluster.namespace,
+        &spec.cluster.chaos_namespace,
+        &before,
+    )?;
+    proof.require_workload_window(
+        evidence
+            .workload_started_at_ms
+            .context("Pod kill lacks workload start")?,
+        evidence
+            .workload_ended_at_ms
+            .context("Pod kill lacks workload end")?,
+    )?;
+    ensure!(
+        !evidence
+            .pods_after
+            .iter()
+            .any(|pod| pod.uid == proof.pod.uid),
+        "original Pod survived recovery"
     );
     Ok(())
 }
@@ -23883,6 +23950,66 @@ mod tests {
         (config, run_spec)
     }
 
+    #[test]
+    fn pod_kill_artifacts_require_overlap_inside_the_recorded_workload() {
+        use crate::fault::scenarios;
+        for scenario in [
+            scenarios::POD_KILL_ONE_SCENARIO,
+            scenarios::POD_CRASH_VERSIONED_HOT_SCENARIO,
+        ] {
+            let (_, spec) = lifecycle_run_spec(scenario);
+            let namespace = &spec.cluster.namespace;
+            let run_id = &spec.metadata.run_id;
+            let old_pod = json!({"name": "rustfs-1", "uid": "old"});
+            let new_pod = json!({"name": "rustfs-1", "uid": "new"});
+            let snapshot = json!({
+                "resource_kind": "podchaos", "resource_name": "kill",
+                "pod_kill_status": {
+                    "schema_version": 1, "scenario": scenario, "run_id": run_id,
+                    "namespace": namespace, "resource_name": "kill", "pod": old_pod,
+                    "request_gate_at_ms": 8, "apply_started_at_ms": 10,
+                    "deletion_observed_at_ms": 30, "pods_after_deletion": [new_pod]
+                },
+                "chaos_status": {
+                    "metadata": {"name": "kill", "namespace": spec.cluster.chaos_namespace, "labels": {
+                        "rustfs-fault-test/run-id": run_id, "rustfs-fault-test/scenario": scenario
+                    }},
+                    "spec": {"action": "pod-kill", "mode": "one", "selector": {"pods": {namespace: ["rustfs-1"]}}},
+                    "status": {"experiment": {"containerRecords": [{"id": format!("{namespace}/rustfs-1"), "injectedCount": 1}]}}
+                }
+            });
+            let mut evidence: FaultEvidenceArtifact = serde_json::from_value(json!({
+                "injected": true, "active_during_workload": true, "recovered": true,
+                "require_client_disruption": false, "client_disruptions": 0,
+                "pods_before": [old_pod], "pods_after": [new_pod],
+                "active_snapshots": [], "workload_snapshots": [snapshot],
+                "workload_started_at_ms": 5, "workload_ended_at_ms": 40
+            }))
+            .expect("evidence");
+            let history = vec![
+                serde_json::from_value(json!({
+                    "id": "request", "scenario": scenario, "run_id": run_id, "kind": "put",
+                    "bucket": "bucket", "started_at_ms": 9, "ended_at_ms": 31,
+                    "outcome": "ok", "durability_cohort": "fault_active"
+                }))
+                .expect("history"),
+            ];
+            super::validate_pod_kill_overlap(&evidence, &history, &spec).expect("valid overlap");
+            assert!(super::validate_pod_kill_overlap(&evidence, &[], &spec).is_err());
+            evidence.workload_started_at_ms = Some(11);
+            assert!(super::validate_pod_kill_overlap(&evidence, &history, &spec).is_err());
+            evidence.workload_started_at_ms = Some(5);
+            evidence.workload_ended_at_ms = Some(29);
+            assert!(super::validate_pod_kill_overlap(&evidence, &history, &spec).is_err());
+            evidence.workload_ended_at_ms = Some(40);
+            evidence.pods_after = evidence.pods_before.clone();
+            assert!(super::validate_pod_kill_overlap(&evidence, &history, &spec).is_err());
+            evidence.pods_after.clear();
+            evidence.workload_snapshots[0]["pod_kill_status"] = Value::Null;
+            assert!(super::validate_pod_kill_overlap(&evidence, &history, &spec).is_err());
+        }
+    }
+
     fn lifecycle_options(root: &std::path::Path, scenario: &str) -> ArtifactValidationOptions {
         ArtifactValidationOptions {
             scenario: scenario.to_string(),
@@ -24174,6 +24301,7 @@ mod tests {
             chaos_status: None,
             dm_status: None,
             quorum_dm_status: None,
+            pod_kill_status: None,
             lifecycle_status: Some(
                 crate::fault::backends::lifecycle::evidence::LifecycleStatusSnapshot {
                     operation:

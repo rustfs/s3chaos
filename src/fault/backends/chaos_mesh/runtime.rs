@@ -286,18 +286,21 @@ fn apply_manifest(
     kind: &'static str,
     name: &str,
 ) -> Result<ChaosGuard> {
-    Kubectl::new(config)
-        .namespaced(namespace)
-        .apply_yaml_command(manifest)
-        .run_checked()?;
-
-    Ok(ChaosGuard {
+    // An apply timeout can follow server-side creation. Own cleanup before
+    // sending the request so an ambiguous response cannot leak this resource.
+    let guard = ChaosGuard {
         config: config.clone(),
         kind,
         namespace: namespace.to_string(),
         name: name.to_string(),
         deleted: false,
-    })
+    };
+    Kubectl::new(config)
+        .namespaced(namespace)
+        .apply_yaml_command(manifest)
+        .run_checked()?;
+
+    Ok(guard)
 }
 
 impl ChaosGuard {
@@ -321,34 +324,28 @@ impl ChaosGuard {
         let deadline = Instant::now() + timeout;
 
         loop {
-            let status_snapshot = match self.json() {
-                Ok(status) => {
-                    if chaos_experiment_is_active(&status)? {
-                        return Ok(());
+            let status_snapshot =
+                match self.json_with_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(status) => {
+                        if Instant::now() < deadline && chaos_experiment_is_active(&status)? {
+                            return Ok(());
+                        }
+                        status
                     }
-                    status
-                }
-                Err(error) => {
-                    format!("failed to read {kind} status: {error}", kind = self.kind)
-                }
-            };
+                    Err(error) => {
+                        format!("failed to read {kind} status: {error}", kind = self.kind)
+                    }
+                };
 
             if Instant::now() >= deadline {
-                let describe = self.describe().unwrap_or_else(|error| {
-                    format!(
-                        "failed to describe {kind}/{name}: {error}",
-                        kind = self.kind,
-                        name = self.name
-                    )
-                });
                 bail!(
-                    "timed out waiting for {kind}/{name} to become active after {timeout:?}\nlast status:\n{status_snapshot}\n\ndescribe:\n{describe}",
+                    "timed out waiting for {kind}/{name} to become active after {timeout:?}\nlast status:\n{status_snapshot}",
                     kind = self.kind,
                     name = self.name,
                 );
             }
 
-            sleep(Duration::from_secs(1));
+            sleep(Duration::from_secs(1).min(deadline.saturating_duration_since(Instant::now())));
         }
     }
 
@@ -380,8 +377,9 @@ impl ChaosGuard {
     }
 
     pub fn delete(&mut self, timeout: Duration) -> Result<()> {
-        self.delete_inner()?;
-        self.wait_deleted(timeout)?;
+        let started = Instant::now();
+        self.delete_inner_with_timeout(timeout)?;
+        self.wait_deleted(timeout.saturating_sub(started.elapsed()))?;
         self.deleted = true;
         Ok(())
     }
@@ -407,14 +405,23 @@ impl ChaosGuard {
     }
 
     pub fn json(&self) -> Result<String> {
+        self.json_with_timeout(self.config.timeout)
+    }
+
+    pub(crate) fn json_with_timeout(&self, timeout: Duration) -> Result<String> {
         let output = Kubectl::new(&self.config)
             .namespaced(&self.namespace)
             .command(["get", self.kind, &self.name, "-o", "json"])
+            .timeout(timeout.min(self.config.timeout))
             .run_checked()?;
         Ok(output.stdout)
     }
 
     fn delete_inner(&self) -> Result<()> {
+        self.delete_inner_with_timeout(self.config.timeout)
+    }
+
+    fn delete_inner_with_timeout(&self, timeout: Duration) -> Result<()> {
         Kubectl::new(&self.config)
             .namespaced(&self.namespace)
             .command([
@@ -424,6 +431,7 @@ impl ChaosGuard {
                 "--ignore-not-found",
                 "--wait=false",
             ])
+            .timeout(timeout)
             .run_checked()?;
         Ok(())
     }
@@ -439,28 +447,15 @@ impl ChaosGuard {
                 resource.as_str(),
                 timeout_arg.as_str(),
             ])
+            .timeout(timeout)
             .run_checked();
         let error = match result {
             Ok(_) => return Ok(()),
             Err(error) => error,
         };
 
-        let status = self.yaml().unwrap_or_else(|error| {
-            format!(
-                "failed to read {kind}/{name} yaml after delete timeout: {error}",
-                kind = self.kind,
-                name = self.name
-            )
-        });
-        let describe = self.describe().unwrap_or_else(|error| {
-            format!(
-                "failed to describe {kind}/{name} after delete timeout: {error}",
-                kind = self.kind,
-                name = self.name
-            )
-        });
         bail!(
-            "timed out waiting for {kind}/{name} deletion after {timeout:?}: {error}\nlast status:\n{status}\n\ndescribe:\n{describe}",
+            "failed waiting for {kind}/{name} deletion within {timeout:?}: {error}",
             kind = self.kind,
             name = self.name,
         )
@@ -524,6 +519,103 @@ impl Drop for ChaosGuard {
 #[cfg(test)]
 mod discovery_tests {
     use super::*;
+
+    #[test]
+    fn apply_timeout_cleans_up_a_resource_created_before_the_response() {
+        use crate::framework::{command::CommandSpec, config::E2eConfig};
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "S3CHAOS_APPLY_TIMEOUT_TEST_DIR";
+        if let Some(directory) = std::env::var_os(CHILD) {
+            let directory = std::path::PathBuf::from(directory);
+            let mut config = E2eConfig::defaults().cluster;
+            config.timeout = Duration::from_millis(200);
+            let spec =
+                PodChaosSpec::kill_one_rustfs_pod(&config, "chaos-mesh", "run", "pod-kill-one");
+            let start = Instant::now();
+            let error = apply_podchaos(&config, &spec).expect_err("ambiguous apply response");
+            assert!(error.to_string().contains("timed out"), "{error:#}");
+            assert!(start.elapsed() < Duration::from_secs(3));
+            assert!(directory.join("created").exists());
+            let deleted =
+                std::fs::read_to_string(directory.join("deleted")).expect("cleanup request");
+            assert!(deleted.contains(&format!(
+                "-n chaos-mesh delete podchaos {} --ignore-not-found --wait=false",
+                spec.name
+            )));
+            return;
+        }
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let kubectl = temporary.path().join("kubectl");
+        std::fs::write(
+            &kubectl,
+            r#"#!/bin/sh
+set -eu
+case " $* " in
+  *" apply "*)
+    /bin/cat > "$S3CHAOS_APPLY_TIMEOUT_TEST_DIR/created"
+    exec /bin/sleep 30 ;;
+  *" delete "*) printf '%s\n' "$*" > "$S3CHAOS_APPLY_TIMEOUT_TEST_DIR/deleted" ;;
+  *) exit 11 ;;
+esac
+"#,
+        )
+        .expect("fake kubectl");
+        std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        CommandSpec::new("env").args([
+            format!("PATH={}", temporary.path().display()),
+            format!("{CHILD}={}", temporary.path().display()),
+            std::env::current_exe().expect("test binary").to_string_lossy().into_owned(),
+            "--exact".into(),
+            "fault::backends::chaos_mesh::runtime::discovery_tests::apply_timeout_cleans_up_a_resource_created_before_the_response".into(),
+            "--nocapture".into(),
+        ]).timeout(Duration::from_secs(5)).run_checked().expect("isolated apply timeout test");
+    }
+
+    #[test]
+    fn stalled_kubectl_cannot_extend_activation_or_deletion_deadlines() {
+        use crate::framework::{command::CommandSpec, config::E2eConfig};
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "S3CHAOS_TIMEOUT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut guard = ChaosGuard {
+                config: E2eConfig::defaults().cluster,
+                kind: "podchaos",
+                namespace: "test".into(),
+                name: "stalled".into(),
+                deleted: true,
+            };
+            for operation in ["activate", "delete", "wait-delete"] {
+                let start = Instant::now();
+                let budget = Duration::from_millis(100);
+                let result = match operation {
+                    "activate" => guard.wait_active(budget),
+                    "delete" => guard.delete(budget),
+                    _ => guard.wait_deleted(budget),
+                };
+                let error = result.expect_err(operation);
+                assert!(
+                    error.to_string().contains("timed out"),
+                    "{operation}: {error:#}"
+                );
+                assert!(start.elapsed() < Duration::from_secs(2), "{operation}");
+            }
+            return;
+        }
+        // PATH is changed only in a child test process, never in parallel tests.
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let kubectl = temporary.path().join("kubectl");
+        std::fs::write(&kubectl, "#!/bin/sh\nexec /bin/sleep 30\n").expect("fake kubectl");
+        std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        CommandSpec::new("env").args([
+            format!("PATH={}", temporary.path().display()), format!("{CHILD}=1"),
+            std::env::current_exe().expect("test binary").to_string_lossy().into_owned(),
+            "--exact".into(),
+            "fault::backends::chaos_mesh::runtime::discovery_tests::stalled_kubectl_cannot_extend_activation_or_deletion_deadlines".into(),
+            "--nocapture".into(),
+        ]).timeout(Duration::from_secs(5)).run_checked().expect("bounded child test");
+    }
 
     #[test]
     fn timechaos_cleanup_skips_only_a_confirmed_unserved_resource() {

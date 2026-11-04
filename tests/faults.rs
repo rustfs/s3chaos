@@ -18,6 +18,42 @@ use std::process::{Command, Output};
 
 #[cfg(unix)]
 #[test]
+fn health_watcher_reports_stalled_kubectl_as_unsafe_within_a_bound() {
+    use s3chaos::framework::command::CommandSpec;
+    use std::{
+        os::unix::fs::PermissionsExt,
+        time::{Duration, Instant},
+    };
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let kubectl = temporary.path().join("kubectl");
+    std::fs::write(&kubectl, "#!/bin/sh\nexec /bin/sleep 30\n").expect("fake kubectl");
+    std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o755)).expect("executable");
+    let start = Instant::now();
+    let output = CommandSpec::new("bash")
+        .args([
+            "-c",
+            r#"
+source "$1"
+export PATH="$2:$PATH"
+export RUSTFS_FAULT_TEST_HEALTH_REQUEST_TIMEOUT_SECONDS=1
+non_fault_tenants_are_ready() { return 0; }
+health_status_json 1 '[]' false
+"#,
+            "health-timeout-test",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh"),
+            temporary.path().to_str().expect("path"),
+        ])
+        .timeout(Duration::from_secs(8))
+        .run_checked()
+        .expect("bounded health report");
+    let status: serde_json::Value = serde_json::from_str(&output.stdout).expect("health json");
+    assert_eq!(status["safe"], false);
+    assert_eq!(status["reason"], "ready_node_count_below_baseline");
+    assert!(start.elapsed() < Duration::from_secs(6));
+}
+
+#[cfg(unix)]
+#[test]
 fn optional_timechaos_cleanup_uses_confirmed_api_discovery() {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh");
     for served in [false, true] {

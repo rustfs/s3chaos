@@ -27,10 +27,7 @@ use crate::{
         },
         host_storage::HostStorageMutationProof,
         plan::{FaultInjection, FaultKind, FaultPlan},
-        pods::{
-            pod_deletion_observed, rustfs_pod_identities, wait_for_rustfs_pod_deletion,
-            wait_for_rustfs_pod_replacement,
-        },
+        pods::{pod_deletion_observed, rustfs_pod_identities, wait_for_rustfs_pod_replacement},
         reporting::{FaultStatusSnapshot, PodIdentity},
         scenarios::{FaultBackend, FaultScenario},
     },
@@ -264,12 +261,6 @@ impl FaultFailureArtifactSource for SamePodIoFaultHandle {
     }
 }
 
-struct PodKillFaultHandle {
-    guard: Box<ChaosGuard>,
-    before_pods: Vec<PodIdentity>,
-    config: Box<ClusterTestConfig>,
-}
-
 struct PodKillStormFaultHandle {
     guard: Box<ChaosGuard>,
     before_pods: Vec<PodIdentity>,
@@ -429,12 +420,8 @@ fn apply_chaos_mesh_fault_backend(request: &FaultApplyRequest<'_>) -> Result<App
             guard: Box::new(guard),
             active_required,
         })),
-        chaos_mesh::AppliedFault::PodKill { guard, before_pods } => {
-            Ok(Box::new(PodKillFaultHandle {
-                guard: Box::new(guard),
-                before_pods,
-                config: Box::new(request.config.cluster.clone()),
-            }))
+        chaos_mesh::AppliedFault::PodKill { spec, before_pods } => {
+            super::pod_kill::arm(&request.config.cluster, spec, before_pods)
         }
         chaos_mesh::AppliedFault::PodKillStorm {
             guard,
@@ -600,40 +587,6 @@ impl FaultLifecyclePort for PodKillStormFaultHandle {
     }
 }
 
-impl FaultFailureArtifactSource for PodKillFaultHandle {
-    fn collect_failure_artifacts(
-        &self,
-        collector: &ArtifactCollector,
-        case_name: &str,
-        suffix: &str,
-    ) -> Result<()> {
-        collect_chaos_failure_artifacts(self.guard.as_ref(), collector, case_name, suffix)
-    }
-}
-
-impl FaultLifecyclePort for PodKillFaultHandle {
-    fn wait_active(&self, timeout: Duration) -> Result<()> {
-        wait_for_rustfs_pod_deletion(&self.config, &self.before_pods, timeout)
-    }
-
-    fn ensure_active(&self, _stage: &str) -> Result<()> {
-        Ok(())
-    }
-
-    fn delete(&mut self, timeout: Duration) -> Result<()> {
-        self.guard.delete(timeout)?;
-        wait_for_rustfs_pod_replacement(&self.config, &self.before_pods, timeout)
-    }
-
-    fn snapshot(&self, stage: &str) -> Result<FaultStatusSnapshot> {
-        chaos_fault_snapshot(self.guard.as_ref(), stage)
-    }
-
-    fn failure_artifacts(&self) -> Option<&dyn FaultFailureArtifactSource> {
-        Some(self)
-    }
-}
-
 impl FaultLifecyclePort for DmFlakeyFaultHandle {
     fn wait_active(&self, _timeout: Duration) -> Result<()> {
         Ok(())
@@ -667,6 +620,7 @@ impl FaultLifecyclePort for DmFlakeyFaultHandle {
                 _ => self.guard.snapshot(stage)?,
             }),
             quorum_dm_status: None,
+            pod_kill_status: None,
             lifecycle_status: None,
         })
     }
@@ -684,6 +638,7 @@ fn chaos_fault_snapshot(guard: &ChaosGuard, stage: &str) -> Result<FaultStatusSn
         chaos_status: Some(serde_json::from_str(&guard.json()?)?),
         dm_status: None,
         quorum_dm_status: None,
+        pod_kill_status: None,
         lifecycle_status: None,
     })
 }
@@ -1353,7 +1308,7 @@ pub(in crate::fault) fn collect_fault_artifacts(
     Ok(())
 }
 
-fn collect_chaos_failure_artifacts(
+pub(super) fn collect_chaos_failure_artifacts(
     guard: &ChaosGuard,
     collector: &ArtifactCollector,
     case_name: &str,
@@ -1407,6 +1362,7 @@ mod tests {
                 chaos_status: None,
                 dm_status: None,
                 quorum_dm_status: None,
+                pod_kill_status: None,
                 lifecycle_status: None,
             })
         }
