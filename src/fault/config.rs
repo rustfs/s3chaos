@@ -163,7 +163,16 @@ pub struct FaultTestConfig {
 
 impl FaultTestConfig {
     pub fn from_env() -> Result<Self> {
-        let context = current_context()?;
+        let context = match std::env::var("S3CHAOS_TARGET_CONTEXT") {
+            Ok(value) => {
+                ensure!(
+                    !value.trim().is_empty(),
+                    "S3CHAOS_TARGET_CONTEXT must not be empty"
+                );
+                value
+            }
+            Err(_) => current_context()?,
+        };
         Self::from_env_with(|name| std::env::var(name).ok(), context)
     }
 

@@ -30,7 +30,7 @@ use crate::protocol::{
     credentials::{AdminCredentials, CredentialProvider, EnvCredentialProvider},
     runner::executor::{ProtocolClock, ProtocolShutdownSignal, ProtocolTimeoutPolicy},
     suite::{
-        ProtocolExecutionTimeouts, ResolvedProtocolSuite, resolve_protocol_endpoint,
+        ProtocolExecutionTimeouts, ProtocolSuite, ResolvedProtocolSuite, resolve_protocol_endpoint,
         resolve_protocol_suite_yaml, validate_protocol_ci_environment,
     },
 };
@@ -56,6 +56,14 @@ pub(crate) struct ConnectedProtocolRuntime {
 impl ConnectedProtocolRuntime {
     pub(crate) async fn connect(path: impl AsRef<Path>) -> Result<Self> {
         let suite = resolve_protocol_suite_yaml(path)?;
+        Self::connect_resolved(suite).await
+    }
+
+    pub(crate) async fn connect_suite(suite: &ProtocolSuite) -> Result<Self> {
+        Self::connect_resolved(suite.resolve()?).await
+    }
+
+    async fn connect_resolved(suite: ResolvedProtocolSuite) -> Result<Self> {
         let endpoint = resolve_protocol_endpoint(&suite.target.endpoint)?;
         let credentials = EnvCredentialProvider.resolve(&suite.target.credentials.admin_profile)?;
         let admin = RustfsAdminClient::new(&endpoint, &suite.target.region, credentials.clone())?;

@@ -67,6 +67,7 @@ fn rustfs_pod_runtime_states(config: &ClusterTestConfig) -> Result<Vec<PodRuntim
         .run_checked()?;
     let value = serde_json::from_str::<serde_json::Value>(&output.stdout)
         .context("parse RustFS pod list json")?;
+    crate::fault::workflow::record_images(config, &value)?;
     let items = value
         .pointer("/items")
         .and_then(serde_json::Value::as_array)
@@ -193,7 +194,7 @@ pub(crate) async fn wait_for_stable_rustfs_pods(
 }
 
 pub(crate) async fn wait_for_ready_tenant(config: &ClusterTestConfig) -> Result<DynamicObject> {
-    let client = kube_client::default_client().await?;
+    let client = kube_client::client_for_context(&config.context).await?;
     let tenants = kube_client::tenant_api(client, &config.test_namespace);
     wait::wait_for_tenant_ready(tenants, &config.tenant_name, config.timeout).await
 }
@@ -341,6 +342,64 @@ pub(super) async fn wait_for_local_forward(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tenant_readiness_uses_selected_context() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const CHILD: &str = "S3CHAOS_SELECTED_CONTEXT_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            let config = FaultTestConfig::for_test("selected-context", "dynamic");
+            wait_for_ready_tenant(&config.cluster).await.unwrap();
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let kubeconfig = directory.path().join("config");
+        std::fs::write(&kubeconfig, format!("apiVersion: v1\nkind: Config\ncurrent-context: other-context\nclusters:\n- name: selected\n  cluster:\n    server: http://{address}\n- name: other\n  cluster:\n    server: http://127.0.0.1:9\ncontexts:\n- name: selected-context\n  context:\n    cluster: selected\n- name: other-context\n  context:\n    cluster: other\nusers: []\n")).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut request = [0; 4096];
+            let count = stream.read(&mut request).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&request[..count])
+                    .starts_with("GET /apis/rustfs.com/v1alpha1/namespaces/")
+            );
+            let body = serde_json::json!({"apiVersion":"rustfs.com/v1alpha1","kind":"Tenant","metadata":{"name":"fault-test-tenant","generation":1},"status":{"currentState":"Ready","observedGeneration":1,"conditions":[{"type":"Ready","status":"True"},{"type":"Degraded","status":"False"}]}}).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "fault::runner::access::tests::tenant_readiness_uses_selected_context",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("KUBECONFIG", kubeconfig)
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .kill_on_drop(true)
+            .output();
+        let output = tokio::time::timeout(Duration::from_secs(15), child)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        server.await.unwrap();
+    }
 
     fn released_port() -> u16 {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener");

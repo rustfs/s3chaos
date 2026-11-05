@@ -894,10 +894,13 @@ pub use artifacts::{
 };
 pub use session::{
     MINT_SESSION_VALIDATION_FILE, MintSessionPublication, MintSessionRequest,
-    MintSessionValidationReport, cleanup_mint_session, run_mint_session,
+    MintSessionValidationReport, cleanup_mint_session, mint_reproduction_request, run_mint_session,
     validate_mint_session_artifacts_and_write_report,
 };
-pub use target::{MintTargetSpec, timestamp_now, verify_mint_target};
+pub use target::{
+    MintTargetDiscovery, MintTargetSpec, MintTargetTimeouts, discover_mint_target, timestamp_now,
+    verify_mint_target,
+};
 
 #[cfg(test)]
 mod tests {

@@ -56,6 +56,8 @@ ACTIVE_QUALIFICATION_CASE=""
 FAULT_TEST_BINARY=""
 FAULT_CATALOG_JSON=""
 FAULT_QUALIFICATION_CATALOG_JSON=""
+WORKFLOW_SESSION_ROOT=""
+WORKFLOW_PROCESS_GROUP=""
 
 usage() {
   cat <<'EOF'
@@ -81,7 +83,8 @@ Commands:
   dashboard-install     Install/upgrade Chaos Mesh with Dashboard enabled.
   dashboard-port-forward [port]
                         Port-forward the Chaos Mesh Dashboard locally.
-  cleanup               Remove managed Chaos and the owned fault namespace.
+  cleanup               Clean one completed run selected by S3CHAOS_RUN_ROOT.
+  cleanup-run <root>     Clean resources proven to belong to one completed run.
 
 RUSTFS_FAULT_TEST_EXPECTED_CONTEXT is optional for ordinary injection runs.
 Storage recovery and qualification require an explicit context, namespace, and Tenant.
@@ -196,6 +199,12 @@ ensure_inherited_kubeconfig() {
 resolve_fault_context() {
   local current_context
   ensure_inherited_kubeconfig
+  if [[ -n "${S3CHAOS_TARGET_CONTEXT:-}" ]]; then
+    FAULT_CONTEXT="$(trim_value "$S3CHAOS_TARGET_CONTEXT")"
+    [[ -n "$FAULT_CONTEXT" && "$FAULT_CONTEXT" != kind-* ]] || die "fault tests require an explicit real-cluster context"
+    export RUSTFS_FAULT_TEST_EXPECTED_CONTEXT="$FAULT_CONTEXT"
+    return
+  fi
   FAULT_CONTEXT="$(trim_value "$FAULT_CONTEXT")"
   current_context="$(kubectl_context)"
   if [[ -n "$FAULT_CONTEXT" ]]; then
@@ -225,7 +234,7 @@ kubectl_cluster() {
 }
 
 fault_catalog_json() {
-  require_command cargo
+  require_cli_runtime
   require_command jq
   if [[ -z "$FAULT_CATALOG_JSON" ]]; then
     FAULT_CATALOG_JSON="$(s3chaos_cli fault-catalog-json)"
@@ -234,13 +243,57 @@ fault_catalog_json() {
 }
 
 s3chaos_cli() {
-  if [[ -n "$FAULT_TEST_BINARY" && -x "$FAULT_TEST_BINARY" ]]; then
+  if [[ -n "${S3CHAOS_BINARY:-}" ]]; then
+    [[ -x "$S3CHAOS_BINARY" ]] || die "S3CHAOS_BINARY is not executable: $S3CHAOS_BINARY"
+    "$S3CHAOS_BINARY" "$@"
+  elif [[ -n "$FAULT_TEST_BINARY" && -x "$FAULT_TEST_BINARY" ]]; then
     "$FAULT_TEST_BINARY" "$@"
   elif [[ -n "$BUILD_JOBS" ]]; then
     CARGO_BUILD_JOBS="$BUILD_JOBS" cargo run --quiet --manifest-path "$MANIFEST" --bin s3chaos -- "$@"
   else
     cargo run --quiet --manifest-path "$MANIFEST" --bin s3chaos -- "$@"
   fi
+}
+
+require_cli_runtime() {
+  if [[ -n "${S3CHAOS_BINARY:-}" ]]; then
+    [[ -x "$S3CHAOS_BINARY" ]] || die "S3CHAOS_BINARY is not executable: $S3CHAOS_BINARY"
+  elif [[ -z "$FAULT_TEST_BINARY" ]]; then
+    require_command cargo
+  fi
+}
+
+validate_startup_inputs() {
+  local mode="$1" name tool
+  local -a missing=()
+  for name in RUSTFS_FAULT_TEST_SERVER_IMAGE RUSTFS_FAULT_TEST_STORAGE_CLASS; do
+    [[ -n "${!name:-}" ]] || missing+=("$name is required")
+  done
+  for tool in jq kubectl nice ps awk setsid timeout; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("required command not found: $tool")
+  done
+  if [[ -z "${S3CHAOS_BINARY:-}" ]]; then
+    command -v cargo >/dev/null 2>&1 || missing+=("required command not found: cargo")
+  elif [[ ! -x "$S3CHAOS_BINARY" ]]; then
+    missing+=("S3CHAOS_BINARY is not executable: $S3CHAOS_BINARY")
+  fi
+  if [[ "$mode" == "dm" ]]; then
+    for name in RUSTFS_FAULT_TEST_DM_NAME RUSTFS_FAULT_TEST_DM_NODE RUSTFS_FAULT_TEST_DM_MOUNT_PATH RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE RUSTFS_FAULT_TEST_DM_OBSERVER_POD RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST; do
+      [[ -n "${!name:-}" ]] || missing+=("$name is required")
+    done
+  fi
+  if (( ${#missing[@]} )); then
+    printf 'fault-test: %s\n' "${missing[@]}" >&2
+    return 1
+  fi
+}
+
+start_workflow_session() {
+  local root="$1"
+  export S3CHAOS_RUN_ID="${S3CHAOS_RUN_ID:-fault-$(date -u +%Y%m%dT%H%M%S)-$$-${RANDOM}}"
+  export S3CHAOS_RUN_ROOT="$root"
+  WORKFLOW_SESSION_ROOT="$root"
+  s3chaos_cli fault-workflow-begin "$root" "$S3CHAOS_RUN_ID" "$$"
 }
 
 catalog_scenario_query() {
@@ -586,6 +639,13 @@ build_fault_binary() {
   local run_root="$1" label="$2"
   local build_messages="$run_root/fault-build.jsonl"
   local build_jobs_label="auto"
+  if [[ -n "${S3CHAOS_BINARY:-}" ]]; then
+    [[ -x "$S3CHAOS_BINARY" ]] || die "S3CHAOS_BINARY is not executable: $S3CHAOS_BINARY"
+    FAULT_TEST_BINARY="$S3CHAOS_BINARY"
+    mkdir -p "$run_root"
+    printf '%s\n' "$FAULT_TEST_BINARY" >"$run_root/fault-test-binary.path"
+    return
+  fi
   local -a build_command=(
     cargo build --manifest-path "$MANIFEST" --bin s3chaos
     --message-format=json-render-diagnostics
@@ -720,7 +780,7 @@ preflight() {
     require_supported_scenario "$scenario"
   fi
 
-  require_command cargo
+  require_cli_runtime
   require_command jq
   require_command kubectl
   require_command nice
@@ -825,6 +885,7 @@ preflight_cleanup() {
   require_command jq
   require_command kubectl
   resolve_fault_context
+  s3chaos_cli fault-workflow-require-idle "$FAULT_CONTEXT"
   require_namespace_ownership
 }
 
@@ -842,6 +903,13 @@ timechaos_is_served() {
 
 cleanup_managed_chaos() {
   local timechaos_served
+  if [[ -n "$WORKFLOW_SESSION_ROOT" ]]; then
+    s3chaos_cli fault-workflow-chaos-cleanup "$WORKFLOW_SESSION_ROOT"
+    return
+  fi
+  if [[ -z "$ACTIVE_ARTIFACTS" ]]; then
+    s3chaos_cli fault-workflow-require-idle "$FAULT_CONTEXT"
+  fi
   timechaos_served="$(timechaos_is_served)" || return $?
   kubectl_ns "$CHAOS_NAMESPACE" delete iochaos,podchaos,networkchaos,stresschaos \
     -l "$MANAGER_SELECTOR" --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
@@ -1005,7 +1073,7 @@ handle_signal() {
         || warn_artifact_write_failed "exit-code" "$ACTIVE_ARTIFACTS/exit-code"
     fi
     finalize_failed_run "${ACTIVE_SCOPE:-run}" "${ACTIVE_NAME:-unknown}" "$ACTIVE_ARTIFACTS" 130 interrupted
-  else
+  elif [[ -n "$WORKFLOW_SESSION_ROOT" ]]; then
     cleanup_managed_chaos || echo "error: managed Chaos cleanup failed during interruption" >&2
   fi
   if [[ -n "$ACTIVE_QUALIFICATION_ROOT" ]]; then
@@ -1020,6 +1088,15 @@ handle_signal() {
 handle_exit() {
   local rc=$? outcome=failed
   trap - EXIT
+  if [[ -n "$WORKFLOW_SESSION_ROOT" && -f "$WORKFLOW_SESSION_ROOT/fault-session.json" ]]; then
+    if [[ -n "$ACTIVE_PID" ]] || { [[ -n "$WORKFLOW_PROCESS_GROUP" ]] && kill -0 -- "-$WORKFLOW_PROCESS_GROUP" 2>/dev/null; }; then
+      echo "fault-test: supervised processes remain active; retaining session: $WORKFLOW_SESSION_ROOT" >&2
+      [[ "$rc" -ne 0 ]] || rc=1
+    elif ! s3chaos_cli fault-workflow-finish "$WORKFLOW_SESSION_ROOT" "$rc"; then
+      echo "fault-test: session recovery or cleanup requires attention: $WORKFLOW_SESSION_ROOT" >&2
+      [[ "$rc" -ne 0 ]] || rc=1
+    fi
+  fi
   if [[ -n "$ACTIVE_QUALIFICATION_ROOT" && ! -f "$ACTIVE_QUALIFICATION_ROOT/qualification-result.json" ]]; then
     [[ "$rc" -ne 130 ]] || outcome=interrupted
     write_qualification_result "$ACTIVE_QUALIFICATION_ROOT" "$outcome" "$rc" \
@@ -1029,7 +1106,7 @@ handle_exit() {
     echo "qualification artifacts: $ACTIVE_QUALIFICATION_ROOT" >&2
     echo "analyze with: make fault-qualify-analyze RUN_ROOT=$ACTIVE_QUALIFICATION_ROOT" >&2
   fi
-  return "$rc"
+  exit "$rc"
 }
 
 capture_cluster_snapshot() {
@@ -1417,6 +1494,7 @@ run_scenario() {
       >"$artifacts/test.log" 2>&1 &
   test_pid=$!
   ACTIVE_PID="$test_pid" ACTIVE_PROCESS_GROUP="$test_pid"
+  WORKFLOW_PROCESS_GROUP="$test_pid"
   health_checks=0
   consecutive_health_failures=0
 
@@ -1485,7 +1563,9 @@ run_scenario() {
 }
 
 new_run_root() {
-  if [[ -n "${RUSTFS_FAULT_TEST_RUN_ROOT:-}" ]]; then
+  if [[ -n "${S3CHAOS_RUN_ROOT:-}" ]]; then
+    echo "$S3CHAOS_RUN_ROOT"
+  elif [[ -n "${RUSTFS_FAULT_TEST_RUN_ROOT:-}" ]]; then
     echo "$RUSTFS_FAULT_TEST_RUN_ROOT"
   else
     echo "$PACKAGE_DIR/target/fault-tests/$(date -u +%Y%m%dT%H%M%SZ)"
@@ -1503,6 +1583,7 @@ initialize_summary() {
 
 run_one() {
   local scenario="$1" mode="${2:-ordinary}" run_root
+  validate_startup_inputs "$mode"
   run_root="$(new_run_root)"
   initialize_summary "$run_root"
   run_root="$(cd "$run_root" && pwd -P)"
@@ -1515,6 +1596,7 @@ run_one() {
     require_non_dm_scenario "$scenario"
   fi
   preflight "$scenario"
+  start_workflow_session "$run_root"
   echo "s3chaos fault-run binary ready"
   run_scenario "$scenario" "$run_root"
   echo "run artifacts: $run_root"
@@ -1527,7 +1609,9 @@ run_dm() {
 
 new_qualification_run_root() {
   local qualification_case="$1"
-  if [[ -n "${RUSTFS_FAULT_TEST_RUN_ROOT:-}" ]]; then
+  if [[ -n "${S3CHAOS_RUN_ROOT:-}" ]]; then
+    echo "$S3CHAOS_RUN_ROOT"
+  elif [[ -n "${RUSTFS_FAULT_TEST_RUN_ROOT:-}" ]]; then
     echo "$RUSTFS_FAULT_TEST_RUN_ROOT"
   else
     echo "$PACKAGE_DIR/target/fault-tests/qualifications/$(date -u +%Y%m%dT%H%M%SZ)-$qualification_case"
@@ -1632,6 +1716,7 @@ run_qualification() {
   ACTIVE_QUALIFICATION_ROOT="$run_root"
   initialize_summary "$run_root"
   write_qualification_request_plan "$run_root" "$qualification_case"
+  validate_startup_inputs qualification
   echo "qualification run root: $run_root"
   echo "live console: make fault-console-serve CONSOLE_ROOT=$run_root"
   build_fault_binary "$run_root" "qualification=$qualification_case"
@@ -1640,6 +1725,7 @@ run_qualification() {
     "$run_root" "$qualification_case" "$QUALIFICATION_SCENARIO" \
     "$QUALIFICATION_KIND" "$QUALIFICATION_STORAGE_CASE"
   preflight "$QUALIFICATION_SCENARIO" qualification "$qualification_case"
+  start_workflow_session "$run_root"
   echo "s3chaos qualification binary ready: case=$qualification_case"
 
   rc=0
@@ -1662,7 +1748,7 @@ run_qualification() {
 
 analyze_qualification() {
   local run_root="$1" plan result resolution console_snapshot qualification_case contract scenario kind storage_case rc
-  require_command cargo
+  require_cli_runtime
   require_command jq
   require_command mktemp
   [[ -d "$run_root" ]] || die "qualification run root does not exist: $run_root"
@@ -1865,6 +1951,7 @@ run_suite() {
   local baseline_ready_nodes baseline_tenants current_time health_checks require_chaos
   local health_status health_safe health_message health_reason
   local consecutive_health_failures will_abort
+  validate_startup_inputs suite
   [[ -f "$suite" ]] || die "suite yaml file not found: $suite"
   run_root="$(new_run_root)"
   mkdir -p "$run_root"
@@ -1872,6 +1959,7 @@ run_suite() {
   suite_plan="$run_root/suite-plan-preview.json"
   build_fault_binary "$run_root" "fault-suite-run"
   preflight_suite "$suite" "$suite_plan" "$mode"
+  start_workflow_session "$run_root"
   suite_name="$(jq -r '.suite // empty' "$suite_plan")"
   [[ -n "$suite_name" ]] || suite_name="$suite"
   baseline_ready_nodes="$(kubectl_cluster get nodes -o json | jq -r '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length')"
@@ -1898,6 +1986,7 @@ run_suite() {
     "$FAULT_TEST_BINARY" fault-suite-run "$suite" \
       >"$run_root/suite.log" 2>&1 &
   ACTIVE_PID="$!" ACTIVE_PROCESS_GROUP="$!"
+  WORKFLOW_PROCESS_GROUP="$ACTIVE_PROCESS_GROUP"
   health_checks=0
   consecutive_health_failures=0
 
@@ -2133,8 +2222,14 @@ case "${1:-help}" in
     port_forward_chaos_dashboard "${2:-}"
     ;;
   cleanup)
-    preflight_cleanup
-    cleanup
+    [[ -z "${2:-}" ]] || die "cleanup selects its run through S3CHAOS_RUN_ROOT; use cleanup-run <root> for a path argument"
+    cleanup_root="${S3CHAOS_RUN_ROOT:-${RUSTFS_FAULT_TEST_RUN_ROOT:-}}"
+    [[ -n "$cleanup_root" ]] || die "cleanup requires a recorded run: use s3chaos cleanup <run-id> or fault-test.sh cleanup-run <run-root>"
+    s3chaos_cli fault-workflow-cleanup "$cleanup_root"
+    ;;
+  cleanup-run)
+    [[ -n "${2:-}" && -z "${3:-}" ]] || die "cleanup-run requires exactly one run root"
+    s3chaos_cli fault-workflow-cleanup "$2"
     ;;
   *)
     usage >&2

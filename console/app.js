@@ -79,6 +79,11 @@
     error: null,
     autoTimer: null,
     lastLoadedAt: null,
+    report: null,
+    historyOffset: 0,
+    historyLimit: 20,
+    historyTotal: 0,
+    historyRequest: 0,
   };
 
   document.addEventListener("DOMContentLoaded", init);
@@ -92,7 +97,11 @@
     dom.controls.addEventListener("submit", onRefreshSubmit);
     dom.autoRefresh.addEventListener("change", updateAutoRefresh);
     renderEmpty();
-    refreshSnapshot();
+    bindHistory();
+    refreshHistory().then(function () {
+      if (state.rootExplicit || state.historyTotal === 0) refreshSnapshot();
+      else document.querySelector(".dashboard").hidden = true;
+    });
   }
 
   function bindDom() {
@@ -151,6 +160,7 @@
     if (state.loading) {
       return;
     }
+    const requestedRoot = state.root;
     state.loading = true;
     state.error = null;
     showBanner("loading", "Loading snapshot...");
@@ -162,38 +172,175 @@
         cache: "no-store",
       });
       if (!response.ok) {
-        throw new Error("GET /api/console returned HTTP " + response.status);
+        const failure = await response.json();
+        throw new Error(failure.error || "Unable to load report (HTTP " + response.status + ")");
       }
       const raw = await response.json();
-      state.snapshot = normalizeSnapshot(raw);
-      syncRootFromSnapshot(state.snapshot);
+      if (requestedRoot !== state.root) return;
+      state.report = raw;
+      state.snapshot = raw.fault ? normalizeSnapshot(raw.fault) : null;
+      if (state.snapshot) renderSnapshot(state.snapshot);
+      document.querySelector(".dashboard").hidden = !raw.fault;
+      renderRunReport(raw);
       state.lastLoadedAt = new Date();
-      renderSnapshot(state.snapshot);
       hideBanner();
     } catch (error) {
+      if (requestedRoot !== state.root) return;
       state.error = error;
-      renderSnapshot(state.snapshot);
       showBanner("error", error.message || "Unable to load snapshot");
     } finally {
       state.loading = false;
       dom.refreshButton.disabled = false;
       renderLastRefresh();
+      if (requestedRoot !== state.root) refreshSnapshot();
     }
   }
 
   function consoleSnapshotUrl() {
     if (!state.rootExplicit || !state.root) {
-      return "/api/console";
+      return "/api/report";
     }
-    return "/api/console?root=" + encodeURIComponent(state.root);
+    return "/api/report?root=" + encodeURIComponent(state.root);
   }
 
-  function syncRootFromSnapshot(snapshot) {
-    if (!snapshot || !snapshot.root) {
-      return;
+  function bindHistory() {
+    document.getElementById("history-controls").addEventListener("submit", function (event) {
+      event.preventDefault();
+      state.historyOffset = 0;
+      refreshHistory();
+    });
+    document.getElementById("history-previous").addEventListener("click", function () {
+      state.historyOffset = Math.max(0, state.historyOffset - state.historyLimit);
+      refreshHistory();
+    });
+    document.getElementById("history-next").addEventListener("click", function () {
+      state.historyOffset += state.historyLimit;
+      refreshHistory();
+    });
+  }
+
+  async function refreshHistory() {
+    const request = ++state.historyRequest;
+    const params = new URLSearchParams({ offset: state.historyOffset, limit: state.historyLimit });
+    ["kind", "result", "since", "until"].forEach(function (key) {
+      const value = document.getElementById("history-" + key).value;
+      if (value) params.set(key, value);
+    });
+    const message = document.getElementById("history-message");
+    try {
+      const response = await fetch("/api/runs?" + params, { cache: "no-store" });
+      const page = await response.json();
+      if (request !== state.historyRequest) return;
+      if (!response.ok) throw new Error(page.error || "Unable to load history");
+      state.historyTotal = page.total;
+      if (page.offset > 0 && page.offset >= page.total) {
+        state.historyOffset = Math.max(0, Math.ceil(page.total / page.limit) - 1) * page.limit;
+        return refreshHistory();
+      }
+      const body = document.getElementById("history-body");
+      body.replaceChildren();
+      page.runs.forEach(function (run) {
+        const row = document.createElement("tr");
+        [run.startedAt, run.id, run.kind, run.target, run.result].forEach(function (value, index) {
+          const cell = document.createElement("td");
+          if (index === 1) {
+            const button = document.createElement("button");
+            button.className = "history-select";
+            button.type = "button";
+            button.textContent = value;
+            button.addEventListener("click", function () {
+              state.root = run.root;
+              state.rootExplicit = true;
+              dom.rootInput.value = run.root;
+              updateUrlRoot(run.root);
+              refreshSnapshot();
+            });
+            cell.appendChild(button);
+          } else cell.textContent = value || "-";
+          row.appendChild(cell);
+        });
+        body.appendChild(row);
+      });
+      document.getElementById("history-count").textContent = page.total;
+      document.getElementById("history-page").textContent = page.total
+        ? (page.offset + 1) + "–" + Math.min(page.offset + page.limit, page.total) + " of " + page.total
+        : "No runs";
+      document.getElementById("history-previous").disabled = page.offset === 0;
+      document.getElementById("history-next").disabled = page.offset + page.limit >= page.total;
+      message.textContent = page.warnings.join(" ") || (page.total ? "Select a run to view its report." : "No matching recorded runs. Existing fault artifacts can be opened using Artifact root.");
+    } catch (error) {
+      if (request === state.historyRequest) message.textContent = error.message;
     }
-    state.root = snapshot.root;
-    dom.rootInput.value = snapshot.root;
+  }
+
+  function renderRunReport(report) {
+    const record = report.record || {};
+    const summary = report.summary || {};
+    document.getElementById("run-report").hidden = false;
+    dom.subtitle.textContent = report.root;
+    document.getElementById("report-title").textContent = record.id || summary.runId || "Selected run";
+    setBadge(document.getElementById("report-result"), report.result, statusClass(report.result));
+    const fields = document.getElementById("report-fields");
+    fields.replaceChildren();
+    const values = [
+      ["Type", report.kind], ["Target", record.target], ["Started", record.startedAt],
+      ["Finished", record.finishedAt], ["Process exit", record.exitCode],
+      ["Runner result", report.artifactResult],
+      ["Cleanup", summary.teardownStatus || (report.cleanup && (report.cleanup.status || (report.cleanup.succeeded === true ? "passed" : report.cleanup.succeeded === false ? "failed" : "see details")))],
+    ];
+    values.forEach(function ([key, value]) {
+      if (value == null) return;
+      const label = document.createElement("dt");
+      const text = document.createElement("dd");
+      label.textContent = key;
+      text.textContent = value;
+      fields.append(label, text);
+    });
+    document.getElementById("report-warnings").textContent = report.warnings.join(" ");
+    ["failure", "cleanup", "summary"].forEach(function (key) {
+      document.getElementById("report-" + key + "-section").hidden = !report[key];
+      document.getElementById("report-" + key).textContent = report[key] ? JSON.stringify(report[key], null, 2) : "";
+    });
+    document.getElementById("report-failure-section").open = Boolean(report.failure);
+    const artifactUrl = function (path) {
+      return "/api/artifact?" + new URLSearchParams({ root: report.artifactRoot, path: path });
+    };
+    const cases = Array.isArray(summary.caseResults) ? summary.caseResults : [];
+    document.getElementById("report-case-section").hidden = cases.length === 0;
+    const caseBody = document.getElementById("report-cases");
+    caseBody.replaceChildren();
+    cases.forEach(function (result) {
+      const row = document.createElement("tr");
+      [result.caseId, result.variantId, result.outcome, result.cleanupSucceeded === true ? "passed" : result.cleanupSucceeded === false ? "failed" : "unknown", result.failureClassification].forEach(function (value, index) {
+        const cell = document.createElement("td");
+        if (index === 0 && result.report) {
+          const link = document.createElement("a");
+          link.textContent = value;
+          link.href = artifactUrl(result.report);
+          link.target = "_blank";
+          link.rel = "noopener";
+          cell.appendChild(link);
+        } else cell.textContent = value || "-";
+        row.appendChild(cell);
+      });
+      caseBody.appendChild(row);
+    });
+    const evidence = document.getElementById("report-artifact-links");
+    evidence.replaceChildren();
+    const paths = (report.kind === "protocol"
+      ? [summary.plan, summary.preflight, summary.registry, summary.cleanup, summary.flakyHistory, summary.failureSummary]
+      : []).concat(Object.values(summary.artifacts || {}))
+      .filter(function (path) { return typeof path === "string" && path.length; });
+    Array.from(new Set(paths)).slice(0, MAX_ARTIFACT_LINKS).forEach(function (path) {
+      const link = document.createElement("a");
+      link.textContent = path;
+      link.href = artifactUrl(path);
+      link.target = "_blank";
+      link.rel = "noopener";
+      evidence.appendChild(link);
+    });
+    const artifacts = document.getElementById("report-artifacts");
+    artifacts.href = artifactUrl(".");
   }
 
   function updateAutoRefresh() {
@@ -202,7 +349,10 @@
       state.autoTimer = null;
     }
     if (dom.autoRefresh.checked) {
-      state.autoTimer = setInterval(refreshSnapshot, AUTO_REFRESH_MS);
+      state.autoTimer = setInterval(function () {
+        refreshHistory();
+        if (state.report || state.rootExplicit) refreshSnapshot();
+      }, AUTO_REFRESH_MS);
     }
   }
 

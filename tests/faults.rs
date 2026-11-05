@@ -71,6 +71,7 @@ fn optional_timechaos_cleanup_uses_confirmed_api_discovery() {
 source "$1"
 discovery_response="$2"
 calls="$3"
+s3chaos_cli() { [[ "$1" == fault-workflow-require-idle ]]; }
 kubectl_cluster() {
   if [[ "$1" == "get" && "$2" == "--raw" && "$3" == "/apis/chaos-mesh.org/v1alpha1" ]]; then
     printf '%s\n' "$discovery_response"
@@ -112,6 +113,7 @@ fn timechaos_cleanup_reports_discovery_delete_and_read_errors() {
                 r#"
 source "$1"
 failure="$2"
+s3chaos_cli() { [[ "$1" == fault-workflow-require-idle ]]; }
 kubectl_cluster() {
   if [[ "$2" != "--raw" ]]; then return 1; fi
   case "$failure" in
@@ -819,6 +821,7 @@ fn unknown_qualification_case_leaves_analyzable_requested_plan() {
 source "$1"
 FAULT_TEST_BINARY="$3"
 build_fault_binary() { :; }
+validate_startup_inputs() { :; }
 trap handle_exit EXIT
 RUSTFS_FAULT_TEST_RUN_ROOT="$2"
 run_qualification unknown-safe-case

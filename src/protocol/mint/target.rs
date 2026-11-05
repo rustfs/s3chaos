@@ -81,6 +81,193 @@ impl Default for MintTargetTimeouts {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MintTargetDiscovery {
+    pub context: String,
+    pub namespace: String,
+    pub service_name: String,
+    pub server_endpoint: Option<String>,
+    pub service_port: Option<u16>,
+    #[serde(default)]
+    pub enable_https: bool,
+    pub region: String,
+    pub rustfs_container: String,
+    #[serde(default)]
+    pub timeouts: MintTargetTimeouts,
+}
+
+/// Discovers an already-owned temporary target without modifying its resources.
+pub async fn discover_mint_target(request: MintTargetDiscovery) -> Result<MintTargetSpec> {
+    validate_timeouts(request.timeouts)?;
+    validate_dns_label("Mint namespace", &request.namespace)?;
+    validate_dns_label("Mint Service name", &request.service_name)?;
+    validate_dns_label("RustFS container name", &request.rustfs_container)?;
+    ensure_nonempty("Mint Kubernetes context", &request.context)?;
+    ensure!(
+        request.server_endpoint.is_some() || request.service_port.is_some(),
+        "Mint discovery requires an explicit server endpoint or Service port"
+    );
+    let client = client_for_context(&request.context).await?;
+    let deadline = Duration::from_secs(request.timeouts.operation_seconds);
+    let namespace = timeout(
+        deadline,
+        Api::<Namespace>::all(client.clone()).get(&request.namespace),
+    )
+    .await
+    .context("time out discovering Mint namespace")??;
+    let pods = timeout(
+        deadline,
+        Api::<Pod>::namespaced(client.clone(), &request.namespace).list(&ListParams::default()),
+    )
+    .await
+    .context("time out discovering Mint pods")??;
+    let service = timeout(
+        deadline,
+        Api::<Service>::namespaced(client.clone(), &request.namespace).get(&request.service_name),
+    )
+    .await
+    .context("time out discovering Mint Service")??;
+    let slices = timeout(
+        deadline,
+        Api::<EndpointSlice>::namespaced(client, &request.namespace).list(
+            &ListParams::default().labels(&format!(
+                "{ENDPOINT_SLICE_SERVICE_LABEL}={}",
+                request.service_name
+            )),
+        ),
+    )
+    .await
+    .context("time out discovering Mint EndpointSlices")??;
+    let now = timestamp_now()?;
+    let mut spec = discovered_target_spec(
+        &request,
+        &namespace,
+        &pods.items,
+        &service,
+        &slices.items,
+        &now,
+    )?;
+    let fingerprint = timeout(
+        Duration::from_secs(ADMIN_PREFLIGHT_SECONDS),
+        read_mint_target_identity(&spec.server_endpoint, spec.enable_https, &spec.region),
+    )
+    .await
+    .context("time out discovering Mint server identity")??;
+    spec.target_fingerprint = fingerprint.sha256;
+    let proof = validate_namespace_ownership(&spec, &namespace, &now)?;
+    verify_mint_target_ready(&spec, &proof, &timestamp_now()?).await?;
+    Ok(spec)
+}
+
+fn discovered_target_spec(
+    request: &MintTargetDiscovery,
+    namespace: &Namespace,
+    pods: &[Pod],
+    service: &Service,
+    slices: &[EndpointSlice],
+    now: &str,
+) -> Result<MintTargetSpec> {
+    ensure!(
+        namespace.name_any() == request.namespace,
+        "Mint namespace name changed during discovery"
+    );
+    let run_id = namespace
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(RUN_ID_LABEL))
+        .context("Mint namespace has no run-id label")?
+        .clone();
+    let expires_at = namespace
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(EXPIRES_AT_ANNOTATION))
+        .context("Mint namespace has no lease expiry annotation")?
+        .clone();
+    let created_at = namespace
+        .metadata
+        .creation_timestamp
+        .as_ref()
+        .context("Mint namespace has no creation timestamp")?
+        .0
+        .to_rfc3339();
+    let (server_endpoint, service_port) = match &request.server_endpoint {
+        Some(endpoint) => {
+            let endpoint = crate::protocol::suite::resolve_protocol_endpoint(
+                &mint_admin_endpoint(endpoint, request.enable_https)?,
+            )?;
+            let url = reqwest::Url::parse(&endpoint).context("parse discovered Mint endpoint")?;
+            let port = url
+                .port_or_known_default()
+                .context("Mint endpoint has no port")?;
+            ensure!(
+                request.service_port.is_none_or(|expected| expected == port),
+                "Mint endpoint and explicit Service port disagree"
+            );
+            (
+                format!(
+                    "{}:{port}",
+                    url.host().context("Mint endpoint has no host")?
+                ),
+                port,
+            )
+        }
+        None => {
+            let port = request
+                .service_port
+                .context("Mint discovery requires an explicit endpoint or Service port")?;
+            (
+                format!("{}.{}.svc:{port}", request.service_name, request.namespace),
+                port,
+            )
+        }
+    };
+    let image_id = pods
+        .iter()
+        .filter_map(|pod| pod.status.as_ref())
+        .filter_map(|status| status.container_statuses.as_ref())
+        .flatten()
+        .find(|container| container.name == request.rustfs_container)
+        .context("Mint namespace has no matching RustFS container")?
+        .image_id
+        .clone();
+    let image_digest = image_id
+        .rsplit_once('@')
+        .map_or(image_id.as_str(), |(_, digest)| digest)
+        .to_string();
+    let spec = MintTargetSpec {
+        api_version: API_VERSION.to_string(),
+        kind: TARGET_KIND.to_string(),
+        run_id,
+        context: request.context.clone(),
+        namespace: request.namespace.clone(),
+        namespace_uid: namespace
+            .metadata
+            .uid
+            .clone()
+            .context("Mint namespace has no UID")?,
+        created_at,
+        expires_at,
+        server_endpoint,
+        service_name: request.service_name.clone(),
+        service_port,
+        enable_https: request.enable_https,
+        region: request.region.clone(),
+        // Resource ownership is checked before credentials are sent to this endpoint.
+        target_fingerprint: "0".repeat(64),
+        rustfs_image_digest: image_digest,
+        rustfs_container: request.rustfs_container.clone(),
+        timeouts: request.timeouts,
+    };
+    spec.validate_at(now)?;
+    validate_namespace_ownership(&spec, namespace, now)?;
+    let proved_pods = validate_target_pods(&spec, pods)?;
+    validate_target_service(&spec, service, slices, &proved_pods)?;
+    Ok(spec)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MintTargetSpec {
@@ -499,25 +686,33 @@ pub async fn inspect_mint_target(
     region: &str,
     expected_fingerprint: &str,
 ) -> Result<TargetFingerprint> {
-    let endpoint = mint_admin_endpoint(server_endpoint, enable_https)?;
-    let credentials = EnvCredentialProvider.resolve("root")?;
-    let server_info = RustfsAdminClient::new(&endpoint, region, credentials)?
-        .server_info()
-        .await
-        .context("query the live RustFS target identity for Mint")?;
-    let observed = TargetFingerprint::new(
-        endpoint,
-        region,
-        server_info.deployment_id,
-        server_info.mode,
-        server_info.region,
-    )?;
+    let observed = read_mint_target_identity(server_endpoint, enable_https, region).await?;
     ensure!(
         observed.sha256 == expected_fingerprint,
         "refuse Mint because the dedicated target fingerprint changed: expected {expected_fingerprint}, observed {}",
         observed.sha256
     );
     Ok(observed)
+}
+
+async fn read_mint_target_identity(
+    server_endpoint: &str,
+    enable_https: bool,
+    region: &str,
+) -> Result<TargetFingerprint> {
+    let endpoint = mint_admin_endpoint(server_endpoint, enable_https)?;
+    let credentials = EnvCredentialProvider.resolve("root")?;
+    let server_info = RustfsAdminClient::new(&endpoint, region, credentials)?
+        .server_info()
+        .await
+        .context("query the live RustFS target identity for Mint")?;
+    TargetFingerprint::new(
+        endpoint,
+        region,
+        server_info.deployment_id,
+        server_info.mode,
+        server_info.region,
+    )
 }
 
 pub async fn verify_mint_target(
@@ -1099,6 +1294,100 @@ mod tests {
             rustfs_container: "rustfs".to_string(),
             timeouts: MintTargetTimeouts::default(),
         }
+    }
+
+    fn discovery_request(spec: &MintTargetSpec) -> MintTargetDiscovery {
+        MintTargetDiscovery {
+            context: spec.context.clone(),
+            namespace: spec.namespace.clone(),
+            service_name: spec.service_name.clone(),
+            server_endpoint: Some(spec.server_endpoint.clone()),
+            service_port: Some(spec.service_port),
+            enable_https: spec.enable_https,
+            region: spec.region.clone(),
+            rustfs_container: spec.rustfs_container.clone(),
+            timeouts: spec.timeouts,
+        }
+    }
+
+    #[test]
+    fn discovery_collects_live_identity_and_preserves_resource_metadata() {
+        let expected = spec();
+        let request = discovery_request(&expected);
+        let mut namespace = namespace(&expected);
+        namespace.metadata.creation_timestamp =
+            Some(serde_json::from_str("\"2026-08-24T00:00:00Z\"").expect("timestamp"));
+        let original = serde_json::to_value(&namespace).expect("namespace before discovery");
+        let pod = pod(&expected, "rustfs-0");
+        let discovered = discovered_target_spec(
+            &request,
+            &namespace,
+            std::slice::from_ref(&pod),
+            &service(&expected),
+            &[endpoint_slice(&expected, &pod)],
+            "2026-08-24T01:00:00Z",
+        )
+        .expect("discover target");
+        assert_eq!(discovered.namespace_uid, expected.namespace_uid);
+        assert_eq!(discovered.run_id, expected.run_id);
+        assert_eq!(discovered.expires_at, expected.expires_at);
+        assert_eq!(discovered.rustfs_image_digest, expected.rustfs_image_digest);
+        assert_eq!(discovered.server_endpoint, expected.server_endpoint);
+        assert_eq!(
+            serde_json::to_value(namespace).expect("namespace after discovery"),
+            original
+        );
+    }
+
+    #[test]
+    fn discovery_rejects_foreign_endpoint_expired_lease_and_unowned_resources() {
+        let expected = spec();
+        let mut request = discovery_request(&expected);
+        let mut namespace = namespace(&expected);
+        namespace.metadata.creation_timestamp =
+            Some(serde_json::from_str("\"2026-08-24T00:00:00Z\"").expect("timestamp"));
+        let pod = pod(&expected, "rustfs-0");
+        let service = service(&expected);
+        let slices = [endpoint_slice(&expected, &pod)];
+        let discover = |request: &MintTargetDiscovery, namespace: &Namespace, now: &str| {
+            discovered_target_spec(
+                request,
+                namespace,
+                std::slice::from_ref(&pod),
+                &service,
+                &slices,
+                now,
+            )
+        };
+        request.server_endpoint = Some("unrelated.example:9000".into());
+        assert!(discover(&request, &namespace, "2026-08-24T01:00:00Z").is_err());
+        request.server_endpoint = Some(expected.server_endpoint.clone());
+        request.service_port = Some(9001);
+        assert!(discover(&request, &namespace, "2026-08-24T01:00:00Z").is_err());
+        request.service_port = Some(expected.service_port);
+        assert!(discover(&request, &namespace, "2026-08-24T13:00:00Z").is_err());
+        namespace
+            .metadata
+            .labels
+            .as_mut()
+            .expect("labels")
+            .remove(MANAGED_BY_LABEL);
+        assert!(discover(&request, &namespace, "2026-08-24T01:00:00Z").is_err());
+    }
+
+    #[tokio::test]
+    async fn discovery_requires_explicit_endpoint_or_port_before_connecting() {
+        let mut request = discovery_request(&spec());
+        request.server_endpoint = None;
+        request.service_port = None;
+        let error = discover_mint_target(request)
+            .await
+            .expect_err("missing endpoint selection");
+        assert!(
+            error
+                .to_string()
+                .contains("explicit server endpoint or Service port")
+        );
     }
 
     fn namespace(spec: &MintTargetSpec) -> Namespace {

@@ -15,6 +15,8 @@
 use anyhow::{Context, Result, bail, ensure};
 #[path = "s3chaos/console_server.rs"]
 mod console_server;
+#[path = "s3chaos/workflow.rs"]
+mod workflow;
 
 use console_server::serve_console;
 use s3chaos::fault::{
@@ -53,11 +55,97 @@ const MAX_MINT_CAPTURE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let arguments = std::env::args().collect::<Vec<_>>();
+    let first = arguments.get(1).map(String::as_str).unwrap_or("--help");
+    if first == "help" && arguments.get(2).is_some_and(|arg| arg == "workers") {
+        return print_help();
+    }
+    if [
+        "init",
+        "run",
+        "runs",
+        "report",
+        "reproduce",
+        "cleanup",
+        "doctor",
+        "validate",
+        "console",
+        "list",
+        "help",
+    ]
+    .contains(&first)
+        || first.starts_with('-')
+    {
+        return workflow::run().await;
+    }
+    if arguments
+        .iter()
+        .skip(2)
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        return print_help();
+    }
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "help".to_string());
 
     match command.as_str() {
         "help" | "--help" | "-h" => print_help(),
+        "fault-workflow-begin" => {
+            let root = next_arg(&mut args, "run root")?;
+            let id = next_arg(&mut args, "run id")?;
+            let pid = next_arg(&mut args, "supervisor pid")?.parse()?;
+            ensure!(args.next().is_none(), "unexpected arguments");
+            s3chaos::fault::workflow::begin(Path::new(&root), &id, pid).await
+        }
+        "fault-workflow-finish" => {
+            let root = next_arg(&mut args, "run root")?;
+            let code = next_arg(&mut args, "exit code")?.parse()?;
+            ensure!(args.next().is_none(), "unexpected arguments");
+            s3chaos::fault::workflow::finish(Path::new(&root), code).await
+        }
+        "fault-workflow-cleanup" | "fault-workflow-chaos-cleanup" => {
+            let root = next_arg(&mut args, "run root")?;
+            ensure!(args.next().is_none(), "unexpected arguments");
+            if command == "fault-workflow-cleanup" {
+                s3chaos::fault::workflow::cleanup(Path::new(&root)).await
+            } else {
+                s3chaos::fault::workflow::cleanup_chaos(Path::new(&root)).await
+            }
+        }
+        "fault-workflow-chaos-delete" => {
+            let root = next_arg(&mut args, "run root")?;
+            let kind = next_arg(&mut args, "Chaos resource kind")?;
+            let name = next_arg(&mut args, "Chaos resource name")?;
+            ensure!(args.next().is_none(), "unexpected arguments");
+            s3chaos::fault::workflow::cleanup_chaos_resource(Path::new(&root), &kind, &name).await
+        }
+        "fault-workflow-require-idle" => {
+            let context = next_arg(&mut args, "context")?;
+            ensure!(args.next().is_none(), "unexpected arguments");
+            s3chaos::fault::workflow::require_idle(&context).await
+        }
+        "workflow-mint-discover" => {
+            let request = next_arg(&mut args, "discovery request")?;
+            ensure!(args.next().is_none(), "unexpected arguments");
+            let request = serde_json::from_str(&fs::read_to_string(request)?)?;
+            let target = s3chaos::protocol::mint::discover_mint_target(request).await?;
+            println!("{}", serde_json::to_string_pretty(&target)?);
+            Ok(())
+        }
+        "workflow-mint-reproduce" => {
+            let original = next_arg(&mut args, "original artifact root")?;
+            let target = next_arg(&mut args, "new target YAML")?;
+            let root = next_arg(&mut args, "new artifact root")?;
+            ensure!(args.next().is_none(), "unexpected arguments");
+            let target =
+                MintTargetSpec::from_yaml(&fs::read_to_string(target)?, &timestamp_now()?)?;
+            let request =
+                s3chaos::protocol::mint::mint_reproduction_request(original, target, root)?;
+            let publication = run_mint_session(request).await?;
+            print!("{}", publication.terminal_summary);
+            ensure!(publication.gate_exit_code == 0, "Mint reproduction failed");
+            Ok(())
+        }
         "fault-catalog-json" => print_fault_catalog_json(),
         "fault-qualification-catalog-json" => print_fault_qualification_catalog_json(),
         "fault-console-json" => print_fault_console_json(args),

@@ -31,6 +31,9 @@ use std::{
 use tokio::net::TcpListener;
 
 use s3chaos::fault::console::{ConsoleSnapshot, build_console_snapshot};
+use s3chaos::workflow::report::{
+    RunFilter, RunPage, RunReport, list_runs_filtered, read_run_report,
+};
 
 const MAX_ARTIFACT_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ARTIFACT_DIRECTORY_ENTRIES: usize = 10_000;
@@ -61,6 +64,16 @@ struct ConsoleQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunsQuery {
+    root: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    #[serde(flatten)]
+    filter: RunFilter,
+}
+
+#[derive(Debug, Deserialize)]
 struct ArtifactRequestQuery {
     root: Option<String>,
     path: String,
@@ -83,6 +96,8 @@ pub async fn serve_console(default_root: impl Into<PathBuf>, addr: SocketAddr) -
         .route("/styles.css", get(styles_css))
         .route("/api/artifact", get(artifact))
         .route("/api/console", get(console_snapshot))
+        .route("/api/runs", get(run_history))
+        .route("/api/report", get(run_report))
         .with_state(state.clone());
 
     let listener = TcpListener::bind(addr)
@@ -350,6 +365,54 @@ async fn console_snapshot(
     }
 }
 
+async fn run_history(
+    State(state): State<ConsoleServerState>,
+    Query(query): Query<RunsQuery>,
+) -> Response {
+    let result = tokio::task::spawn_blocking(move || run_history_for_query(&state, query))
+        .await
+        .context("read run history")
+        .and_then(|result| result);
+    report_response(result)
+}
+
+async fn run_report(
+    State(state): State<ConsoleServerState>,
+    Query(query): Query<ConsoleQuery>,
+) -> Response {
+    let result = tokio::task::spawn_blocking(move || run_report_for_query(&state, query))
+        .await
+        .context("read run report")
+        .and_then(|result| result);
+    report_response(result)
+}
+
+fn report_response<T: serde::Serialize>(result: Result<T>) -> Response {
+    match result {
+        Ok(report) => Json(report).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+fn run_history_for_query(state: &ConsoleServerState, query: RunsQuery) -> Result<RunPage> {
+    let (_, root) = resolve_request_roots(state, query.root)?;
+    list_runs_filtered(
+        root,
+        &query.filter,
+        query.offset.unwrap_or(0),
+        query.limit.unwrap_or(20),
+    )
+}
+
+fn run_report_for_query(state: &ConsoleServerState, query: ConsoleQuery) -> Result<RunReport> {
+    let (_, root) = resolve_request_roots(state, query.root)?;
+    read_run_report(root)
+}
+
 fn console_snapshot_for_query(
     state: &ConsoleServerState,
     query: ConsoleQuery,
@@ -362,8 +425,8 @@ fn console_snapshot_for_query(
 mod tests {
     use super::{
         ArtifactQuery, ArtifactReadLimits, ArtifactRequestQuery, ConsoleQuery, ConsoleServerState,
-        artifact, artifact_download_filename, console_snapshot_for_query, read_artifact,
-        read_artifact_with_limits,
+        RunsQuery, artifact, artifact_download_filename, console_snapshot_for_query, read_artifact,
+        read_artifact_with_limits, run_history_for_query, run_report_for_query,
     };
     use axum::{
         extract::{Query, State},
@@ -375,6 +438,46 @@ mod tests {
         ConsoleServerState {
             default_root: default_root.to_path_buf(),
         }
+    }
+
+    #[test]
+    fn history_query_decodes_pagination_and_filters() {
+        let query: RunsQuery = serde_urlencoded::from_str(
+            "offset=20&limit=10&kind=protocol&result=failed&since=2026-11-01",
+        )
+        .unwrap();
+        assert_eq!(query.offset, Some(20));
+        assert_eq!(query.limit, Some(10));
+        assert_eq!(query.filter.kind.as_deref(), Some("protocol"));
+        assert_eq!(query.filter.since.as_deref(), Some("2026-11-01"));
+    }
+
+    #[test]
+    fn history_and_report_reject_roots_outside_default_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let requested = Some(outside.path().display().to_string());
+        assert!(
+            run_report_for_query(
+                &state(root.path()),
+                ConsoleQuery {
+                    root: requested.clone()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            run_history_for_query(
+                &state(root.path()),
+                RunsQuery {
+                    root: requested,
+                    offset: None,
+                    limit: None,
+                    filter: Default::default(),
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]

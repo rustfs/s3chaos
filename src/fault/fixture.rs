@@ -292,12 +292,8 @@ pub fn apply_tenant_resources(config: &ClusterTestConfig, volumes_per_server: u3
                 )
             })?;
     }
-    kubectl
-        .apply_yaml_command(credential_secret_manifest(config))
-        .run_checked()?;
-    kubectl
-        .apply_yaml_command(tenant_manifest(config, volumes_per_server)?)
-        .run_checked()?;
+    super::workflow::apply_fixture_resource(config, credential_secret_manifest(config))?;
+    super::workflow::apply_fixture_resource(config, tenant_manifest(config, volumes_per_server)?)?;
     Ok(())
 }
 
@@ -332,12 +328,11 @@ pub fn apply_admin_tenant_stage(
                 )
             })?;
     }
-    kubectl
-        .apply_yaml_command(credential_secret_manifest(config))
-        .run_checked()?;
-    kubectl
-        .apply_yaml_command(admin_tenant_manifest(config, plan, expanded, run_id)?)
-        .run_checked()?;
+    super::workflow::apply_fixture_resource(config, credential_secret_manifest(config))?;
+    super::workflow::apply_fixture_resource(
+        config,
+        admin_tenant_manifest(config, plan, expanded, run_id)?,
+    )?;
     Ok(())
 }
 

@@ -23,6 +23,17 @@ use crate::protocol::{
 
 #[async_trait]
 pub(crate) trait ProtocolCaseLifecycle: Sync {
+    fn case_started(&self, _case_id: &str, _total: usize) {}
+
+    fn case_finished(
+        &self,
+        _execution: &ProtocolCaseExecution,
+        _cleanup: &ProtocolCleanupReport,
+        _completed: usize,
+        _total: usize,
+    ) {
+    }
+
     async fn run_case(
         &self,
         case: &ProtocolSuitePlanCase,
@@ -117,6 +128,7 @@ where
     ) -> Result<ProtocolSuiteExecution> {
         let mut cases = Vec::with_capacity(selected_cases.len());
         let mut stop_reason = None;
+        let mut completed = 0;
 
         if let Some(reason) = preflight_failure {
             cases.extend(selected_cases.iter().map(|case| ExecutedProtocolCase {
@@ -165,6 +177,8 @@ where
                     .iter()
                     .enumerate()
                     .map(|(index, case)| async move {
+                        self.case_lifecycle
+                            .case_started(&case.id, selected_cases.len());
                         let started_at_millis = self.clock.now_millis();
                         tokio::select! {
                             biased;
@@ -239,6 +253,8 @@ where
                                     execution.report.case_id
                                 ));
                             }
+                            completed += 1;
+                            self.case_lifecycle.case_finished(&execution, &cleanup, completed, selected_cases.len());
                             wave_results[index] = Some(ExecutedProtocolCase { execution, cleanup });
                         }
                         signal = &mut shutdown => {
@@ -288,6 +304,16 @@ where
                                 },
                                 cleanup,
                             });
+                            let result = wave_results[index]
+                                .as_ref()
+                                .expect("interrupted case result");
+                            completed += 1;
+                            self.case_lifecycle.case_finished(
+                                &result.execution,
+                                &result.cleanup,
+                                completed,
+                                selected_cases.len(),
+                            );
                         }
                     }
                 }
@@ -336,6 +362,41 @@ mod tests {
         invoked: Arc<Mutex<Vec<String>>>,
         cleanup_failures: BTreeSet<String>,
         never_completes: bool,
+    }
+
+    struct ObservedLifecycle {
+        inner: FakeLifecycle,
+        events: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ProtocolCaseLifecycle for ObservedLifecycle {
+        fn case_started(&self, case_id: &str, total: usize) {
+            self.events
+                .lock()
+                .expect("progress events")
+                .push(format!("started:{case_id}:{total}"));
+        }
+
+        fn case_finished(
+            &self,
+            execution: &ProtocolCaseExecution,
+            cleanup: &ProtocolCleanupReport,
+            completed: usize,
+            total: usize,
+        ) {
+            self.events.lock().expect("progress events").push(format!(
+                "finished:{}:{completed}/{total}:{}",
+                execution.report.case_id, cleanup.succeeded
+            ));
+        }
+
+        async fn run_case(
+            &self,
+            case: &ProtocolSuitePlanCase,
+        ) -> Result<(ProtocolCaseExecution, ProtocolCleanupReport)> {
+            self.inner.run_case(case).await
+        }
     }
 
     #[async_trait]
@@ -545,6 +606,50 @@ mod tests {
             artifact_dir: format!("cases/{id}"),
             contract: None,
         }
+    }
+
+    #[tokio::test]
+    async fn progress_reports_timed_out_case_after_cleanup_without_starting_later_wave() {
+        let lifecycle = ObservedLifecycle {
+            inner: FakeLifecycle {
+                invoked: Arc::new(Mutex::new(Vec::new())),
+                cleanup_failures: BTreeSet::new(),
+                never_completes: true,
+            },
+            events: Mutex::new(Vec::new()),
+        };
+        let cleanup = FakeCleanup::default();
+        let timeout = ImmediateCaseTimeout::default();
+        let clock = FakeClock(AtomicU64::new(42));
+        let executor = ProtocolSuiteExecutor::new(
+            &lifecycle,
+            &cleanup,
+            &NeverShutdown,
+            &clock,
+            &timeout,
+            "rustfs.com/s3chaos/v1alpha1",
+        );
+        let result = executor
+            .execute(
+                &[planned_case("first", 0), planned_case("second", 1)],
+                &mut (),
+                None,
+            )
+            .await
+            .expect("timed out execution");
+        assert_eq!(
+            *lifecycle.events.lock().expect("events"),
+            vec!["started:first:2", "finished:first:1/2:true"]
+        );
+        assert_eq!(
+            result.cases[0].execution.report.failure_phase.as_deref(),
+            Some("case-timeout")
+        );
+        assert_eq!(
+            result.cases[1].execution.report.failure_phase.as_deref(),
+            Some("not-run")
+        );
+        assert_eq!(*cleanup.suite_calls.lock().expect("cleanup calls"), 1);
     }
 
     #[tokio::test]
