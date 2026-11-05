@@ -235,6 +235,21 @@ fn fault_command(
     if args.keep_resources {
         environment.insert("S3CHAOS_KEEP_RESOURCES".into(), "1".into());
     }
+    if args.case.as_deref() == Some("quorum-p-dm-eio") {
+        let source = match original {
+            Some(original) => original.join("quorum-dm-targets.json"),
+            None => PathBuf::from(
+                environment
+                    .get("RUSTFS_FAULT_TEST_QUORUM_DM_TARGETS")
+                    .context("RUSTFS_FAULT_TEST_QUORUM_DM_TARGETS is required")?,
+            ),
+        };
+        let resolved = prepare_quorum_targets(&source, root)?;
+        environment.insert(
+            "RUSTFS_FAULT_TEST_QUORUM_DM_TARGETS".into(),
+            resolved.display().to_string(),
+        );
+    }
     let mut command = subprocess("bash", &environment);
     command.arg(bundled.join("scripts/fault-test.sh"));
     if root.join("suite.yaml").is_file() {
@@ -262,6 +277,43 @@ fn fault_command(
         command.arg("suite-run").arg(snapshot);
     }
     Ok(command)
+}
+
+fn prepare_quorum_targets(source: &Path, root: &Path) -> Result<PathBuf> {
+    let template: serde_json::Value = runs::read_json(source)?;
+    let mut resolved = template.clone();
+    let targets = resolved
+        .get_mut("targets")
+        .and_then(serde_json::Value::as_array_mut)
+        .context("quorum DM configuration requires a targets array")?;
+    ensure!(targets.len() == 2, "quorum DM requires exactly two targets");
+    for target in targets {
+        let token = target["stateToken"]
+            .as_str()
+            .context("missing stateToken")?;
+        let state_file = target["stateFile"].as_str().context("missing stateFile")?;
+        if Path::new(state_file).is_relative() {
+            ensure!(
+                !token.is_empty()
+                    && token.len() <= 128
+                    && token
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+                    && state_file == format!(".host-mutation-{token}.json"),
+                "relative stateFile must be .host-mutation-<stateToken>.json"
+            );
+            target["stateFile"] = serde_json::Value::String(
+                root.join("artifacts")
+                    .join(state_file)
+                    .display()
+                    .to_string(),
+            );
+        }
+    }
+    runs::write_json(&root.join("quorum-dm-targets.json"), &template)?;
+    let path = root.join("quorum-dm-targets-resolved.json");
+    runs::write_json(&path, &resolved)?;
+    Ok(path)
 }
 
 fn protocol_command(
@@ -565,7 +617,7 @@ pub async fn cleanup(data: &Path, id: &str) -> Result<()> {
             .as_ref()
             .context("missing Mint target snapshot")?
             .credentials
-            .environment()?,
+            .recovery_environment()?,
     };
     let mut environment = environment;
     environment.insert("RUSTFS_PROTOCOL_TEST_DEDICATED".into(), "1".into());
@@ -950,6 +1002,43 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn quorum_targets_preserve_absolute_paths_and_reject_relative_escapes() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("targets.json");
+        let root = directory.path().join("run");
+        let absolute = directory.path().join("existing-state.json");
+        fs::write(&absolute, b"existing recovery evidence").unwrap();
+        let mut template = serde_json::json!({"targets": [
+            {"stateFile": absolute, "stateToken": "a"},
+            {"stateFile": ".host-mutation-b.json", "stateToken": "b"}
+        ]});
+        runs::write_json(&source, &template).unwrap();
+        let path = prepare_quorum_targets(&source, &root).unwrap();
+        let resolved: serde_json::Value = runs::read_json(&path).unwrap();
+        assert_eq!(
+            resolved["targets"][0]["stateFile"],
+            template["targets"][0]["stateFile"]
+        );
+        assert_eq!(fs::read(&absolute).unwrap(), b"existing recovery evidence");
+        for invalid in [
+            "../.host-mutation-b.json",
+            "nested/.host-mutation-b.json",
+            ".host-mutation-other.json",
+        ] {
+            template["targets"][1]["stateFile"] = invalid.into();
+            runs::write_json(&source, &template).unwrap();
+            assert!(prepare_quorum_targets(&source, &root).is_err());
+        }
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!({"targets": "invalid"}),
+        ] {
+            runs::write_json(&source, &invalid).unwrap();
+            assert!(prepare_quorum_targets(&source, &root).is_err());
+        }
     }
 
     #[test]

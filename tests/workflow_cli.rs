@@ -300,6 +300,133 @@ fn fault_worker_uses_saved_environment_and_requires_evidence_after_successful_ex
 
 #[cfg(target_os = "linux")]
 #[test]
+fn quorum_dm_runs_and_reproduces_with_run_scoped_state_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new();
+    let source = sandbox.directory.path().join("targets.json");
+    let targets: Vec<_> = ["a", "b"]
+        .iter()
+        .map(|token| {
+            serde_json::json!({
+                "node": format!("node-{token}"), "mapperName": format!("dm-{token}"),
+                "mountPath": format!("/data/{token}"), "persistentVolume": format!("pv-{token}"),
+                "observerNamespace": "observers", "observerPod": format!("observer-{token}"),
+                "stateFile": format!(".host-mutation-{token}.json"), "stateToken": token,
+            })
+        })
+        .collect();
+    let template = serde_json::json!({"targets": targets});
+    fs::write(&source, serde_json::to_vec(&template).unwrap()).unwrap();
+    let config = serde_json::json!({"schemaVersion": 1, "targets": {"lab": {"fault": {
+        "context": "local-context", "storageClass": "static", "image": "rustfs:test",
+        "options": {
+            "RUSTFS_FAULT_TEST_QUORUM_DM_TARGETS": source,
+            "RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE": "1",
+            "RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST": "node-a,node-b",
+            "RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST": "/dev/mapper/dm-a,/dev/mapper/dm-b",
+            "RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST": "pv-a,pv-b"
+        }
+    }}}});
+    fs::write(
+        sandbox.directory.path().join("missing-targets.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    let script = sandbox.directory.path().join("empty-path/bash");
+    fs::write(
+        &script,
+        r#"#!/bin/bash
+source "$1"
+kubectl() { printf 'unexpected kubectl invocation\n' >&2; exit 91; }
+build_fault_binary() { :; }
+require_dm_scenario() { :; }
+preflight() { :; }
+start_workflow_session() { :; }
+run_scenario() { printf '%s' "$1" > "$2/scenario-started"; }
+run_dm "$3"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:/usr/bin:/bin",
+        sandbox.directory.path().join("empty-path").display()
+    );
+    let mut original_id = String::new();
+    let mut original_evidence = None;
+    for replay in [false, true] {
+        let arguments = if replay {
+            vec!["reproduce", original_id.as_str(), "--use-current-image"]
+        } else {
+            vec![
+                "run",
+                "fault",
+                "--target",
+                "lab",
+                "--case",
+                "quorum-p-dm-eio",
+            ]
+        };
+        let output = sandbox
+            .local_command(&arguments)
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "a simulated scenario has no final evidence"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Result: incomplete"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let history = json_output(sandbox.local(&["runs", "--json"]));
+        let id = history["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|run| run["id"].as_str().filter(|id| *id != original_id))
+            .unwrap();
+        let root = sandbox.data().join("runs").join(id);
+        assert_eq!(
+            fs::read_to_string(root.join("artifacts/scenario-started")).unwrap(),
+            "quorum-p-dm-eio"
+        );
+        let resolved: Value = serde_json::from_slice(
+            &fs::read(root.join("quorum-dm-targets-resolved.json")).unwrap(),
+        )
+        .unwrap();
+        for (index, token) in ["a", "b"].iter().enumerate() {
+            assert_eq!(
+                resolved["targets"][index]["stateFile"],
+                root.join(format!("artifacts/.host-mutation-{token}.json"))
+                    .display()
+                    .to_string()
+            );
+        }
+        if !replay {
+            original_id = id.into();
+            original_evidence =
+                Some(fs::read(root.join("quorum-dm-targets-resolved.json")).unwrap());
+            fs::remove_file(&source).unwrap();
+        }
+    }
+    let original = sandbox.data().join("runs").join(original_id);
+    assert_eq!(
+        fs::read(original.join("quorum-dm-targets-resolved.json")).unwrap(),
+        original_evidence.unwrap()
+    );
+    let saved: Value =
+        serde_json::from_slice(&fs::read(original.join("quorum-dm-targets.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved, template);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn cleanup_rejects_a_live_worker_after_its_parent_has_exited() {
     use s3chaos::workflow::{
         config::Target,
@@ -380,12 +507,80 @@ fn installed_binary_lists_and_validates_without_cargo_or_source_files() {
     );
     assert!(help.contains("Usage:"));
     let suites = successful(sandbox.local(&["list", "suites"]));
-    assert!(suites.contains("fault/examples/smoke.yaml"));
-    assert!(suites.contains("protocol/examples/smoke.yaml"));
+    assert!(suites.contains("fault\tsmoke"));
+    assert!(suites.contains("protocol\tsmoke"));
+    for row in suites.lines().skip(1) {
+        let (kind, suite) = row.split_once('\t').expect("suite kind and runnable name");
+        let stdout = successful(sandbox.local(&["validate", kind, suite]));
+        assert!(stdout.contains(&format!("{kind} suite is valid")));
+    }
     let cases = json_output(sandbox.local(&["list", "cases", "--kind", "protocol"]));
     assert!(!cases.as_array().expect("protocol case catalog").is_empty());
     for kind in ["fault", "protocol"] {
-        let stdout = successful(sandbox.local(&["validate", kind, "smoke"]));
-        assert!(stdout.contains(&format!("{kind} suite is valid")));
+        let suites = successful(sandbox.local(&["list", "suites", "--kind", kind]));
+        assert!(suites.contains(&format!("{kind}\tsmoke")));
+        assert!(
+            suites
+                .lines()
+                .skip(1)
+                .all(|row| row.starts_with(&format!("{kind}\t")))
+        );
+    }
+}
+
+#[test]
+fn mint_cleanup_reaches_the_recovery_worker_without_original_credentials() {
+    use s3chaos::workflow::{
+        config::{CredentialSource, MintTarget, Target},
+        runs::RunRecord,
+    };
+
+    let sandbox = Sandbox::new();
+    let target = Target {
+        mint: Some(MintTarget {
+            context: "local-context".into(),
+            service: "rustfs".into(),
+            port: Some(9000),
+            endpoint: None,
+            region: "us-east-1".into(),
+            container: "rustfs".into(),
+            credentials: CredentialSource {
+                access_key_env: "LAB_KEY".into(),
+                secret_key_env: "LAB_SECRET".into(),
+                session_token_env: Some("LAB_TOKEN".into()),
+            },
+        }),
+        ..Target::default()
+    };
+    let (mut record, root) =
+        RunRecord::create(&sandbox.data(), "mint", "local-fixture", target, None)
+            .expect("Mint run record");
+    record.state = "finished".into();
+    record.result = "failed".into();
+    record.save(&root).expect("finished Mint run");
+    let before = fs::read(root.join("record.json")).expect("record before cleanup");
+    fs::create_dir(root.join("artifacts")).expect("empty artifacts");
+
+    for partial_credentials in [false, true] {
+        let mut command = sandbox.local_command(&["cleanup", &record.id]);
+        if partial_credentials {
+            command.env("LAB_KEY", "test-only-key");
+        }
+        let output = command.output().expect("Mint recovery command");
+        assert!(
+            !output.status.success(),
+            "missing ownership evidence must block cleanup"
+        );
+        let stderr = String::from_utf8(output.stderr).expect("cleanup stderr");
+        assert!(stderr.contains("mint-target-spec.json"), "{stderr}");
+        assert!(
+            !stderr.contains("missing credential environment variables"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("test-only-key"), "{stderr}");
+        assert_eq!(
+            fs::read(root.join("record.json")).expect("record after cleanup"),
+            before
+        );
     }
 }

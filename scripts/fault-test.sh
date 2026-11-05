@@ -264,7 +264,7 @@ require_cli_runtime() {
 }
 
 validate_startup_inputs() {
-  local mode="$1" name tool
+  local name tool
   local -a missing=()
   for name in RUSTFS_FAULT_TEST_SERVER_IMAGE RUSTFS_FAULT_TEST_STORAGE_CLASS; do
     [[ -n "${!name:-}" ]] || missing+=("$name is required")
@@ -276,11 +276,6 @@ validate_startup_inputs() {
     command -v cargo >/dev/null 2>&1 || missing+=("required command not found: cargo")
   elif [[ ! -x "$S3CHAOS_BINARY" ]]; then
     missing+=("S3CHAOS_BINARY is not executable: $S3CHAOS_BINARY")
-  fi
-  if [[ "$mode" == "dm" ]]; then
-    for name in RUSTFS_FAULT_TEST_DM_NAME RUSTFS_FAULT_TEST_DM_NODE RUSTFS_FAULT_TEST_DM_MOUNT_PATH RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE RUSTFS_FAULT_TEST_DM_OBSERVER_POD RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST; do
-      [[ -n "${!name:-}" ]] || missing+=("$name is required")
-    done
   fi
   if (( ${#missing[@]} )); then
     printf 'fault-test: %s\n' "${missing[@]}" >&2
@@ -1583,10 +1578,13 @@ initialize_summary() {
 
 run_one() {
   local scenario="$1" mode="${2:-ordinary}" run_root
-  validate_startup_inputs "$mode"
+  validate_startup_inputs
   run_root="$(new_run_root)"
   initialize_summary "$run_root"
   run_root="$(cd "$run_root" && pwd -P)"
+  if [[ "$mode" == "dm" ]]; then
+    validate_dm_env_contract "$scenario"
+  fi
   build_fault_binary "$run_root" "scenario=$scenario"
   if [[ "$scenario" == "fresh-volume-replacement" || "$scenario" == "on-disk-bitrot" || "$scenario" == "network-partition-during-heal" || "$scenario" == "metadata-shard-corruption" ]]; then
     require_supported_scenario "$scenario"
@@ -1716,7 +1714,7 @@ run_qualification() {
   ACTIVE_QUALIFICATION_ROOT="$run_root"
   initialize_summary "$run_root"
   write_qualification_request_plan "$run_root" "$qualification_case"
-  validate_startup_inputs qualification
+  validate_startup_inputs
   echo "qualification run root: $run_root"
   echo "live console: make fault-console-serve CONSOLE_ROOT=$run_root"
   build_fault_binary "$run_root" "qualification=$qualification_case"
@@ -1951,7 +1949,7 @@ run_suite() {
   local baseline_ready_nodes baseline_tenants current_time health_checks require_chaos
   local health_status health_safe health_message health_reason
   local consecutive_health_failures will_abort
-  validate_startup_inputs suite
+  validate_startup_inputs
   [[ -f "$suite" ]] || die "suite yaml file not found: $suite"
   run_root="$(new_run_root)"
   mkdir -p "$run_root"

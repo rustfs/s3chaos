@@ -110,6 +110,12 @@ make -j2 fault-dm-run SCENARIO=quorum-p-dm-eio
 
 The three allowlists must exactly match the two JSON members. All existing
 context, namespace ownership, static storage and image prerequisites apply.
+For a saved target used by `s3chaos run fault --case quorum-p-dm-eio`, use
+`.host-mutation-qdm-a.json` and `.host-mutation-qdm-b.json` as the relative
+`stateFile` values, matching each `stateToken`. The CLI resolves these filenames
+inside the new run's artifact directory and saves the target configuration for
+`reproduce`. Absolute paths retain their existing meaning and must belong to
+the selected run directory.
 Device-mapper execution remains excluded from the ordinary multi-attempt suite
 runner. The wrapper persists its validated target JSON into this run before
 launching the fault process; cancellation checks the exact two recorded state

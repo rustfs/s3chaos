@@ -378,11 +378,13 @@ pub async fn run() -> Result<()> {
 fn list(what: ListKind, kind: Option<Kind>) -> Result<()> {
     match what {
         ListKind::Suites => {
+            println!("KIND\tSUITE");
             for (name, _) in resources::FILES {
-                if name.contains("/examples/")
-                    && kind.is_none_or(|kind| name.starts_with(kind.as_str()))
+                if let Some((suite_kind, suite)) = name.split_once("/examples/")
+                    && kind.is_none_or(|kind| suite_kind == kind.as_str())
+                    && let Some(suite) = suite.strip_suffix(".yaml")
                 {
-                    println!("{name}");
+                    println!("{suite_kind}\t{suite}");
                 }
             }
         }

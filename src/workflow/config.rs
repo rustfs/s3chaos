@@ -94,12 +94,17 @@ impl Default for CredentialSource {
 
 impl CredentialSource {
     pub fn environment(&self) -> Result<BTreeMap<String, String>> {
-        self.environment_with(|name| env::var(name).ok())
+        self.environment_with(|name| env::var(name).ok(), true)
+    }
+
+    pub fn recovery_environment(&self) -> Result<BTreeMap<String, String>> {
+        self.environment_with(|name| env::var(name).ok(), false)
     }
 
     fn environment_with(
         &self,
         get: impl Fn(&str) -> Option<String>,
+        require_all: bool,
     ) -> Result<BTreeMap<String, String>> {
         let mut values = BTreeMap::new();
         let mut missing = Vec::new();
@@ -126,7 +131,7 @@ impl CredentialSource {
             }
         }
         ensure!(
-            missing.is_empty(),
+            !require_all || missing.is_empty(),
             "missing credential environment variables: {}",
             missing.join(", ")
         );
@@ -355,17 +360,53 @@ mod tests {
             session_token_env: None,
         };
         let values = source
-            .environment_with(|name| match name {
-                "LAB_KEY" => Some("key-a".into()),
-                "LAB_SECRET" => Some("secret-a".into()),
-                "RUSTFS_PROTOCOL_TEST_ADMIN_SESSION_TOKEN" => Some("unrelated-token".into()),
-                _ => None,
-            })
+            .environment_with(
+                |name| match name {
+                    "LAB_KEY" => Some("key-a".into()),
+                    "LAB_SECRET" => Some("secret-a".into()),
+                    "RUSTFS_PROTOCOL_TEST_ADMIN_SESSION_TOKEN" => Some("unrelated-token".into()),
+                    _ => None,
+                },
+                true,
+            )
             .unwrap();
         assert_eq!(values["RUSTFS_PROTOCOL_TEST_ADMIN_ACCESS_KEY"], "key-a");
         assert!(!values.contains_key("RUSTFS_PROTOCOL_TEST_ADMIN_SESSION_TOKEN"));
-        let error = source.environment_with(|_| None).unwrap_err().to_string();
+        let error = source
+            .environment_with(|_| None, true)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("LAB_KEY") && error.contains("LAB_SECRET"));
+    }
+
+    #[test]
+    fn recovery_credentials_preserve_available_material_and_validate_sources() {
+        let mut source = CredentialSource {
+            access_key_env: "LAB_KEY".into(),
+            secret_key_env: "LAB_SECRET".into(),
+            session_token_env: Some("LAB_TOKEN".into()),
+        };
+        let values = source
+            .environment_with(
+                |name| match name {
+                    "LAB_KEY" => Some(String::new()),
+                    "LAB_TOKEN" => Some("token-a".into()),
+                    "RUSTFS_PROTOCOL_TEST_ADMIN_SECRET_KEY" => Some("unrelated-secret".into()),
+                    _ => None,
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            values,
+            BTreeMap::from([(
+                "RUSTFS_PROTOCOL_TEST_ADMIN_SESSION_TOKEN".into(),
+                "token-a".into(),
+            )])
+        );
+        assert!(source.environment_with(|_| None, false).unwrap().is_empty());
+        source.secret_key_env = "invalid reference".into();
+        assert!(source.environment_with(|_| None, false).is_err());
     }
 
     #[test]
