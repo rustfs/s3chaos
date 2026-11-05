@@ -71,6 +71,7 @@ fn optional_timechaos_cleanup_uses_confirmed_api_discovery() {
 source "$1"
 discovery_response="$2"
 calls="$3"
+s3chaos_cli() { [[ "$1" == fault-workflow-require-idle ]]; }
 kubectl_cluster() {
   if [[ "$1" == "get" && "$2" == "--raw" && "$3" == "/apis/chaos-mesh.org/v1alpha1" ]]; then
     printf '%s\n' "$discovery_response"
@@ -112,6 +113,7 @@ fn timechaos_cleanup_reports_discovery_delete_and_read_errors() {
                 r#"
 source "$1"
 failure="$2"
+s3chaos_cli() { [[ "$1" == fault-workflow-require-idle ]]; }
 kubectl_cluster() {
   if [[ "$2" != "--raw" ]]; then return 1; fi
   case "$failure" in
@@ -819,6 +821,7 @@ fn unknown_qualification_case_leaves_analyzable_requested_plan() {
 source "$1"
 FAULT_TEST_BINARY="$3"
 build_fault_binary() { :; }
+validate_startup_inputs() { :; }
 trap handle_exit EXIT
 RUSTFS_FAULT_TEST_RUN_ROOT="$2"
 run_qualification unknown-safe-case
@@ -932,6 +935,107 @@ printf 'validated-and-protected\n'
         String::from_utf8_lossy(&output.stdout),
         "validated-and-protected\n"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn dm_runner_validates_scenario_inputs_before_build() {
+    for (scenario, input, expected_error) in [
+        ("quorum-p-dm-eio", "valid", None),
+        (
+            "quorum-p-dm-eio",
+            "missing",
+            Some("RUSTFS_FAULT_TEST_QUORUM_DM_TARGETS is required"),
+        ),
+        (
+            "quorum-p-dm-eio",
+            "invalid",
+            Some("quorum dm requires exactly two closed targets"),
+        ),
+        (
+            "dm-flakey",
+            "valid",
+            Some("RUSTFS_FAULT_TEST_DM_NAME is required"),
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let root = parent.join("child/artifacts");
+        let targets = parent.join("targets.json");
+        let values: Vec<_> = ["a", "b"]
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "node": format!("node-{id}"),
+                    "mapperName": format!("dm-{id}"),
+                    "mountPath": format!("/data/{id}"),
+                    "persistentVolume": format!("pv-{id}"),
+                    "observerNamespace": "observers",
+                    "observerPod": format!("observer-{id}"),
+                    "stateFile": root.join(format!(".host-mutation-{id}.json")),
+                    "stateToken": id,
+                })
+            })
+            .collect();
+        let mut document = serde_json::json!({"targets": values});
+        if input == "invalid" {
+            document["targets"][1]["stateToken"] = serde_json::json!("a");
+        }
+        std::fs::write(&targets, serde_json::to_vec(&document).unwrap()).unwrap();
+        assert!(!root.exists());
+        let output = Command::new("bash")
+            .args([
+                "-c",
+                r#"
+source "$1"
+unset RUSTFS_FAULT_TEST_DM_NAME RUSTFS_FAULT_TEST_DM_NODE RUSTFS_FAULT_TEST_DM_MOUNT_PATH
+unset RUSTFS_FAULT_TEST_DM_OBSERVER_NAMESPACE RUSTFS_FAULT_TEST_DM_OBSERVER_POD
+if [[ "$4" == missing ]]; then
+  unset RUSTFS_FAULT_TEST_QUORUM_DM_TARGETS
+fi
+kubectl() { printf 'unexpected kubectl invocation\n' >&2; exit 91; }
+build_fault_binary() { touch "$1/build-started"; }
+require_dm_scenario() { :; }
+preflight() { :; }
+start_workflow_session() { :; }
+run_scenario() { printf 'scenario-executed\n'; }
+run_dm "$3"
+"#,
+                "dm-runner-input-test",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fault-test.sh"),
+                root.to_str().unwrap(),
+                scenario,
+                input,
+            ])
+            .env("S3CHAOS_BINARY", env!("CARGO_BIN_EXE_s3chaos"))
+            .env("S3CHAOS_RUN_ROOT", &root)
+            .env("RUSTFS_FAULT_TEST_RUN_ROOT", &root)
+            .env("RUSTFS_FAULT_TEST_QUORUM_DM_TARGETS", &targets)
+            .env("RUSTFS_FAULT_TEST_SERVER_IMAGE", "rustfs:test")
+            .env("RUSTFS_FAULT_TEST_STORAGE_CLASS", "static")
+            .env("RUSTFS_FAULT_TEST_NAMESPACE", "fault-tests")
+            .env("RUSTFS_FAULT_TEST_DEVICE_MAPPER_DESTRUCTIVE", "1")
+            .env("RUSTFS_FAULT_TEST_HOST_NODE_ALLOWLIST", "node-a,node-b")
+            .env(
+                "RUSTFS_FAULT_TEST_HOST_DEVICE_ALLOWLIST",
+                "/dev/mapper/dm-a,/dev/mapper/dm-b",
+            )
+            .env("RUSTFS_FAULT_TEST_HOST_PV_ALLOWLIST", "pv-a,pv-b")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if let Some(expected_error) = expected_error {
+            assert!(!output.status.success(), "{stdout}");
+            assert!(stderr.contains(expected_error), "{stderr}");
+            assert!(!root.join("build-started").exists());
+            assert!(!stdout.contains("scenario-executed"));
+        } else {
+            assert!(output.status.success(), "{stderr}");
+            assert!(root.join("build-started").exists());
+            assert!(stdout.contains("scenario-executed"));
+        }
+    }
 }
 
 #[cfg(unix)]

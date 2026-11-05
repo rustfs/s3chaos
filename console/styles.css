@@ -57,8 +57,7 @@ a:hover {
 
 .app-shell {
   min-height: 100vh;
-  display: grid;
-  grid-template-rows: auto auto 1fr;
+  display: block;
 }
 
 .topbar {
@@ -808,3 +807,24 @@ a:hover {
     font-size: 20px;
   }
 }
+
+
+[hidden] { display: none !important; }
+
+.history-panel, .report-panel { margin: 14px 24px 0; }
+.history-controls, .history-pagination { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; padding: 12px 16px; }
+.history-controls label { display: grid; gap: 5px; font-size: 12px; color: var(--muted); }
+.history-controls input, .history-controls select { font: inherit; padding: 8px; border: 1px solid var(--subtle); border-radius: 6px; background: var(--panel); color: var(--text); }
+.history-pagination { align-items: center; justify-content: flex-end; }
+.history-message { margin: 8px 16px; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.history-select { border: 0; padding: 0; font: inherit; color: var(--focus); background: none; cursor: pointer; text-align: left; }
+.history-select:hover { text-decoration: underline; }
+.report-fields { display: grid; grid-template-columns: auto 1fr; gap: 8px 20px; padding: 0 16px; font-size: 13px; }
+.report-fields dt { color: var(--muted); }
+.report-fields dd { margin: 0; overflow-wrap: anywhere; }
+.report-panel details { margin: 12px 16px; }
+.report-panel summary { cursor: pointer; }
+.report-panel pre { overflow: auto; max-height: 500px; padding: 12px; background: var(--panel-alt); font-size: 12px; }
+.report-evidence { display: flex; gap: 12px; flex-wrap: wrap; margin: 12px 16px; font-size: 13px; overflow-wrap: anywhere; }
+.report-artifacts { display: inline-block; margin: 12px 16px; }
+@media (max-width: 640px) { .history-panel, .report-panel { margin: 12px 14px 0; } }

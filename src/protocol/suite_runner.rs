@@ -55,7 +55,10 @@ use crate::protocol::{
             ensure_dedicated_target_fingerprint, protocol_artifact_base,
         },
     },
-    suite::{ProtocolSuite, ProtocolSuiteContracts, ProtocolSuiteSelector},
+    suite::{
+        ProtocolExternalIdentityProviderKind, ProtocolSuite, ProtocolSuiteContracts,
+        ProtocolSuiteExternalIdentity, ProtocolSuiteSelector,
+    },
     suite_plan::{
         ProtocolMutatingProbeStatus, ProtocolMutatingProbeSummary, ProtocolSuitePlan,
         ProtocolSuitePlanCase, TargetFingerprint,
@@ -91,7 +94,65 @@ pub async fn plan_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<Pro
 }
 
 pub async fn run_protocol_suite_from_yaml(path: impl AsRef<Path>) -> Result<()> {
-    run_protocol_suite(path.as_ref(), None).await
+    run_protocol_suite(path.as_ref(), None, None).await
+}
+
+/// Rebuilds the effective suite without writing to the original run.
+pub fn protocol_reproduction_suite(
+    artifact_root: impl AsRef<Path>,
+    case_id: Option<&str>,
+) -> Result<(ProtocolSuite, TargetFingerprint)> {
+    let artifact_root = artifact_root.as_ref();
+    let plan: ProtocolSuitePlan = serde_json::from_str(
+        &fs::read_to_string(artifact_root.join("protocol-suite-plan.json"))
+            .context("read protocol suite plan for reproduction")?,
+    )
+    .context("parse protocol suite plan for reproduction")?;
+    ensure!(
+        !plan.cases.is_empty(),
+        "recorded protocol plan contains no cases to reproduce"
+    );
+    if let Some(case_id) = case_id {
+        ensure!(
+            plan.cases.iter().any(|case| case.id == case_id),
+            "case {case_id} was not part of run {}",
+            plan.run_id
+        );
+    }
+    let mut suite = ProtocolSuite::from_yaml_path(artifact_root.join("protocol-suite.yaml"))?;
+    ensure!(
+        suite.metadata.name == plan.suite,
+        "protocol source suite does not match the recorded plan"
+    );
+    suite.selector = ProtocolSuiteSelector {
+        cases: plan
+            .cases
+            .iter()
+            .filter(|case| case_id.is_none_or(|selected| selected == case.id))
+            .map(|case| case.id.clone())
+            .collect(),
+        ..ProtocolSuiteSelector::default()
+    };
+    suite.execution.profile = plan.profile;
+    suite.execution.parallelism = plan.execution.parallelism;
+    suite.execution.cleanup = plan.execution.cleanup;
+    suite.execution.timeouts = plan.execution.timeouts;
+    suite.execution.artifact_retention = plan.execution.artifact_retention;
+    suite.contracts = plan.contracts;
+    suite.target.endpoint = plan.target.fingerprint.endpoint.clone();
+    suite.target.region = plan.target.fingerprint.region.clone();
+    suite.target.credentials.admin_profile = plan.target.admin_profile;
+    suite.target.ownership.resource_prefixes.bucket = plan.target.bucket_prefix;
+    suite.target.ownership.resource_prefixes.identity = plan.target.identity_prefix;
+    suite.target.external_identity =
+        plan.target
+            .external_identity_profile
+            .map(|profile| ProtocolSuiteExternalIdentity {
+                provider: ProtocolExternalIdentityProviderKind::Keycloak,
+                profile,
+            });
+    suite.resolve()?;
+    Ok((suite, plan.target.fingerprint))
 }
 
 pub async fn reproduce_protocol_case_from_artifacts(
@@ -99,33 +160,11 @@ pub async fn reproduce_protocol_case_from_artifacts(
     case_id: &str,
 ) -> Result<()> {
     let artifact_root = artifact_root.as_ref();
-    let plan: ProtocolSuitePlan = serde_json::from_str(
-        &fs::read_to_string(artifact_root.join("protocol-suite-plan.json"))
-            .context("read protocol suite plan for reproduction")?,
-    )
-    .context("parse protocol suite plan for reproduction")?;
-    let planned_case = plan
-        .cases
-        .iter()
-        .find(|case| case.id == case_id)
-        .with_context(|| format!("case {case_id} was not part of run {}", plan.run_id))?;
-    let mut suite = ProtocolSuite::from_yaml_path(artifact_root.join("protocol-suite.yaml"))?;
-    ensure!(
-        suite.metadata.name == plan.suite,
-        "protocol source suite does not match the recorded plan"
-    );
-    suite.selector = ProtocolSuiteSelector {
-        cases: vec![planned_case.id.clone()],
-        ..ProtocolSuiteSelector::default()
-    };
-    let relative = Path::new("cases")
-        .join(case_id)
-        .join("reproduction-suite.yaml");
-    let artifacts = ProtocolArtifactWriter::file(artifact_root);
-    artifacts.write_text(&relative, &serde_yaml_ng::to_string(&suite)?)?;
+    let (suite, fingerprint) = protocol_reproduction_suite(artifact_root, Some(case_id))?;
     run_protocol_suite(
-        &artifact_root.join(relative),
-        Some(&plan.target.fingerprint),
+        &artifact_root.join("protocol-suite.yaml"),
+        Some(&fingerprint),
+        Some(suite),
     )
     .await
 }
@@ -133,9 +172,14 @@ pub async fn reproduce_protocol_case_from_artifacts(
 async fn run_protocol_suite(
     path: &Path,
     expected_fingerprint: Option<&TargetFingerprint>,
+    suite_override: Option<ProtocolSuite>,
 ) -> Result<()> {
     ensure_dedicated_target_acknowledgement()?;
-    let runtime = ConnectedProtocolRuntime::connect(path).await?;
+    let mut source_suite = match suite_override {
+        Some(suite) => suite,
+        None => ProtocolSuite::from_yaml_path(path)?,
+    };
+    let runtime = ConnectedProtocolRuntime::connect_suite(&source_suite).await?;
     let mut preflight = run_connected_preflight(&runtime).await?;
     ensure_dedicated_target_fingerprint(&preflight.target_fingerprint)?;
     if let Some(expected) = expected_fingerprint {
@@ -152,11 +196,29 @@ async fn run_protocol_suite(
         (&preflight).into(),
         protocol_artifact_base(),
     )?;
+    if let Some(root) = std::env::var_os("RUSTFS_PROTOCOL_TEST_RUN_ROOT") {
+        claim_exact_protocol_run_root(&mut plan, Path::new(&root))?;
+    }
     let artifact_root = plan.artifact_root();
     let artifacts = ProtocolArtifactWriter::file(&artifact_root);
     artifacts.initialize_run(path)?;
+    source_suite.target.endpoint = runtime.endpoint.clone();
+    source_suite.selector = ProtocolSuiteSelector {
+        cases: plan.cases.iter().map(|case| case.id.clone()).collect(),
+        ..ProtocolSuiteSelector::default()
+    };
+    artifacts.write_text(
+        "protocol-suite.yaml",
+        &serde_yaml_ng::to_string(&source_suite)?,
+    )?;
     artifacts.write_json("protocol-suite-plan.json", &plan)?;
     artifacts.write_json("preflight-summary.json", &preflight)?;
+    eprintln!(
+        "protocol suite {}: {} cases; artifacts: {}",
+        plan.suite,
+        plan.cases.len(),
+        artifact_root.display()
+    );
 
     let mut registry = ResourceRegistry::create(
         &artifact_root,
@@ -505,6 +567,7 @@ async fn run_protocol_suite(
         summary.status = ProtocolCaseStatus::Failed;
         summary.failure_summary = Some("protocol-failure-summary.json".to_string());
         artifacts.write_json("protocol-suite-summary.json", &summary)?;
+        print_protocol_summary(&summary, &artifact_root, false, fallback_cleanup.succeeded);
         return Err(error).with_context(|| {
             format!(
                 "validate Phase 1 protocol artifacts at {}",
@@ -513,6 +576,7 @@ async fn run_protocol_suite(
         });
     }
 
+    print_protocol_summary(&summary, &artifact_root, true, fallback_cleanup.succeeded);
     if !passed {
         bail!(
             "protocol suite failed; artifacts preserved at {}",
@@ -524,6 +588,107 @@ async fn run_protocol_suite(
         runtime.suite.metadata.name,
         artifact_root.display()
     );
+    Ok(())
+}
+
+fn print_protocol_summary(
+    summary: &ProtocolSuiteSummary,
+    artifact_root: &Path,
+    artifacts_valid: bool,
+    cleanup_succeeded: bool,
+) {
+    let cleanup_succeeded = cleanup_succeeded
+        && summary
+            .case_results
+            .iter()
+            .all(|case| case.cleanup_succeeded);
+    let count = |outcome| {
+        summary
+            .case_results
+            .iter()
+            .filter(|case| case.outcome == outcome)
+            .count()
+    };
+    eprintln!(
+        "protocol result {:?}: passed={} failed={} not-run={} skipped={} expected-divergence={}; cleanup={}; artifacts={}",
+        summary.status,
+        count(ProtocolCaseOutcome::Passed),
+        count(ProtocolCaseOutcome::Failed),
+        count(ProtocolCaseOutcome::NotRun),
+        count(ProtocolCaseOutcome::CapabilitySkipped),
+        count(ProtocolCaseOutcome::ExpectedDivergence),
+        if cleanup_succeeded {
+            "passed"
+        } else {
+            "failed"
+        },
+        if artifacts_valid { "valid" } else { "invalid" },
+    );
+    let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("s3chaos"));
+    let executable = shell_quote(&executable.display().to_string());
+    let workflow_root = artifact_root
+        .parent()
+        .filter(|root| root.join("record.json").is_file());
+    if let Some(root) = workflow_root {
+        eprintln!(
+            "report: {executable} report {}",
+            shell_quote(&root.display().to_string())
+        );
+    } else {
+        eprintln!(
+            "validate: {executable} protocol-validate-artifacts {}",
+            shell_quote(&artifact_root.display().to_string())
+        );
+        eprintln!(
+            "report: {}",
+            artifact_root.join("protocol-suite-summary.json").display()
+        );
+    }
+    for case in &summary.case_results {
+        if case.outcome != ProtocolCaseOutcome::Failed && case.cleanup_succeeded {
+            continue;
+        }
+        eprintln!(
+            "failed case: {} ({})",
+            case.case_id,
+            case.failure_classification
+                .as_deref()
+                .unwrap_or("cleanup-failure")
+        );
+        if let Some(root) = workflow_root {
+            eprintln!(
+                "reproduce: {executable} reproduce {} --case {}",
+                shell_quote(&root.display().to_string()),
+                shell_quote(&case.case_id)
+            );
+        } else {
+            eprintln!(
+                "reproduce: {executable} protocol-suite-reproduce {} {}",
+                shell_quote(&artifact_root.display().to_string()),
+                shell_quote(&case.case_id)
+            );
+        }
+    }
+}
+
+fn claim_exact_protocol_run_root(plan: &mut ProtocolSuitePlan, root: &Path) -> Result<()> {
+    ensure!(
+        !root.as_os_str().is_empty(),
+        "RUSTFS_PROTOCOL_TEST_RUN_ROOT must not be empty"
+    );
+    let root_text = root
+        .to_str()
+        .context("protocol run root must be UTF-8")?
+        .to_string();
+    if let Some(parent) = root.parent().filter(|path| !path.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).context("create protocol run parent directory")?;
+    }
+    fs::create_dir(root)
+        .with_context(|| format!("claim new protocol run root {}", root.display()))?;
+    plan.artifact_root = root_text;
+    for case in &mut plan.cases {
+        case.artifact_dir = root.join("cases").join(&case.id).display().to_string();
+    }
     Ok(())
 }
 
@@ -879,6 +1044,30 @@ pub async fn cleanup_protocol_artifact_root(artifact_root: impl AsRef<Path>) -> 
 
 #[async_trait::async_trait]
 impl ProtocolCaseLifecycle for LiveProtocolCaseLifecycle<'_> {
+    fn case_started(&self, case_id: &str, total: usize) {
+        eprintln!("protocol case started: {case_id} ({total} selected)");
+    }
+
+    fn case_finished(
+        &self,
+        execution: &ProtocolCaseExecution,
+        cleanup: &ProtocolCleanupReport,
+        completed: usize,
+        total: usize,
+    ) {
+        eprintln!(
+            "protocol case {completed}/{total}: {} {:?}; {} ms; cleanup={}",
+            execution.report.case_id,
+            execution.report.outcome,
+            execution.report.duration_millis,
+            if cleanup.succeeded {
+                "passed"
+            } else {
+                "failed"
+            }
+        );
+    }
+
     async fn run_case(
         &self,
         case: &ProtocolSuitePlanCase,
@@ -1244,6 +1433,54 @@ mod tests {
                 .map(|entry| entry.run_id.as_str())
                 .collect::<Vec<_>>(),
             ["run-3"]
+        );
+    }
+
+    #[test]
+    fn exact_run_root_relocates_case_paths_and_refuses_existing_artifacts() {
+        let base = tempfile::tempdir().expect("temporary run directory");
+        let suite: ProtocolSuite =
+            serde_yaml_ng::from_str(protocol_suite_template_yaml()).expect("suite");
+        let fingerprint = TargetFingerprint::new(
+            "http://127.0.0.1:9000",
+            "us-east-1",
+            "deployment",
+            None,
+            None,
+        )
+        .expect("fingerprint");
+        let preflight = crate::protocol::suite_plan::ProtocolSuitePlanPreflight {
+            endpoint_reachable: true,
+            admin_api_reachable: true,
+            external_identity: None,
+            capability_matrix: Vec::new(),
+            stale_buckets: Vec::new(),
+            stale_identities: Vec::new(),
+            stale_resource_policy: "fail".into(),
+            mutating_permission_probe:
+                crate::protocol::suite_plan::ProtocolMutatingProbeSummary::not_run(),
+        };
+        let mut plan = ProtocolSuitePlan::build(
+            &suite.resolve().expect("resolved suite"),
+            fingerprint,
+            preflight,
+            base.path(),
+            "run",
+        )
+        .expect("plan");
+        let exact = base.path().join("workflow/artifacts");
+        super::claim_exact_protocol_run_root(&mut plan, &exact).expect("claim exact root");
+        assert_eq!(plan.artifact_root(), exact);
+        assert!(
+            plan.cases
+                .iter()
+                .all(|case| Path::new(&case.artifact_dir) == exact.join("cases").join(&case.id))
+        );
+        fs::write(exact.join("preserved"), b"original evidence").expect("original artifact");
+        assert!(super::claim_exact_protocol_run_root(&mut plan, &exact).is_err());
+        assert_eq!(
+            fs::read(exact.join("preserved")).expect("preserved artifact"),
+            b"original evidence"
         );
     }
 

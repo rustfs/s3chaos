@@ -1,4 +1,5 @@
 SHELL := /bin/bash
+PREFIX ?= $(HOME)/.local
 
 SCENARIO ?=
 SUITE ?=
@@ -12,9 +13,24 @@ FAULT_SCRIPT := $(CURDIR)/scripts/fault-test.sh
 PROTOCOL_SCRIPT := $(CURDIR)/scripts/protocol-test.sh
 PROTOCOL_COMPAT_SCRIPT := $(CURDIR)/scripts/protocol-compatibility.sh
 
-.PHONY: check fmt fmt-check clippy test fault-check fault-list fault-qualify-list fault-qualify fault-qualify-analyze fault-preflight fault-run fault-chaos-plan fault-chaos-run fault-dm-run fault-ack-calibration-run fault-suite-template fault-suite-validate fault-suite-plan fault-suite-run fault-console-json fault-console-serve fault-dashboard-install fault-dashboard-port-forward fault-cleanup protocol-check protocol-list protocol-compatibility-mint protocol-mint-cleanup protocol-suite-template protocol-suite-validate protocol-suite-plan protocol-suite-run protocol-cleanup protocol-validate-artifacts protocol-validate-mint-artifacts protocol-validate-mint-session
+.PHONY: help install check fmt fmt-check clippy test fault-check fault-list fault-qualify-list fault-qualify fault-qualify-analyze fault-preflight fault-run fault-chaos-plan fault-chaos-run fault-dm-run fault-ack-calibration-run fault-suite-template fault-suite-validate fault-suite-plan fault-suite-run fault-console-json fault-console-serve fault-dashboard-install fault-dashboard-port-forward fault-cleanup protocol-check protocol-list protocol-compatibility-mint protocol-mint-cleanup protocol-suite-template protocol-suite-validate protocol-suite-plan protocol-suite-run protocol-cleanup protocol-validate-artifacts protocol-validate-mint-artifacts protocol-validate-mint-session
 
 check: fmt-check clippy test
+
+help:
+	@printf '%s\n' \
+	  'make install [PREFIX=$$HOME/.local]  Build and install s3chaos with bundled resources' \
+	  's3chaos --help                     Commands, options, and examples' \
+	  's3chaos init --help                Save a test target' \
+	  's3chaos run --help                 Run a supervised test' \
+	  's3chaos runs                       Browse recorded runs' \
+	  's3chaos console                    Open the local run console' \
+	  'make check                         Format, Clippy, and unit tests' \
+	  'make fault-check                   Check plus fault script and suite validation' \
+	  'make protocol-check                Check plus protocol script validation'
+
+install:
+	cargo install --locked --path . --bin s3chaos --root "$(PREFIX)" --force
 
 fmt:
 	+cargo fmt --all

@@ -31,6 +31,37 @@
 
       <div id="status-banner" class="status-banner" role="status" aria-live="polite" hidden></div>
 
+      <section class="panel history-panel" aria-labelledby="history-title">
+        <div class="panel-header compact">
+          <h2 id="history-title">Run history</h2>
+          <span id="history-count" class="count-pill">0</span>
+        </div>
+        <form id="history-controls" class="history-controls">
+          <label>Type<select id="history-kind"><option value="">All types</option><option value="fault">Fault</option><option value="protocol">Protocol</option><option value="mint">Mint</option></select></label>
+          <label>Result<select id="history-result"><option value="">All results</option><option value="passed">Passed</option><option value="failed">Failed</option><option value="incomplete">Incomplete</option><option value="unknown">Unknown</option><option value="running">Running</option><option value="preparing">Preparing</option></select></label>
+          <label>From (UTC)<input id="history-since" type="date"></label>
+          <label>Through (UTC)<input id="history-until" type="date"></label>
+          <button class="button" type="submit">Apply</button>
+        </form>
+        <p id="history-message" class="history-message" role="status"></p>
+        <div class="table-wrap">
+          <table class="attempt-table"><thead><tr><th>Started</th><th>Run</th><th>Type</th><th>Target</th><th>Result</th></tr></thead><tbody id="history-body"></tbody></table>
+        </div>
+        <div class="history-pagination"><button id="history-previous" class="button" type="button">Previous</button><span id="history-page"></span><button id="history-next" class="button" type="button">Next</button></div>
+      </section>
+
+      <section id="run-report" class="panel report-panel" aria-labelledby="report-title" hidden>
+        <div class="panel-header compact"><h2 id="report-title">Selected run</h2><span id="report-result" class="badge neutral"></span></div>
+        <dl id="report-fields" class="report-fields"></dl>
+        <p id="report-warnings" class="history-message" role="status"></p>
+        <details id="report-failure-section" hidden><summary>Failure details</summary><pre id="report-failure"></pre></details>
+        <details id="report-cleanup-section" hidden><summary>Cleanup details</summary><pre id="report-cleanup"></pre></details>
+        <div id="report-case-section" class="table-wrap" hidden><table class="attempt-table"><thead><tr><th>Case</th><th>Variant</th><th>Result</th><th>Cleanup</th><th>Failure</th></tr></thead><tbody id="report-cases"></tbody></table></div>
+        <details id="report-summary-section" hidden><summary>Runner report</summary><pre id="report-summary"></pre></details>
+        <div id="report-artifact-links" class="report-evidence"></div>
+        <a id="report-artifacts" class="report-artifacts" target="_blank" rel="noopener">Browse artifacts</a>
+      </section>
+
       <main class="dashboard">
         <section class="panel overview-panel" aria-labelledby="overview-title">
           <div class="panel-header">

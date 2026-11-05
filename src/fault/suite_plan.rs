@@ -910,6 +910,12 @@ fn attempt_seed(base_seed: Option<u64>, attempt_index: usize, repetition: usize)
     base_seed.map(|seed| seed ^ ((attempt_index as u64) << 32) ^ repetition as u64)
 }
 
+/// Invert the attempt seed transform while keeping planning and reproduction in sync.
+pub fn suite_seed_for_attempt(workload_seed: u64, attempt_index: usize, repetition: usize) -> u64 {
+    attempt_seed(Some(workload_seed), attempt_index, repetition)
+        .expect("a supplied workload seed always resolves")
+}
+
 fn suite_run_root(config: &FaultTestConfig, suite: &ResolvedFaultSuite, run_id: &str) -> PathBuf {
     config
         .cluster

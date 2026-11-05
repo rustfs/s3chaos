@@ -76,6 +76,19 @@ fn require_crd(config: &ClusterTestConfig, crd: &str, description: &str) -> Resu
 }
 
 pub fn cleanup_run(config: &ClusterTestConfig, namespace: &str, run_id: &str) -> Result<()> {
+    if std::env::var_os("S3CHAOS_RUN_ROOT").is_some() {
+        for kind in [
+            "schedule",
+            "iochaos",
+            "podchaos",
+            "networkchaos",
+            "timechaos",
+            "stresschaos",
+        ] {
+            workflow_cleanup(kind, "*", config.timeout)?;
+        }
+        return Ok(());
+    }
     let selector = format!("{RUN_ID_LABEL}={run_id}");
     let timeout = delete_timeout_arg(config);
     for kind in [
@@ -110,6 +123,9 @@ pub fn cleanup_run_kind(
     run_id: &str,
     kind: &str,
 ) -> Result<()> {
+    if workflow_cleanup(kind, "*", config.timeout)? {
+        return Ok(());
+    }
     if kind == "timechaos" && !timechaos_is_served(config)? {
         return Ok(());
     }
@@ -159,6 +175,9 @@ pub fn cleanup_managed_stresschaos(config: &ClusterTestConfig, namespace: &str) 
 }
 
 fn cleanup_managed_kind(config: &ClusterTestConfig, namespace: &str, kind: &str) -> Result<()> {
+    if workflow_cleanup(kind, "*", config.timeout)? {
+        return Ok(());
+    }
     if kind == "timechaos" && !timechaos_is_served(config)? {
         return Ok(());
     }
@@ -214,6 +233,27 @@ fn discovery_serves_timechaos(discovery: &Value) -> Result<bool> {
 /// suite driving it) forever — `kubectl delete` waits indefinitely by default.
 fn delete_timeout_arg(config: &ClusterTestConfig) -> String {
     format!("--timeout={}s", config.timeout.as_secs().max(1))
+}
+
+fn workflow_cleanup(kind: &str, name: &str, timeout: Duration) -> Result<bool> {
+    let Some(root) = std::env::var_os("S3CHAOS_RUN_ROOT") else {
+        return Ok(false);
+    };
+    let binary = std::env::var_os("S3CHAOS_BINARY")
+        .map(std::path::PathBuf::from)
+        .map_or_else(std::env::current_exe, Ok)?;
+    crate::framework::command::CommandSpec::new(
+        binary.to_str().context("binary path is not UTF-8")?,
+    )
+    .args([
+        "fault-workflow-chaos-delete",
+        root.to_str().context("run root is not UTF-8")?,
+        kind,
+        name,
+    ])
+    .timeout(timeout)
+    .run_checked()?;
+    Ok(true)
 }
 
 pub fn apply_iochaos(config: &ClusterTestConfig, spec: &IoChaosSpec) -> Result<ChaosGuard> {
@@ -295,10 +335,7 @@ fn apply_manifest(
         name: name.to_string(),
         deleted: false,
     };
-    Kubectl::new(config)
-        .namespaced(namespace)
-        .apply_yaml_command(manifest)
-        .run_checked()?;
+    crate::fault::workflow::apply_fixture_resource(config, manifest)?;
 
     Ok(guard)
 }
@@ -389,15 +426,23 @@ impl ChaosGuard {
         finalizers: &[String],
         timeout: Duration,
     ) -> Result<()> {
-        let patch = serde_json::json!({
-            "metadata": {
-                "finalizers": finalizers,
-            },
-        })
+        let current: Value = serde_json::from_str(&self.json()?)?;
+        crate::fault::workflow::validate_chaos_snapshot(self.kind, &self.name, &current)?;
+        let uid = current["metadata"]["uid"]
+            .as_str()
+            .context("Chaos resource UID is missing")?;
+        let version = current["metadata"]["resourceVersion"]
+            .as_str()
+            .context("Chaos resource version is missing")?;
+        let patch = serde_json::json!([
+            {"op":"test","path":"/metadata/uid","value":uid},
+            {"op":"test","path":"/metadata/resourceVersion","value":version},
+            {"op":"add","path":"/metadata/finalizers","value":finalizers},
+        ])
         .to_string();
         Kubectl::new(&self.config)
             .namespaced(&self.namespace)
-            .command(["patch", self.kind, &self.name, "--type=merge", "-p", &patch])
+            .command(["patch", self.kind, &self.name, "--type=json", "-p", &patch])
             .run_checked()?;
         self.wait_deleted(timeout)?;
         self.deleted = true;
@@ -422,6 +467,9 @@ impl ChaosGuard {
     }
 
     fn delete_inner_with_timeout(&self, timeout: Duration) -> Result<()> {
+        if workflow_cleanup(self.kind, &self.name, timeout)? {
+            return Ok(());
+        }
         Kubectl::new(&self.config)
             .namespaced(&self.namespace)
             .command([

@@ -56,6 +56,7 @@ pub mod suite;
 pub mod suite_plan;
 pub mod suite_runner;
 pub mod warp_metrics;
+pub mod workflow;
 pub mod workload;
 pub mod xl2_inspector;
 

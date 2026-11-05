@@ -73,6 +73,57 @@ pub struct MintSessionRequest {
     pub forbidden_material: Vec<String>,
 }
 
+/// Reuses the recorded Mint inputs with an independently verified new target.
+pub fn mint_reproduction_request(
+    original_root: impl AsRef<Path>,
+    target: MintTargetSpec,
+    artifact_root: impl Into<PathBuf>,
+) -> Result<MintSessionRequest> {
+    let original_root = original_root.as_ref();
+    ensure_safe_session_root(original_root)?;
+    ensure_mint_artifact_tree_safe(original_root, &[])?;
+    let original_target: MintTargetSpec = read_json(&original_root.join(TARGET_SPEC_FILE))?;
+    original_target.validate_contract()?;
+    target.validate_at(&timestamp_now()?)?;
+    ensure!(
+        target.namespace_uid != original_target.namespace_uid,
+        "Mint reproduction requires a new temporary namespace UID"
+    );
+    let mint_root = original_root.join(MINT_ARTIFACT_DIR);
+    let profile: MintProfile = read_json(&mint_root.join("mint-profile.json"))?;
+    ensure!(
+        profile.target_fingerprint == format!("sha256:{}", original_target.target_fingerprint)
+            && profile.region == original_target.region,
+        "recorded Mint profile does not match its original target"
+    );
+    let request = MintSessionRequest {
+        artifact_root: artifact_root.into(),
+        target,
+        profile_name: profile.name,
+        mint_image: profile.image,
+        mint_platform: profile.platform,
+        mint_mode: profile.mode,
+        mint_suites: profile.suites,
+        inventory: read_json(&mint_root.join("mint-inventory.json"))?,
+        known_failures: read_json(&mint_root.join("mint-known-failures.json"))?,
+        forbidden_material: [
+            ADMIN_ACCESS_KEY_ENV,
+            ADMIN_SECRET_KEY_ENV,
+            ADMIN_SESSION_TOKEN_ENV,
+        ]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .filter(|value| !value.is_empty())
+        .collect(),
+    };
+    ensure!(
+        !request.artifact_root.exists(),
+        "Mint reproduction artifact root already exists"
+    );
+    validate_request(&request)?;
+    Ok(request)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MintSessionPublication {
     pub gate_exit_code: i32,
@@ -1944,6 +1995,70 @@ mod tests {
             known_failures: placeholder_known_failures(),
             forbidden_material: Vec::new(),
         }
+    }
+
+    #[test]
+    fn reproduction_reuses_recorded_mint_inputs_with_a_fresh_namespace() {
+        let original = request();
+        let root = tempfile::tempdir().expect("original run");
+        let mint_root = root.path().join(MINT_ARTIFACT_DIR);
+        fs::create_dir(&mint_root).expect("Mint artifacts");
+        let profile = MintProfile::new(MintProfileSpec {
+            name: original.profile_name.clone(),
+            image: original.mint_image.clone(),
+            platform: original.mint_platform.clone(),
+            mode: original.mint_mode,
+            suites: original.mint_suites.clone(),
+            region: original.target.region.clone(),
+            target_fingerprint: format!("sha256:{}", original.target.target_fingerprint),
+        })
+        .expect("original profile");
+        for (name, value) in [
+            (
+                TARGET_SPEC_FILE.to_string(),
+                serde_json::to_value(&original.target).expect("target JSON"),
+            ),
+            (
+                "mint/mint-profile.json".to_string(),
+                serde_json::to_value(&profile).expect("profile JSON"),
+            ),
+            (
+                "mint/mint-inventory.json".to_string(),
+                serde_json::to_value(&original.inventory).expect("inventory JSON"),
+            ),
+            (
+                "mint/mint-known-failures.json".to_string(),
+                serde_json::to_value(&original.known_failures).expect("known failures JSON"),
+            ),
+        ] {
+            fs::write(
+                root.path().join(name),
+                serde_json::to_vec(&value).expect("JSON"),
+            )
+            .expect("recorded input");
+        }
+        let mut target = original.target.clone();
+        let now = time::OffsetDateTime::now_utc();
+        target.created_at = now
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("created time");
+        target.expires_at = (now + time::Duration::hours(12))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("expiry");
+        let destination = root.path().join("reproduction");
+        assert!(mint_reproduction_request(root.path(), target.clone(), &destination).is_err());
+        target.namespace_uid = Uuid::new_v4().to_string();
+        let replay = mint_reproduction_request(root.path(), target.clone(), &destination)
+            .expect("new target request");
+        assert_eq!(replay.target, target);
+        assert_eq!(replay.mint_image, original.mint_image);
+        assert_eq!(replay.inventory, original.inventory);
+        assert_eq!(replay.known_failures, original.known_failures);
+        assert!(!destination.exists());
+        assert_eq!(
+            fs::read_dir(root.path()).expect("original entries").count(),
+            2
+        );
     }
 
     fn capture(disposition: MintProcessDisposition) -> OwnedMintCapture {

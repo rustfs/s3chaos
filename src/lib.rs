@@ -16,3 +16,4 @@ pub mod fault;
 pub mod framework;
 pub mod protocol;
 pub(crate) mod rustfs;
+pub mod workflow;

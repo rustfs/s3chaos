@@ -12,6 +12,158 @@ on Kubernetes:
   surface with native test cases across authorization, IAM, STS, OIDC,
   bucket policy, and a bounded compatibility supplement alongside Mint.
 
+## Daily workflow
+
+Install once from a checkout with a Rust toolchain:
+
+```bash
+make install                              # defaults to $HOME/.local/bin
+export PATH="$HOME/.local/bin:$PATH"
+s3chaos --help
+s3chaos --version
+```
+
+`PREFIX=/path/to/prefix` selects another installation directory. The binary
+contains its matching scripts, suite examples, Mint inventory, and console
+assets. Installed commands can run outside the checkout without Cargo.
+Fault runs still require Bash, kubectl, jq, GNU timeout, the RustFS Operator,
+and the backend required by the selected scenario, including Chaos Mesh or
+prepared Linux device-mapper helpers.
+
+### Fault smoke
+
+Prepare a dedicated Kubernetes test cluster with the RustFS Operator and
+Chaos Mesh, then save its context, StorageClass, and RustFS image:
+
+```bash
+s3chaos init --kind fault --target lab \
+  --context '<test kube context>' --storage-class '<test StorageClass>' \
+  --image 'rustfs/rustfs:<tested version>'
+s3chaos validate fault smoke
+s3chaos doctor --kind fault --target lab --case io-eio
+s3chaos run fault --target lab --suite smoke
+```
+
+The run prints its ID and artifact directory before preparing the test. The
+foreground supervisor checks the selected environment, monitors cluster
+health, executes the test, restores faults, and validates the evidence.
+It coordinates runs through the `s3chaos-fault-session` Lease in `kube-system`.
+Its Kubernetes identity needs `get`, `create`, and `delete` permissions for
+Leases there, plus `get` permission for namespaces to verify cluster and
+namespace identities.
+A successful run removes fixtures created by that run. Pre-existing resources
+are retained. Failed runs retain diagnostic fixtures after fault restoration;
+`--keep-resources` also retains fixtures after a successful test.
+
+Use `s3chaos list suites --kind fault` for bundled suites and
+`s3chaos list cases --kind fault` for individual scenarios. A YAML path can
+replace the suite name. `--case <scenario>` runs one scenario, and
+`--qualification <case>` selects a planned qualification. Device-mapper and
+storage-recovery scenarios continue to require their dedicated devices,
+allowlists, and recovery proofs described in the guides below. Save their
+non-secret settings with repeatable `init --option NAME=VALUE` arguments.
+
+### Native Protocol smoke
+
+Export the test administrator credentials through your credential manager or
+shell, using environment variable names specific to this target:
+
+```bash
+export LAB_ACCESS_KEY='<test administrator access key>'
+export LAB_SECRET_KEY='<test administrator secret key>'
+s3chaos init --kind protocol --target lab \
+  --endpoint 'http://<test server>:9000' --region us-east-1 \
+  --access-key-env LAB_ACCESS_KEY --secret-key-env LAB_SECRET_KEY --dedicated
+s3chaos validate protocol smoke
+s3chaos doctor --kind protocol --target lab
+s3chaos run protocol --target lab --suite smoke
+```
+
+Initialization reads and displays the deployment identity and saves its
+fingerprint. Subsequent runs verify that identity before testing. To confirm
+a replacement deployment, repeat `init` with `--replace`. Target files contain
+environment variable references; access keys, secret keys, and optional session
+tokens are read from the named source together. `--session-token-env NAME`
+selects the token source. OIDC references use repeatable
+`--oidc-env DESTINATION=SOURCE` arguments. After configuring those references,
+select the OIDC suite for its prerequisites and an individual case:
+
+```bash
+s3chaos doctor --kind protocol --target lab --suite oidc-keycloak \
+  --case oidc-web-identity-basic
+s3chaos run protocol --target lab --suite oidc-keycloak \
+  --case oidc-web-identity-basic
+```
+
+`doctor --suite` checks the chosen Protocol suite; `--case` narrows its case
+selection while retaining the suite's identity-provider configuration.
+
+### Results, reproduction, and cleanup
+
+Use the printed run ID for subsequent operations:
+
+```bash
+s3chaos runs
+s3chaos runs --kind fault --result failed --limit 20 --offset 0
+s3chaos report <run-id>
+s3chaos report <run-id> --json
+s3chaos reproduce <run-id>
+s3chaos reproduce <run-id> --case <failed-case-id>
+s3chaos cleanup <run-id>
+s3chaos console
+```
+
+The console prints a loopback URL. Its history list supports UTC date, test
+type, and result filters with pagination. Selecting a run loads the report,
+cleanup status, failure details, and evidence. CLI reports and the console
+read the same published runner conclusions. Protocol artifact-validation
+failures and Mint teardown failures remain visible in the final result.
+`--root /path/to/artifacts` opens existing fault artifacts in the console.
+
+Reproduction creates a new run, preserving the recorded effective test
+selection and parameters. It checks target identity again and records its
+relationship to the original run. A different executable version requires
+`--use-current-version`. For fault suites, `--case <scenario-or-case-name>`
+selects a unique recorded attempt; repeated names require
+`--case attempt:<index>` from `suite-plan.json`. The selected attempt keeps
+its original workload seed, parameters, profile, and expected-failure rules.
+Fault reproduction uses the recorded pullable
+RustFS image digest. When that evidence is unavailable, `--use-current-image`
+explicitly accepts the saved image tag and records that choice. Cleanup uses
+the recorded target and resource ownership; repeated cleanup retains local
+reports. A lost supervisor does not automatically release the cluster's
+fault-test ownership. On Linux and macOS, history checks the recorded process
+identity: an exited supervisor displays
+`incomplete`; an unverifiable process or remote host displays `unknown`.
+Check the supervisor and restoration evidence before taking further action.
+These display states do not authorize resource deletion.
+
+`doctor` checks the selected target and prerequisites. It reports permissions
+that still require runtime verification. `validate` only checks the suite and
+needs neither target connectivity nor credentials. `--json` is available for
+history and reports; execution exit status remains suitable for CI.
+
+Configuration defaults to `$XDG_CONFIG_HOME/s3chaos/targets.json` (or
+`$HOME/.config/s3chaos/targets.json`). Run records and bundled resources use
+`$XDG_STATE_HOME/s3chaos` (or `$HOME/.local/state/s3chaos`). Global `--config`
+and `--data-dir` options select explicit locations for projects or CI. The
+saved target supplies the execution configuration; unrelated fault/protocol
+environment settings are cleared before launching the worker.
+
+Mint uses a saved target and a prepared ephemeral namespace:
+
+```bash
+s3chaos init --kind mint --target mint-lab \
+  --context '<test kube context>' --service rustfs --port 9000 \
+  --access-key-env LAB_ACCESS_KEY --secret-key-env LAB_SECRET_KEY --dedicated
+s3chaos run mint --target mint-lab --namespace '<prepared ephemeral namespace>'
+```
+
+Each invocation requires a newly prepared namespace satisfying the ownership
+requirements in the Mint section below. The CLI reads its UID, Service, Pod
+image digests, lease, and target fingerprint to generate the session proof.
+Reproduction requires a new namespace with `--namespace`.
+
 ## Architecture
 
 ```
@@ -26,6 +178,7 @@ src/
                      catalog (catalog/), S3/STS/admin/Keycloak clients,
                      fixture registry with ownership + durable cleanup,
                      preflight, runner, reporting
+  workflow/          Saved targets, bundled resources, run records, and reports
   framework/         Shared Kubernetes plumbing: kube client, kubectl wrapper,
                      port-forward, tenant factory, wait helpers
 scripts/             Shell entry points invoked by Make targets
@@ -40,8 +193,9 @@ console/             Web console assets served by the run console
 
 The `s3chaos` CLI exposes machine-readable commands (`fault-catalog-json`,
 `fault-qualification-catalog-json`, `protocol-catalog-json`,
-`*-suite-json`, ...) used by scripts, CI, and the console. There is no
-installed binary on a fresh checkout; run commands via Cargo:
+`*-suite-json`, ...) used by scripts, CI, and the console. These worker
+commands remain available alongside the daily workflow. From a source
+checkout, commands can also run through Cargo:
 
 ```bash
 cargo run --quiet --bin s3chaos -- help
@@ -71,12 +225,15 @@ make fault-dm-run SCENARIO=dm-flakey-versioned-hot  # one supervised DM run
 make fault-dm-run SCENARIO=node-crash-proxy         # DM crash + node held down
 make fault-console-serve                             # browse run artifacts
 
-# Pin the context, namespace, and tenant recorded in the run's target proof.
-export RUSTFS_FAULT_TEST_EXPECTED_CONTEXT='<run-context>'
-export RUSTFS_FAULT_TEST_NAMESPACE='<run-namespace>'
-export RUSTFS_FAULT_TEST_TENANT='<run-tenant>'
-make fault-cleanup                                   # release cluster fixtures
+# Use the exact artifact directory printed by the supervised run.
+RUSTFS_FAULT_TEST_RUN_ROOT='<run artifact directory>' make fault-cleanup
 ```
+
+The Make/script cleanup entry point requires `RUSTFS_FAULT_TEST_RUN_ROOT`
+or `S3CHAOS_RUN_ROOT` and reads that run's persisted ownership proof.
+For runs created through the unified CLI, use `s3chaos cleanup <run-id>`.
+Older directories without ownership proof remain available for report viewing;
+cleanup requires the run's verified resource identities.
 
 Both live targets build once and run cluster preflight once. The Chaos wrapper
 uses one pre-run plan pass. `make fault-preflight SCENARIO=...` is available for

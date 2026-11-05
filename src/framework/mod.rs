@@ -18,6 +18,7 @@ pub mod config;
 pub mod kube_client;
 pub mod kubectl;
 pub mod port_forward;
+pub mod process_identity;
 pub mod resources;
 pub mod tenant_factory;
 pub mod wait;
